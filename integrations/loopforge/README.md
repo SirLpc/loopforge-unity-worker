@@ -58,6 +58,18 @@ python3 integrations/loopforge/worker_client.py approve \
 
 需要逐阶段 SOP 时，用同一 render 命令生成 create、prepare、implement、compile、test、review、fix 的节点脚本。每个脚本通过 --from-artifact 读取上一份 JSON，并为 --output 设置唯一文件名和产物名称。develop 节点处理自动返工。拆分流程需要显式处理失败边和重试。脚本节点的产物只交接任务标识、状态、修改清单、审查结论及 Windows 产物引用。
 
+## 目录池和排队
+
+```bash
+python3 integrations/loopforge/worker_client.py render develop \
+  --input '.agentflow/inputs/**/unity-plan.json' --output unity-task.json \
+  --pool game --queue-wait-seconds 18000 --wait-seconds 18000
+```
+
+把 `game` 换成 Worker 已配置的池 ID，由可信执行脚本固定。用户方案继续存放需求和测试范围。`unity-task.json` 的 `pool_id`、`slot_id` 和 `base_commit` 用于核对目录绑定和开发基线。排队期间 `slot_id` 为空。交付用原任务 ID、目录标识和审批 revision 接续。
+
+先升级 Worker，再发布支持排队的执行脚本。单目录入口和已运行的旧 Job 保持可查询。`--queue-wait-seconds` 与 `--wait-seconds` 分别控制目录等待和执行轮询。`queue_timeout` 后需要新的 `--attempt`。对断线的原节点重跑时复用同一任务和 Job。
+
 ## 超时、重试和取消
 
 Worker 与 LoopForge 各自配置超时。为 Git、Codex、Unity 和可能的三次返工预留时间。客户端可用 --wait-seconds 或 UNITY_WORKER_WAIT_SECONDS 调整，--follow 将脱敏日志附加到 SOP 输出。稳定请求 ID 让同一节点重试复用原 Job。确认可安全重跑时用 --attempt 1 等新编号。

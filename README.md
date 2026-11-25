@@ -1,6 +1,6 @@
 # LoopForge × Windows Unity Worker
 
-Windows Worker 在常驻 Unity 工程中执行 Git 同步、Codex 开发、Unity 编译和测试、独立审查及审批交付。LoopForge 管理需求、方案和人工审批，以 HTTP 调度 Worker。每次执行使用同一工程、Library、Git 对象、LFS 与 Package 缓存。
+Windows Worker 在常驻 Unity 工程中执行 Git 同步、Codex 开发、Unity 编译和测试、独立审查及审批交付。LoopForge 管理需求、方案和人工审批，以 HTTP 调度 Worker。每单固定使用分配到的常驻工程及其 Library、Git 对象、LFS 与依赖缓存。支持单目录，也可配置多个命名池。
 
 ## Windows 部署
 
@@ -26,7 +26,17 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 
 配置 `[test_assemblies]` 后，每个开发任务必须提供 `test_selection`。键为 `editmode` 或 `playmode`，值为包含 `assembly` 和 `fixtures` 的列表。填写完整测试类名，由 Worker 生成程序集和测试筛选参数，并在 XML 中核对每个夹具实际运行。省略 `[test_assemblies]` 时沿用既有测试模式。
 
-启动脚本默认监听 127.0.0.1。WSL2 NAT 部署用 Ubuntu 的 ip -4 route show default 确定 Windows 网关，在启动脚本传入 -BindAddress <网关IP> 并将防火墙来源限制到 WSL2/Docker 所需网络。配置受信任链路或 TLS。Docker Desktop 的 host.docker.internal 也可通过健康探针验证。生产运行一个服务实例且 --workers 1，状态目录固定。实例互斥由 Windows 内核对象和数据库租约共同保护。只有 Worker 使用该工程执行 Git 及 Unity 操作。
+启动脚本默认监听 127.0.0.1。WSL2 NAT 部署用 Ubuntu 的 ip -4 route show default 确定 Windows 网关，在启动脚本传入 -BindAddress <网关IP> 并将防火墙来源限制到 WSL2/Docker 所需网络。配置受信任链路或 TLS。Docker Desktop 的 host.docker.internal 也可通过健康探针验证。生产运行一个服务实例且 --workers 1，状态目录固定。Windows 内核对象独占状态目录和每个 checkout，SQLite 租约将任务绑定到一个目录。只有 Worker 使用这些工程执行 Git 及 Unity 操作。
+
+## 目录池
+
+1. 为同一个受信任仓库预备至少一份独立 Git 检出。每份使用私有的 `.git`、Unity `Library`/`Temp` 和 Codex home。通过预热确认 Unity 版本、依赖、Git LFS 和选定测试均可用。两个目录的真实路径和 Codex home 必须不同。
+2. 按 [配置示例](config.example.toml) 设置 `default_pool`、`legacy_slot`、`[pools.<id>]` 与各 `slots`。显式池启用每个目录的预检。若 `GET /api/v1/pools` 显示 `unavailable`，检查该 checkout 的远端、Unity 版本、路径、Editor 锁和 Git 清洁度，修复后重启复检。
+3. `remote_identity` 是 UTF-8 `git remote get-url origin`、一个 NUL 字节、`git remote get-url --push origin` 的 SHA-256 小写十六进制。仅比较摘要。命名池需固定仓库、基础分支、Unity 版本和相对工程路径。第二个仓库用独立的池 ID。工作流用可信 `--pool` 参数选池。
+4. `max_parallel_unity` 默认 1，限制该 Worker 管理的 Editor 进程。多个任务的 Git、Codex 和审查可以重叠。确认宿主授权和容量后可调高。退出状态不明时保留 Editor 名额，核验进程后用 `recover` 释放。
+5. 改版前停止接单并备份数据库和运行配置。保留原目录作为 `legacy_slot`，正式 `default_pool` 为原 Worker ID。数据库升级保留原任务、Job、审批与产物。设置槽位 `enabled = false` 暂停新分配，已绑定任务继续完成。排空后可以从配置移除非默认槽位。更换仓库或目录用新的池或槽位 ID。
+
+命名池准备可选 `[pools.<id>.pr]`，填写 `provider`、`api_url`、`repository`、`token_env`。`token_env` 仅指服务进程的凭据环境变量名。没有池专用适配器时只有默认池继承现有宿主 PR/MR 配置。
 
 ## 开发与交付
 
@@ -34,7 +44,7 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 2. POST /api/v1/tasks 创建持久任务。POST /api/v1/tasks/{task_id}/run 取得租约并执行开发验证。也可逐个运行 prepare、implement、compile、test、review 和 fix。
 3. Worker 增量获取配置的基础分支，在原工程建立 ai/task-<UUID>。编译、每个启用的测试模式和独立审查共同验证同一 Git 树。只有确定的编译错误、测试断言或审查修改请求进入自动返工，默认最多三轮。
 4. 任务进入 awaiting_approval 后，审阅报告、变更和测试证据。授权者记录审批，指定这一版 revision。Commit Job 会再次比对当前 Git 树，安全暂存明确的文件清单并普通推送任务分支。
-5. 完成后运行 release。失败和取消任务也保留租约及现场，工作区整理完成后由操作员释放。下一任务仍使用相同的工程目录。
+5. 完成后运行 release。失败和取消任务也保留租约及现场，工作区整理完成后由操作员释放。池中的空闲目录可以继续接单。
 
 ### API 约定
 
@@ -42,19 +52,20 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 
 | 方法和路径 | 用途 |
 | --- | --- |
-| GET /api/v1/workers | 查询 Worker ID、租约及执行阶段 |
-| POST /api/v1/tasks | 需要 request_id、requirement、plan、acceptance_criteria 字符串数组。可传 workflow_run_id、project_rules |
+| GET /api/v1/workers | 查询 Worker ID 和默认池的状态 |
+| GET /api/v1/pools | 查询各池排队数、目录状态及当前任务 |
+| POST /api/v1/tasks | 需要 request_id、requirement、plan、acceptance_criteria 字符串数组。可传 workflow_run_id、project_rules、pool_id |
 | GET /api/v1/tasks/{task_id} | 任务状态、阶段、失败类型、审查、审批和交付 |
 | POST /api/v1/tasks/{task_id}/{action} | 固定操作 run、prepare、implement、compile、test、review、fix、pr、cancel、release |
 | POST /api/v1/tasks/{task_id}/commit | 需要 request_id 和签批时的 revision。两者和当前批准在同一事务内核对 |
 | POST /api/v1/tasks/{task_id}/approve | Operator Token。需要 request_id、revision、approver。可指定 commit_message、create_pr |
 | POST /api/v1/tasks/{task_id}/recover | Operator Token。需要 request_id、confirmed_stopped=true、note |
-| GET /api/v1/jobs/{job_id} | 轮询 Job 的 running、succeeded、failed、cancelled、recovery_required |
+| GET /api/v1/jobs/{job_id} | 轮询 Job 的 queued、running、succeeded、failed、cancelled、recovery_required |
 | GET /api/v1/tasks/{task_id}/artifacts | 取任务已登记的产物路径 |
 | GET /api/v1/tasks/{task_id}/artifacts/{name} | 下载指定 Job 完成后留存的产物 |
 | GET /api/v1/tasks/{task_id}/logs?name=...&offset=0&limit=8192 | 按明确的日志名查询。将 next_offset 带入下一个请求 |
 
-每个操作传唯一 UUID request_id。原样重试会返回同一 Job，变更目标或有效负载会返回 409。失败后明确重新执行安全阶段时，使用新的 request_id。并发冲突、非法阶段和缺少当前版本批准也返回 409。cancel 返回受理结果，随后轮询原 Job，直到确认终态。创建任务只入库，在 prepare 或 run 时竞争租约。
+每个操作传唯一 UUID request_id。原样重试会返回同一 Job，变更目标或有效负载会返回 409。失败后明确重新执行安全阶段时，使用新的 request_id。并发冲突、非法阶段和缺少当前版本批准也返回 409。cancel 返回受理结果，随后轮询原 Job，直到确认终态。创建任务只入库，在 prepare 或 run 时分配目录。提供 `queue_wait_seconds`（1 至 86400）时等候同池目录。Job 过期记录 `queue_timeout`，需明确用新请求 ID 重试。省略此字段时仍使用立即接单或 `409`。一经分配，任务、日志、审批及后续操作始终使用原 `slot_id`。
 
 ### 工作区与恢复
 

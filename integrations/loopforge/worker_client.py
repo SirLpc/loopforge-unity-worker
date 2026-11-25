@@ -101,6 +101,7 @@ def handoff(task, job, plan_request_id=None):
         summary.update(job_status=job["status"], job_error=job.get("error_message"))
     result = {
         "task_id": task_id, "job_id": job.get("job_id") or task.get("job_id"),
+        "pool_id": task.get("pool_id"), "slot_id": task.get("slot_id"), "base_commit": task.get("base_commit"),
         "stage_result": summary, "changed_files": task.get("changed_files", []),
         "review_result": task.get("review_result"),
         "artifact_reference": [f"/api/v1/tasks/{task_id}/artifacts/{entry['name']}"
@@ -111,23 +112,33 @@ def handoff(task, job, plan_request_id=None):
     return result
 
 
+def check_assignment(task, previous):
+    if any(previous.get(key) is not None and previous[key] != task.get(key) for key in ("pool_id", "slot_id")):
+        raise ClientError("The upstream artifact references a different Worker pool or directory")
+
+
 def check_delivery(task, previous):
+    check_assignment(task, previous)
     if not task["revision"] or task["revision"] != task["approved_revision"]:
         raise ClientError("The Worker has no approval for the current reviewed revision")
     if previous and previous.get("stage_result", {}).get("revision") != task["revision"]:
         raise ClientError("The upstream artifact references a different revision")
 
 
-def wait_job(client, task_path, job_id, wait_seconds, follow):
-    deadline = time.monotonic() + wait_seconds
+def wait_job(client, task_path, job_id, wait_seconds, follow, *, queue_wait_seconds=None):
+    queue_deadline = time.monotonic() + (queue_wait_seconds or wait_seconds) + 3
+    execution_deadline = None
     seen = {}
     previous_stage = None
-    while time.monotonic() < deadline:
+    while True:
         job = client.request(f"/api/v1/jobs/{job_id}")
         task = client.request(task_path)
-        stage = task["current_stage"]
+        status = job["status"]
+        stage = "queued" if status == "queued" else task["current_stage"]
         if stage != previous_stage:
-            print(f"Unity Worker {task['task_id']} {stage}", flush=True)
+            pool = f" pool={task['pool_id']}" if task.get("pool_id") else ""
+            slot = f" slot={task['slot_id']}" if task.get("slot_id") else ""
+            print(f"Unity Worker {task['task_id']} {stage}{pool}{slot}", flush=True)
             previous_stage = stage
         if follow:
             for artifact in task["artifacts"]:
@@ -138,10 +149,15 @@ def wait_job(client, task_path, job_id, wait_seconds, follow):
                     if page["text"]:
                         print(page["text"], end="", flush=True)
                     seen[name] = page["next_offset"]
-        if job["status"] != "running":
+        if status not in {"queued", "running"}:
             return task, job
-        time.sleep(min(3, max(0, deadline - time.monotonic())))
-    raise Interrupted(f"Polling timed out for Worker job {job_id}")
+        current = time.monotonic()
+        if status == "running" and execution_deadline is None:
+            execution_deadline = current + wait_seconds
+        remaining = (execution_deadline if status == "running" else queue_deadline) - current
+        if remaining <= 0:
+            raise Interrupted(f"Polling timed out for Worker job {job_id}")
+        time.sleep(min(3, remaining))
 
 
 def run_action(client, args):
@@ -167,6 +183,8 @@ def run_action(client, args):
         payload = {key: plan[key] for key in ("requirement", "plan", "acceptance_criteria")}
         plan_request_id = str(UUID(creation_id)) if creation_id else operation_id(run_id, "create", 0)
         payload.update(workflow_run_id=run_id, project_rules=plan.get("project_rules", ""), request_id=plan_request_id)
+        if args.pool:
+            payload["pool_id"] = args.pool
         if "test_selection" in plan:
             payload["test_selection"] = plan["test_selection"]
         created = client.request("/api/v1/tasks", payload)
@@ -185,7 +203,11 @@ def run_action(client, args):
         return 0
     if operation == "commit":
         check_delivery(task, previous)
+    elif operation == "release":
+        check_assignment(task, previous)
     payload = {"request_id": operation_id(task_id, operation, args.attempt)}
+    if operation in {"run", "prepare"} and args.queue_wait_seconds is not None:
+        payload["queue_wait_seconds"] = args.queue_wait_seconds
     if operation == "commit":
         payload["revision"] = task["revision"]
     if operation == "approve":
@@ -199,10 +221,11 @@ def run_action(client, args):
         payload.update(confirmed_stopped=True, note=args.note)
     job = None
     try:
-        if action in ("develop", "deliver", "release") and args.attempt == 0 and task.get("job_id"):
+        if action in ("develop", "run", "prepare", "deliver", "release") and args.attempt == 0 and task.get("job_id"):
             previous_job = client.request(f"/api/v1/jobs/{UUID(task['job_id'])}")
             if previous_job.get("action") == operation:
-                if previous_job["status"] == "failed":
+                if (previous_job["status"] == "failed" and previous_job.get("failure_kind") != "queue_timeout"
+                        and action in {"develop", "deliver", "release"}):
                     payload["request_id"] = operation_id(task_id, operation, previous_job["job_id"])
                 else:
                     job = previous_job
@@ -210,7 +233,8 @@ def run_action(client, args):
             job = client.request(task_path + "/" + operation, payload)
         save_json(args.output, handoff(task, job, plan_request_id))
         print(f"Unity Worker task {task_id}, job {job['job_id']}", flush=True)
-        task, job = wait_job(client, task_path, job["job_id"], args.wait_seconds, args.follow)
+        task, job = wait_job(client, task_path, job["job_id"], args.wait_seconds, args.follow,
+                             queue_wait_seconds=args.queue_wait_seconds)
     except (Interrupted, KeyboardInterrupt):
         print(f"Cancellation requested for Worker task {task_id}. Verify Windows process status.", file=sys.stderr)
         if operation not in ("cancel", "approve", "recover"):
@@ -244,6 +268,8 @@ def main(argv=None):
     parser.add_argument("--output", default="unity-task.json")
     parser.add_argument("--task-id")
     parser.add_argument("--run-id")
+    parser.add_argument("--pool", help="Configured pool ID for create or develop")
+    parser.add_argument("--queue-wait-seconds", type=int, help="Time allowed to wait for a workspace")
     parser.add_argument("--attempt", type=int, default=0)
     parser.add_argument("--wait-seconds", type=int, default=int(os.environ.get("UNITY_WORKER_WAIT_SECONDS", "14400")))
     parser.add_argument("--follow", action="store_true")
@@ -256,6 +282,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.attempt < 0 or args.wait_seconds <= 0:
         parser.error("Select a non-negative attempt and positive wait time")
+    if args.pool is not None and args.action not in {"create", "develop"}:
+        parser.error("--pool is only available for create or develop")
+    if args.queue_wait_seconds is not None and (args.action not in {"develop", "run", "prepare"}
+                                                or not 1 <= args.queue_wait_seconds <= 86400):
+        parser.error("--queue-wait-seconds requires develop, run or prepare and a value from 1 to 86400")
     if args.approved_plan and (args.action not in ("deliver", "release") or not args.from_artifact):
         parser.error("--approved-plan requires a delivery or release operation with --from-artifact")
 
