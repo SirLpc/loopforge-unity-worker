@@ -129,6 +129,8 @@ def permission_args(settings, cwd, *, review):
     access.update({str(path): "deny" for path in getattr(settings, "sibling_checkouts", ())})
     if not review:
         access[str(cwd / ".git")] = "read"
+        for path in (*getattr(settings, "ignored_cache_paths", ()), *getattr(settings, "allowed_tracked_outputs", ())):
+            access[str(cwd / path)] = "deny"
         if cwd != settings.project:
             for path in sorted(nested_denials(settings, cwd)):
                 access[str(path)] = "deny"

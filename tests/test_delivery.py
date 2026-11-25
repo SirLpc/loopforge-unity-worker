@@ -7,9 +7,9 @@ class PullRequestsTests(unittest.TestCase):
         from development import DevelopmentWorker
         from process_runner import StageError
 
-        ctx = SimpleNamespace(check_cancelled=lambda: None, task={})
+        ctx = SimpleNamespace(check_cancelled=lambda: None, task={"pool_id": "default"})
         with self.assertRaises(StageError) as error:
-            DevelopmentWorker.publish_pr(SimpleNamespace(pr_adapter=None), ctx)
+            DevelopmentWorker.publish_pr(SimpleNamespace(adapters={"default": None}), ctx)
         self.assertEqual(error.exception.kind, "pr_failed")
 
     def test_gitlab_encodes_project_and_reuses_existing_mr(self):

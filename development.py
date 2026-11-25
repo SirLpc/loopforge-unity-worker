@@ -48,15 +48,17 @@ class DevelopmentWorker:
     def __init__(self, settings, runner=None, agent: AgentExecutor | None = None, pr_adapter=None, *, unavailable=None):
         self.cfg = legacy_service(settings) if isinstance(settings, Settings) else settings
         self.runner = runner or ProcessRunner()
-        self.store = Store.open_service(self.cfg)
+        self.adapters = {pool.id: HostedPullRequests.from_pool_config(pool.pr) if pool.pr else
+                         pr_adapter if pool.id == self.cfg.default_pool else None
+                         for pool in self.cfg.pools.values()}
+        delivery = {pool_id: [adapter.provider, adapter.api, adapter.repository]
+                    for pool_id, adapter in self.adapters.items() if isinstance(adapter, HostedPullRequests)}
+        self.store = Store.open_service(self.cfg, delivery=delivery)
         self.marker = safe_child(self.cfg.logs, "active.lock")
         self.guard = threading.RLock()
         self.active = {}
         self.stopping = False
         self.store.recover_interrupted()
-        self.adapters = {pool.id: HostedPullRequests.from_pool_config(pool.pr) if pool.pr else
-                         pr_adapter if pool.id == self.cfg.default_pool else None
-                         for pool in self.cfg.pools.values()}
         self.workspaces = {}
         rejected = dict(unavailable or {})
         self.scheduler = PoolScheduler(self, rejected)
@@ -185,6 +187,7 @@ class DevelopmentWorker:
                 if previous := self.previous(db, "smoke", job_id, job_id, {}):
                     return publishable(previous)
                 if (self.store.slot_lease(db, self.cfg.legacy_slot) or self.scheduler.slot_blocked(self.cfg.legacy_slot)
+                        or self.store.has_queued(db, self.cfg.default_pool)
                         or not self.cfg.slots[self.cfg.legacy_slot].enabled or self.stopping):
                     raise RequestConflict("Worker busy or blocked")
                 if self.store.task(db, job_id) or self.store.job(db, job_id):

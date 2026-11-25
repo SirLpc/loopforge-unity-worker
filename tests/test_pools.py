@@ -324,3 +324,64 @@ class PoolTests(unittest.TestCase):
                 self.assertFalse(self.task(client, task_id)["lease"])
             self.assertEqual([slot["status"] for slot in client.get("/api/v1/pools").json()["pools"][0]["slots"]],
                              ["idle", "idle"])
+
+    def test_legacy_smoke_waits_behind_queue_head(self):
+        from pool_scheduler import PoolScheduler
+
+        first = self.config.pools["game"].slots[0]
+        self.config = replace(self.config, pools={**self.config.pools, "game": replace(self.config.pools["game"], slots=(first,))})
+        with patch.object(PoolScheduler, "dispatch"), patch.object(DevelopmentWorker, "stage_prepare", return_value={}), \
+                self.client(runner=FixtureRunner(self.root)) as client:
+            owner, waiting = self.create(client), self.create(client)
+            self.assertEqual(self.wait(client, self.action(client, owner, "prepare"))["status"], "succeeded")
+            head = self.action(client, waiting, "prepare", queue_wait_seconds=120)
+            self.action(client, owner, "cancel")
+            self.assertEqual(self.wait(client, self.action(client, owner, "release"))["status"], "succeeded")
+            self.assertEqual(client.post("/jobs", json={"job_id": str(uuid4())}).status_code, 409)
+            self.assertEqual(self.job(client, head["job_id"])["status"], "queued")
+
+    def test_effective_default_pr_target_is_bound_while_task_pending(self):
+        from pull_requests import HostedPullRequests
+
+        initial = HostedPullRequests("gitlab", "https://example.invalid/api/v4", "group/first", "configuration-key")
+        redirected = HostedPullRequests("gitlab", "https://example.invalid/api/v4", "group/second", "configuration-key")
+        with self.client(pr_adapter=initial) as client:
+            self.create(client)
+        with self.assertRaisesRegex(RuntimeError, "execution settings"), self.client(pr_adapter=redirected):
+            pass
+
+    def test_invalid_delivery_configuration_leaves_state_unmodified(self):
+        selected = self.config.pools["game"]
+        invalid = {"provider": "gitlab", "api_url": "http://example.invalid", "repository": "group/repo", "token_env": "TEST_TOKEN"}
+        self.config = replace(self.config, pools={**self.config.pools, "game": replace(selected, pr=invalid)})
+        self.assertFalse((self.config.logs / "worker.sqlite3").exists())
+        with self.assertRaises(ValueError), self.client():
+            pass
+        self.assertFalse((self.config.logs / "worker.sqlite3").exists())
+
+    def test_legacy_unknown_editor_holds_capacity_for_second_slot(self):
+        marker = self.config.logs / "active.lock"
+        marker.touch()
+        delegate = FixtureRunner(self.root)
+        entered = threading.Event()
+        original = delegate.run
+
+        def observe(argv, cwd, prefix, **kwargs):
+            if "-projectPath" in argv:
+                entered.set()
+            return original(argv, cwd, prefix, **kwargs)
+
+        delegate.run = observe
+        with patch.object(DevelopmentWorker, "stage_prepare", return_value={}), \
+                patch.object(DevelopmentWorker, "stage_implement", return_value={}), \
+                patch.object(DevelopmentWorker, "stage_compile", lambda _, ctx: ctx.workspace.unity.run(ctx, "compile")), \
+                self.client(runner=delegate) as client:
+            task = self.create(client)
+            for action in ("prepare", "implement"):
+                self.assertEqual(self.wait(client, self.action(client, task, action))["status"], "succeeded")
+            self.assertEqual(self.task(client, task)["slot_id"], "worker-02")
+            job = self.action(client, task, "compile")
+            self.assertFalse(entered.wait(0.4))
+            marker.unlink()
+            self.assertEqual(self.wait(client, job)["status"], "succeeded")
+            self.assertTrue(entered.is_set())

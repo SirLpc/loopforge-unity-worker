@@ -30,16 +30,17 @@ max_diff_bytes = 2000000
 # Optional PR/MR creation uses UNITY_PR_PROVIDER, UNITY_PR_API_URL, UNITY_PR_REPOSITORY and UNITY_PR_TOKEN.
 
 # Optional per-mode assembly allowlist. When present, development requests require test_selection.
+# Service-level keys for pool mode. Place these before TOML tables.
+# default_pool = "game"
+# legacy_slot = "worker-01"
+# max_parallel_unity = 1
+
 # [test_assemblies]
 # editmode = ['Game.Tests.EditMode']
 # playmode = ['Game.Tests.PlayMode']
 
 # To use named pools, move project, git_root and codex_home into each slot.
 # The simple single-project configuration above remains valid on its own.
-# default_pool = "game"
-# legacy_slot = "worker-01"
-# max_parallel_unity = 1
-#
 # [pools.game]
 # unity_exe = 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe'
 # unity_version = "2022.3.62f3"

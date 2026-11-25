@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -368,6 +369,21 @@ def load_service_settings(*, config=None) -> ServiceSettings:
     return ServiceSettings(default_pool, default_slot, pools, parallel)
 
 
+def has_external_checkout_link(checkout: Path) -> bool:
+    directories = [checkout]
+    while directories:
+        with os.scandir(directories.pop()) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                is_reparse_point = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                if stat.S_ISLNK(info.st_mode) or is_reparse_point:
+                    if not Path(entry.path).resolve(strict=True).is_relative_to(checkout):
+                        return True
+                elif stat.S_ISDIR(info.st_mode):
+                    directories.append(entry.path)
+    return False
+
+
 def check_slot(slot: SlotSettings, *, leased: bool) -> str | None:
     from git_workspace import GitWorkspace
     from process_runner import ProcessRunner, StageError
@@ -380,9 +396,9 @@ def check_slot(slot: SlotSettings, *, leased: bool) -> str | None:
             return "workspace_missing"
         protected = [cfg.checkout / ".git", *(cfg.checkout / name for name in cfg.ignored_cache_paths)]
         protected += [cfg.project / name for name in ("Assets", "Packages", "ProjectSettings", "Library", "Temp", "Logs", "Obj", "UserSettings")]
-        if any(path.resolve() != path for path in protected):
+        if any(path.resolve() != path for path in protected) or has_external_checkout_link(cfg.checkout):
             return "workspace_link"
-        if cfg.codex_home is not None and not cfg.codex_home.is_dir():
+        if cfg.codex_home is not None and (not cfg.codex_home.is_dir() or cfg.codex_home.resolve() != cfg.codex_home):
             return "codex_home_missing"
         UnityExecutor(cfg).validate()
         workspace = GitWorkspace(cfg)

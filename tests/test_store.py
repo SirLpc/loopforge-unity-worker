@@ -128,3 +128,28 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(store.active_job(db, "1"), original)
                 with self.assertRaises(sqlite3.IntegrityError):
                     store.save_job(db, {**original, "job_id": "run", "request_id": "r", "status": "running"})
+
+    def test_resolved_legacy_job_does_not_reacquire_editor_permit(self):
+        from task_store import Store
+
+        with test_directory() as root:
+            config = self.pooled_config(root)
+            store = Store.open_service(config)
+            with store.connect(write=True) as db:
+                store.save_task(db, {"task_id": "recovered", "pool_id": "game", "worker_id": "service",
+                                     "slot_id": "worker-01", "lease": True, "status": "failed", "failure_kind": "recovered"})
+                store.save_job(db, {"job_id": "old", "task_id": "recovered", "request_id": "old",
+                                    "status": "recovery_required", "action": "compile"})
+                store.save_job(db, {"job_id": "recover", "task_id": "recovered", "request_id": "recover",
+                                    "status": "succeeded", "action": "recover"})
+                db.execute("DROP TABLE unity_permits")
+                names = {column[1] for column in db.execute("PRAGMA table_info(jobs)")}
+                if "queue_pool" in names:
+                    for name in ("queue_pool_fifo", "queue_deadlines"):
+                        db.execute(f"DROP INDEX {name}")
+                    db.execute("ALTER TABLE jobs DROP COLUMN queue_pool")
+                    db.execute("ALTER TABLE jobs DROP COLUMN queue_deadline")
+                db.execute("PRAGMA user_version=1")
+            upgraded = Store.open_service(config)
+            with upgraded.connect() as db:
+                self.assertFalse(upgraded.has_task_permit(db, "recovered"))

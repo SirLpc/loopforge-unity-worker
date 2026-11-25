@@ -25,7 +25,7 @@ def path_key(path):
 
 
 class Store:
-    def __init__(self, path, worker_id, project, *, config=None):
+    def __init__(self, path, worker_id, project, *, config=None, delivery=None):
         self.path = path
         self.worker_id = worker_id
         self.default_pool = config.default_pool if config else worker_id
@@ -34,7 +34,7 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
         with self.connect(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RuntimeError(f"Unsupported Worker database version {version}")
             if version == 0:
                 self._migrate(db)
@@ -43,21 +43,33 @@ class Store:
                 # An upgrade can encounter an interrupted Editor invocation from before permits were tracked.
                 db.execute("""INSERT INTO unity_permits (job_id)
                     SELECT jobs.id FROM jobs JOIN tasks ON jobs.task_id = tasks.id
-                    WHERE jobs.status IN ('running', 'recovery_required') AND tasks.lease = 1
+                    WHERE tasks.lease = 1
+                      AND (jobs.status = 'running' OR (
+                           jobs.status = 'recovery_required' AND json_extract(tasks.data, '$.status') = 'recovery_required'
+                           AND NOT EXISTS (SELECT 1 FROM jobs AS recovered
+                               WHERE recovered.task_id = jobs.task_id AND recovered.rowid > jobs.rowid
+                                 AND recovered.status = 'succeeded' AND json_extract(recovered.data, '$.action') = 'recover')))
                       AND (json_extract(jobs.data, '$.action') IN ('smoke', 'compile', 'test')
                            OR (json_extract(jobs.data, '$.action') = 'run'
                                AND json_extract(tasks.data, '$.current_stage') IN ('compile', 'test')))""")
-                db.execute("PRAGMA user_version=2")
+            if version < 3:
+                db.execute("ALTER TABLE jobs ADD COLUMN queue_pool TEXT")
+                db.execute("ALTER TABLE jobs ADD COLUMN queue_deadline TEXT")
+                db.execute("""UPDATE jobs SET queue_pool = (SELECT pool_id FROM tasks WHERE tasks.id = jobs.task_id),
+                    queue_deadline = json_extract(data, '$.queue_deadline_at') WHERE status = 'queued'""")
+                db.execute("CREATE INDEX queue_pool_fifo ON jobs(queue_pool) WHERE status = 'queued'")
+                db.execute("CREATE INDEX queue_deadlines ON jobs(queue_deadline) WHERE status = 'queued'")
+                db.execute("PRAGMA user_version=3")
             self._bind(db, "identity", 1, [worker_id, path_key(project)])
             self._bind(db, "service_binding", 1, [self.default_pool, self.legacy_slot])
             if config:
-                self._bind_pools(db, config)
+                self._bind_pools(db, config, delivery or {})
 
     @classmethod
-    def open_service(cls, config):
+    def open_service(cls, config, *, delivery=None):
         from artifacts import safe_child
 
-        return cls(safe_child(config.logs, "worker.sqlite3"), config.worker_id, config.legacy.project, config=config)
+        return cls(safe_child(config.logs, "worker.sqlite3"), config.worker_id, config.legacy.project, config=config, delivery=delivery)
 
     def _migrate(self, db):
         # Execute statements individually to keep DDL and backfill in the opening transaction.
@@ -98,7 +110,7 @@ class Store:
         if db.execute(f"SELECT value FROM {table} WHERE id = ?", (key,)).fetchone()[0] != data:
             raise RuntimeError(f"Worker database is already bound to different {table} settings")
 
-    def _bind_pools(self, db, config):
+    def _bind_pools(self, db, config, delivery):
         unfinished_pools = {pool_id for (pool_id,) in db.execute(
             "SELECT DISTINCT pool_id FROM tasks WHERE lease = 1 OR "
             "json_extract(data, '$.status') NOT IN ('completed', 'failed', 'cancelled')")}
@@ -109,7 +121,7 @@ class Store:
             cfg = pool.policy
             binding = [pool.remote_identity, cfg.git_remote, cfg.base_branch, cfg.unity_version,
                        cfg.project.relative_to(cfg.checkout).as_posix()]
-            policy = signature([pool.pr, cfg.test_assemblies, cfg.test_modes, cfg.max_fixes, cfg.unity_exe,
+            policy = signature([delivery.get(pool.id, pool.pr), cfg.test_assemblies, cfg.test_modes, cfg.max_fixes, cfg.unity_exe,
                                 cfg.codex_exe, cfg.git_exe, cfg.codex_sandbox, cfg.init_submodules,
                                 cfg.ignored_cache_paths, cfg.allowed_tracked_outputs, cfg.max_diff_bytes,
                                 cfg.git_timeout, cfg.unity_timeout, cfg.codex_timeout])
@@ -155,9 +167,32 @@ class Store:
     def slot_lease(self, db, slot_id):
         return self._one(db.execute("SELECT data FROM tasks WHERE slot_id = ? AND lease = 1", (slot_id,)))
 
-    def queued_jobs(self, db, pool_id):
-        rows = db.execute("SELECT jobs.data FROM jobs JOIN tasks ON jobs.task_id = tasks.id "
-                          "WHERE jobs.status = 'queued' AND tasks.pool_id = ? ORDER BY jobs.rowid", (pool_id,))
+    @staticmethod
+    def has_queued(db, pool_id=None):
+        query = "SELECT 1 FROM jobs WHERE status = 'queued'"
+        if pool_id is None:
+            return db.execute(query + " LIMIT 1").fetchone() is not None
+        return db.execute(query + " AND queue_pool = ? LIMIT 1", (pool_id,)).fetchone() is not None
+
+    @staticmethod
+    def queued_count(db, pool_id):
+        return db.execute("SELECT count(*) FROM jobs WHERE status = 'queued' AND queue_pool = ?", (pool_id,)).fetchone()[0]
+
+    @staticmethod
+    def has_expired_queue_jobs(db, timestamp):
+        return db.execute("SELECT 1 FROM jobs WHERE status = 'queued' AND queue_deadline <= ? LIMIT 1",
+                          (timestamp,)).fetchone() is not None
+
+    @staticmethod
+    def expired_queue_jobs(db, timestamp):
+        rows = db.execute("SELECT data FROM jobs WHERE status = 'queued' AND queue_deadline <= ? "
+                          "ORDER BY queue_deadline LIMIT 128", (timestamp,))
+        return [json.loads(value) for (value,) in rows]
+
+    @staticmethod
+    def queued_jobs(db, pool_id, *, timestamp, limit):
+        rows = db.execute("SELECT data FROM jobs WHERE status = 'queued' AND queue_pool = ? "
+                          "AND queue_deadline > ? ORDER BY rowid LIMIT ?", (pool_id, timestamp, limit))
         return [json.loads(value) for (value,) in rows]
 
     def job(self, db, job_id):
@@ -182,10 +217,14 @@ class Store:
 
     @staticmethod
     def save_job(db, job):
+        queued = job["status"] == "queued"
         db.execute(
-            "INSERT INTO jobs(id, task_id, request_id, status, data) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET status = excluded.status, data = excluded.data",
-            (job["job_id"], job["task_id"], job["request_id"], job["status"], encode(job)),
+            "INSERT INTO jobs(id, task_id, request_id, status, data, queue_pool, queue_deadline) "
+            "VALUES (?, ?, ?, ?, ?, CASE WHEN ? THEN (SELECT pool_id FROM tasks WHERE id = ?) END, ?) "
+            "ON CONFLICT(id) DO UPDATE SET status = excluded.status, data = excluded.data, "
+            "queue_pool = excluded.queue_pool, queue_deadline = excluded.queue_deadline",
+            (job["job_id"], job["task_id"], job["request_id"], job["status"], encode(job),
+             queued, job["task_id"], job.get("queue_deadline_at") if queued else None),
         )
 
     @staticmethod

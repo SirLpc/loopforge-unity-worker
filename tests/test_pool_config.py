@@ -97,3 +97,27 @@ class PoolConfigTests(unittest.TestCase):
                 lock.touch()
                 self.assertEqual(worker_config.check_slot(service.slots["worker-01"], leased=False), "workspace_in_use")
                 self.assertIsNone(worker_config.check_slot(service.slots["worker-01"], leased=True))
+
+    def test_nested_cache_can_never_link_to_another_slot(self):
+        import subprocess
+
+        with test_directory() as root:
+            config, first, second = self.pool_fixture(root)
+            foreign = second / "Library"
+            foreign.mkdir()
+            link = first / "Library/RedirectedCache"
+            if os.name == "nt":
+                subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(foreign)],
+                               check=True, capture_output=True)
+            else:
+                link.symlink_to(foreign, target_is_directory=True)
+            try:
+                service = self.config_loader()(config=config)
+                with patch("unity_executor.unity_product_version", return_value="2022.3.62f3"):
+                    self.assertEqual(worker_config.check_slot(service.slots["worker-01"], leased=False), "workspace_link")
+                    self.assertIsNone(worker_config.check_slot(service.slots["worker-02"], leased=False))
+            finally:
+                if os.name == "nt":
+                    link.rmdir()
+                else:
+                    link.unlink()

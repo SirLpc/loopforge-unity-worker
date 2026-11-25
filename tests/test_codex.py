@@ -30,3 +30,16 @@ class CodexOutputTests(unittest.TestCase):
                 arguments = " ".join(permission_args(settings, cwd, review=read_only))
                 self.assertIn(f'{toml_string(sibling)}="deny"', arguments)
                 self.assertIn(f'{toml_string(cwd)}="{"read" if read_only else "write"}"', arguments)
+
+    def test_root_project_protects_configured_caches_and_tracked_outputs(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from codex_executor import permission_args, toml_string
+
+        own = Path.cwd() / "slot"
+        settings = SimpleNamespace(project=own, codex_exe=str(own.parent / "codex.exe"),
+                                   codex_home=own.parent / "codex-home", codex_sandbox="mxc",
+                                   ignored_cache_paths=("Assets/Dependencies",), allowed_tracked_outputs=("Logs/Historic.log",))
+        arguments = " ".join(permission_args(settings, own, review=False))
+        for name in ("Assets/Dependencies", "Logs/Historic.log"):
+            self.assertIn(f'{toml_string(own / name)}="deny"', arguments)

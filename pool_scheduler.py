@@ -63,7 +63,7 @@ class PoolScheduler:
         if pool is None:
             raise RequestConflict("The task's workspace pool is no longer configured")
         available = self._available(db, pool)
-        if available and not self.store.queued_jobs(db, pool.id):
+        if available and not self.store.has_queued(db, pool.id):
             self._assign(task, job, available[0])
             return True
         if queue_wait_seconds is None:
@@ -80,29 +80,32 @@ class PoolScheduler:
         with self.worker.guard:
             if self.worker.stopping:
                 return
+            timestamp = now()
+            with self.store.connect() as db:
+                if not self.store.has_queued(db):
+                    return
+                ready = [(pool, slots) for pool in self.config.pools.values()
+                         if self.store.has_queued(db, pool.id) and (slots := self._available(db, pool))]
+                if not ready and not self.store.has_expired_queue_jobs(db, timestamp):
+                    return
+
             launches = []
             with self.store.connect(write=True) as db:
-                timestamp = now()
-                for pool in self.config.pools.values():
-                    queued = self.store.queued_jobs(db, pool.id)
-                    if not queued:
-                        continue
-                    available = iter(self._available(db, pool))
-                    for job in queued:
+                for job in self.store.expired_queue_jobs(db, timestamp):
+                    task = self.store.task(db, job["task_id"])
+                    message = "The job expired while waiting for a Unity workspace"
+                    job.update(status="failed", finished_at=timestamp, failure_kind="queue_timeout", error_message=message)
+                    task.update(status="failed", finished_at=timestamp, failure_kind="queue_timeout", error_message=message)
+                    self.store.save_task(db, task)
+                    self.store.save_job(db, job)
+                for pool, slots in ready:
+                    heads = self.store.queued_jobs(db, pool.id, timestamp=timestamp, limit=len(slots))
+                    for job, slot_id in zip(heads, slots):
                         task = self.store.task(db, job["task_id"])
-                        if job["queue_deadline_at"] <= timestamp:
-                            message = "The job expired while waiting for a Unity workspace"
-                            job.update(status="failed", finished_at=timestamp, failure_kind="queue_timeout",
-                                       error_message=message)
-                            task.update(status="failed", finished_at=timestamp, failure_kind="queue_timeout",
-                                        error_message=message)
-                        elif slot_id := next(available, None):
-                            self._assign(task, job, slot_id)
-                            launches.append(job)
-                        else:
-                            continue
+                        self._assign(task, job, slot_id)
                         self.store.save_task(db, task)
                         self.store.save_job(db, job)
+                        launches.append(job)
             for job in launches:
                 self.worker.spawn(job, {})
 
@@ -113,7 +116,8 @@ class PoolScheduler:
             while True:
                 ctx.check_cancelled()
                 with self.store.connect(write=True) as db:
-                    if self.store.take_unity_permit(db, job_id, self.config.max_parallel_unity):
+                    limit = self.config.max_parallel_unity - int(self.worker.marker.exists())
+                    if limit > 0 and self.store.take_unity_permit(db, job_id, limit):
                         break
                 self.editors.wait(0.25)
         unverified = False
@@ -156,4 +160,4 @@ class PoolScheduler:
             slots.append({"id": slot.id, "status": status,
                           "task_id": task["task_id"] if task else None,
                           "current_stage": task["current_stage"] if task else None})
-        return {"id": pool.id, "queued_count": len(self.store.queued_jobs(db, pool.id)), "slots": slots}
+        return {"id": pool.id, "queued_count": self.store.queued_count(db, pool.id), "slots": slots}
