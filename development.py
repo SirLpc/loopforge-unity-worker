@@ -244,7 +244,8 @@ class DevelopmentWorker:
                     job.update(status="succeeded", finished_at=now(), stage_result={"status": task["status"],
                                                                                       "cancel_requested": bool(running)})
                 else:
-                    task.update(job_id=job["job_id"], lease=True, cancel_requested=False)
+                    task.update(job_id=job["job_id"], lease=True, cancel_requested=False,
+                                slot_id=task["slot_id"] or self.store.legacy_slot)
                     task["started_at"] = task["started_at"] or now()
                     if action not in {"release", "recover", "pr"}:
                         task["finished_at"] = None
