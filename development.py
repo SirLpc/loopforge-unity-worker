@@ -4,15 +4,18 @@ import json
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from uuid import uuid4
 
 from artifacts import RunContext, log_page, redact_text, safe_child
 from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, AgentExecutor, CodexExecutor
 from git_workspace import GitWorkspace
+from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
+from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
-from worker_config import validate_test_selection
+from worker_config import Settings, check_slot, legacy_service, validate_test_selection
 
 
 STAGES = {
@@ -32,10 +35,6 @@ RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "lice
              "startup_failed", "test_execution_failed", "not_run", "unsupported", "review_blocked", "dirty_workspace"}
 
 
-class RequestConflict(Exception):
-    pass
-
-
 class TaskNotFound(Exception):
     pass
 
@@ -45,28 +44,44 @@ def publishable(job):
 
 
 class DevelopmentWorker:
-    def __init__(self, settings, runner=None, agent: AgentExecutor | None = None, pr_adapter=None):
-        self.cfg = settings
+    def __init__(self, settings, runner=None, agent: AgentExecutor | None = None, pr_adapter=None, *, unavailable=None):
+        self.cfg = legacy_service(settings) if isinstance(settings, Settings) else settings
         self.runner = runner or ProcessRunner()
-        self.agent = agent or CodexExecutor(settings)
-        self.pr_adapter = pr_adapter
-        self.git = GitWorkspace(settings)
-        self.unity = UnityExecutor(settings)
-        self.store = Store(safe_child(settings.logs, "worker.sqlite3"), settings.worker_id, settings.project)
-        self.marker = safe_child(settings.logs, "active.lock")
+        self.store = Store.open_service(self.cfg)
+        self.marker = safe_child(self.cfg.logs, "active.lock")
         self.guard = threading.RLock()
         self.active = {}
         self.stopping = False
         self.store.recover_interrupted()
+        self.adapters = {pool.id: HostedPullRequests.from_pool_config(pool.pr) if pool.pr else
+                         pr_adapter if pool.id == self.cfg.default_pool else None
+                         for pool in self.cfg.pools.values()}
+        self.workspaces = {}
+        rejected = dict(unavailable or {})
+        for slot in self.cfg.slots.values():
+            cfg = slot.settings
+            self.workspaces[slot.id] = SimpleNamespace(git=GitWorkspace(cfg), unity=UnityExecutor(cfg),
+                                                        agent=agent or CodexExecutor(cfg), settings=cfg)
+            if not self.cfg.implicit and slot.id not in rejected:
+                with self.store.connect() as db:
+                    leased = self.store.slot_lease(db, slot.id) is not None
+                if error := check_slot(slot, leased=leased):
+                    rejected[slot.id] = error
+        self.scheduler = PoolScheduler(self, rejected)
+
+    def start(self):
+        self.scheduler.start()
 
     def close(self):
         with self.guard:
             self.stopping = True
             active = list(self.active.values())
-            for thread, cancel in active:
+            for _, cancel in active:
                 cancel.set()
+        self.scheduler.close()
+        deadline = time.monotonic() + 8
         for thread, _ in active:
-            thread.join(8)
+            thread.join(max(0, deadline - time.monotonic()))
 
     def clean_output(self, value):
         if isinstance(value, str):
@@ -87,14 +102,22 @@ class DevelopmentWorker:
                 return publishable(job)
         raise TaskNotFound
 
-    def worker(self):
+    def pools(self):
         with self.store.connect() as db:
-            task = self.store.lease(db)
-        status = "leased" if task else "idle"
-        if self.marker.exists() or (task and task["status"] == "recovery_required"):
-            status = "recovery_required"
-        return {"worker_id": self.cfg.worker_id, "status": status,
-                "task_id": task["task_id"] if task else None, "current_stage": task["current_stage"] if task else None}
+            return [self.scheduler.pool_status(db, pool) for pool in self.cfg.pools.values()]
+
+    def worker(self, *, legacy=False):
+        with self.store.connect() as db:
+            pool = self.scheduler.pool_status(db, self.cfg.pools[self.cfg.default_pool])
+        slots = pool["slots"]
+        if legacy:
+            slots = [slot for slot in slots if slot["id"] == self.cfg.legacy_slot]
+        states = {slot["status"] for slot in slots}
+        status = "idle" if "idle" in states else "leased" if "leased" in states else "recovery_required"
+        leased = [slot for slot in slots if slot["task_id"]]
+        current = leased[0] if len(leased) == 1 else {}
+        return {"worker_id": self.cfg.worker_id, "status": status, "task_id": current.get("task_id"),
+                "current_stage": current.get("current_stage")}
 
     def require_task(self, db, task_id):
         if task := self.store.task(db, task_id):
@@ -109,10 +132,13 @@ class DevelopmentWorker:
         return job
 
     def new_task(self, task_id, payload, task_type):
+        pool_id = payload.get("pool_id", self.cfg.default_pool)
+        policy = self.cfg.pools[pool_id].policy
         return {
             "task_id": task_id, "job_id": None, "worker_id": self.cfg.worker_id, "task_type": task_type,
+            "pool_id": pool_id, "slot_id": None,
             "workflow_run_id": None, "requirement": "", "plan": "", "acceptance_criteria": [], "project_rules": "",
-            **payload, "base_branch": self.cfg.base_branch if task_type == "development" else None,
+            **payload, "base_branch": policy.base_branch if task_type == "development" else None,
             "base_commit": None, "task_branch": None, "status": "pending", "current_stage": "created",
             "retry_count": 0, "created_at": now(), "started_at": None, "finished_at": None, "exit_code": None,
             "error_message": None, "failure_kind": None, "log_path": f"tasks/{task_id}", "artifacts": [],
@@ -135,6 +161,10 @@ class DevelopmentWorker:
         with self.store.connect(write=True) as db:
             if previous := self.previous(db, "create", None, request_id, payload):
                 return publishable(previous)
+            pool = self.cfg.pools.get(payload.get("pool_id", self.cfg.default_pool))
+            if pool is None:
+                raise ValueError("Unknown Unity workspace pool")
+            validate_test_selection(payload.get("test_selection"), pool.policy.test_assemblies)
             task_id = str(uuid4())
             task = self.new_task(task_id, payload, "development")
             job = self.new_job(task_id, request_id, "create", payload)
@@ -149,7 +179,8 @@ class DevelopmentWorker:
             with self.store.connect(write=True) as db:
                 if previous := self.previous(db, "smoke", job_id, job_id, {}):
                     return publishable(previous)
-                if self.store.lease(db) or self.marker.exists() or self.stopping:
+                if (self.store.slot_lease(db, self.cfg.legacy_slot) or self.scheduler.slot_blocked(self.cfg.legacy_slot)
+                        or not self.cfg.slots[self.cfg.legacy_slot].enabled or self.stopping):
                     raise RequestConflict("Worker busy or blocked")
                 if self.store.task(db, job_id) or self.store.job(db, job_id):
                     raise RequestConflict("Job ID is already assigned")
@@ -157,17 +188,18 @@ class DevelopmentWorker:
                     raise RequestConflict("Job ID already has a log; inspect it instead of resubmitting")
                 task = self.new_task(job_id, {}, "startup_smoke")
                 job = self.new_job(job_id, job_id, "smoke", {}, job_id=job_id)
-                task.update(job_id=job_id, lease=True, status="preparing", current_stage="startup_smoke",
+                task.update(job_id=job_id, slot_id=self.cfg.legacy_slot, lease=True, status="preparing", current_stage="startup_smoke",
                             started_at=now(), log_path=f"{job_id}.log")
                 self.store.save_task(db, task)
                 self.store.save_job(db, job)
-            self.spawn(job, {})
-            return publishable(job)
+            return self.spawn(job, {})
 
     def next_stage(self, task):
         stage, failure = task["current_stage"], task["failure_kind"]
         if task["status"] == "failed":
-            if failure in FIXABLE and task["retry_count"] < self.cfg.max_fixes:
+            if failure == "queue_timeout" and stage == "created":
+                return "prepare"
+            if failure in FIXABLE and task["retry_count"] < self.cfg.pools[task["pool_id"]].policy.max_fixes:
                 return "fix"
             if failure == "unity_changed" and stage in {"compile", "test"}:
                 return "compile"
@@ -183,8 +215,8 @@ class DevelopmentWorker:
         if self.stopping:
             raise RequestConflict("Worker is shutting down")
         active_job = self.store.active_job(db, task["task_id"])
-        if self.marker.exists() and action != "cancel":
-            raise RequestConflict("The legacy active.lock requires operator inspection")
+        if task["slot_id"] and self.scheduler.slot_blocked(task["slot_id"]) and action != "cancel":
+            raise RequestConflict("The assigned workspace is unavailable")
         if status == "recovery_required":
             if action == "recover" and task["lease"] and not active_job:
                 return
@@ -200,7 +232,7 @@ class DevelopmentWorker:
             if status == "awaiting_approval" and stage == "reviewed" and task["lease"]:
                 if task["revision"] != payload["revision"]:
                     raise RequestConflict("Approval revision does not match the reviewed revision")
-                if payload["create_pr"] and self.pr_adapter is None:
+                if payload["create_pr"] and self.adapters.get(task["pool_id"]) is None:
                     raise RequestConflict("This worker has no PR/MR adapter configured")
                 return
         elif action == "commit" and task["lease"] and task["approved_revision"]:
@@ -210,14 +242,14 @@ class DevelopmentWorker:
                                        and task["failure_kind"] in {"git_failed", "timeout", "recovered", "push_failed"}):
                 return
         elif action == "pr" and status == "completed" and task["pushed"] and task["approval"]["create_pr"]:
-            if task["lease"] and self.pr_adapter is not None and not task.get("pull_request"):
+            if task["lease"] and self.adapters.get(task["pool_id"]) is not None and not task.get("pull_request"):
                 return
         elif action in STAGES or action == "run":
+            if task["pool_id"] not in self.cfg.pools:
+                raise RequestConflict("The task's workspace pool is no longer configured")
             first = self.next_stage(task)
             if task["task_type"] == "development" and first and (action == first or action == "run"):
-                if self.marker.exists() or (not task["lease"] and self.store.lease(db)):
-                    raise RequestConflict("Worker busy or requires recovery")
-                if task["lease"] or first == "prepare":
+                if task["lease"] or (first == "prepare" and task["slot_id"] is None):
                     return
         raise RequestConflict(f"Operation is unavailable at {status}/{stage}")
 
@@ -230,22 +262,28 @@ class DevelopmentWorker:
                 self.check_action(db, task, action, payload)
                 job = self.new_job(task_id, request_id, action, payload)
                 if action in {"approve", "cancel"}:
-                    running = self.store.active_job(db, task_id)
+                    active = self.store.active_job(db, task_id)
+                    running = active and active["status"] == "running"
                     if action == "approve":
                         task.update(current_stage="approved", approved_revision=payload["revision"],
                                     approval={**payload, "approved_at": now()})
                     elif running:
                         task["cancel_requested"] = True
                     else:
+                        if active:
+                            active.update(status="cancelled", finished_at=now(), failure_kind="cancelled",
+                                          error_message="Cancellation requested")
+                            self.store.save_job(db, active)
                         task.update(status="cancelled", current_stage="cancelled", finished_at=now(),
                                     failure_kind="cancelled", error_message="Cancellation requested")
                     if not running:
                         task["job_id"] = job["job_id"]
                     job.update(status="succeeded", finished_at=now(), stage_result={"status": task["status"],
                                                                                       "cancel_requested": bool(running)})
+                elif not task["lease"]:
+                    self.scheduler.admit(db, task, job, payload.get("queue_wait_seconds"))
                 else:
-                    task.update(job_id=job["job_id"], lease=True, cancel_requested=False,
-                                slot_id=task["slot_id"] or self.store.legacy_slot)
+                    task.update(job_id=job["job_id"], cancel_requested=False)
                     task["started_at"] = task["started_at"] or now()
                     if action not in {"release", "recover", "pr"}:
                         task["finished_at"] = None
@@ -254,7 +292,8 @@ class DevelopmentWorker:
             if action == "cancel" and task_id in self.active:
                 self.active[task_id][1].set()
             elif job["status"] == "running":
-                self.spawn(job, payload)
+                return self.spawn(job, payload)
+            self.scheduler.wake.set()
             return publishable(job)
 
     def spawn(self, job, payload):
@@ -266,8 +305,9 @@ class DevelopmentWorker:
             thread.start()
         except RuntimeError:
             self.active.pop(task_id, None)
-            self.store.recover_interrupted()
-            raise
+            self.store.recover_interrupted(job["job_id"])
+            return self.job(job["job_id"])
+        return publishable(job)
 
     def save(self, job, **change):
         change = self.clean_output(change)
@@ -291,20 +331,22 @@ class DevelopmentWorker:
             def save(**change):
                 ctx.task.update(self.save(job, **change))
 
-            ctx = RunContext(self.cfg, self.runner, task, job, cancel, save)
+            workspace = self.workspaces[task["slot_id"]]
+            ctx = RunContext(workspace.settings, self.runner, task, job, cancel, save)
+            ctx.workspace = workspace
             if action == "run":
                 result = self.run(ctx)
             elif action == "smoke":
-                result = self.unity.run(ctx, "startup_smoke", safe_child(self.cfg.logs, f"{task['task_id']}.log"))
+                result = ctx.workspace.unity.run(ctx, "startup_smoke", safe_child(self.cfg.logs, f"{task['task_id']}.log"))
             elif action == "release":
-                assert_unity_closed(self.cfg.project)
+                assert_unity_closed(ctx.settings.project)
                 if task["task_type"] == "development":
-                    self.git.clean(ctx)
+                    ctx.workspace.git.clean(ctx)
                 result = {"released": True}
             elif action == "recover":
-                assert_unity_closed(self.cfg.project)
+                assert_unity_closed(ctx.settings.project)
                 if task["task_type"] == "development":
-                    self.git.validate(ctx)
+                    ctx.workspace.git.validate(ctx)
                 result = {"recovered": True, "operator_note": payload["note"]}
             elif action == "pr":
                 result = self.publish_pr(ctx)
@@ -330,6 +372,7 @@ class DevelopmentWorker:
                 self.finish(job, self.clean_output(result), error, time.monotonic() - started)
             finally:
                 self.active.pop(job["task_id"], None)
+                self.scheduler.wake.set()
 
     def finish(self, job, result, error, duration):
         with self.store.connect(write=True) as db:
@@ -366,7 +409,7 @@ class DevelopmentWorker:
             try:
                 result = self.run_stage(ctx, action)
             except StageError as error:
-                if error.kind not in FIXABLE or ctx.task["retry_count"] >= self.cfg.max_fixes:
+                if error.kind not in FIXABLE or ctx.task["retry_count"] >= ctx.settings.max_fixes:
                     raise
                 ctx.save(status="failed", failure_kind=error.kind, error_message=str(error), stage_result=error.result)
                 action = "fix"
@@ -387,10 +430,10 @@ class DevelopmentWorker:
         return result
 
     def stage_prepare(self, ctx):
-        self.unity.validate()
+        ctx.workspace.unity.validate()
         task = ctx.task
         branch = "ai/task-" + task["task_id"].replace("-", "")
-        prepared = self.git.prepare(ctx, branch)
+        prepared = ctx.workspace.git.prepare(ctx, branch)
         ctx.save(**prepared)
         return {"base_commit": prepared["base_commit"], "task_branch": branch}
 
@@ -399,7 +442,7 @@ class DevelopmentWorker:
         return {key: task[key] for key in ("requirement", "plan", "acceptance_criteria", "project_rules")}
 
     def agent_implementation(self, ctx, diagnostics=None):
-        self.git.checkout_is(ctx, ctx.task, ctx.task["base_commit"])
+        ctx.workspace.git.checkout_is(ctx, ctx.task, ctx.task["base_commit"])
         ctx.save(revision=None, approved_revision=None, approval=None, compile_report=None, test_report=None,
                  review_result=None, agent_session_id=None)
         info = self.brief(ctx.task)
@@ -408,12 +451,12 @@ class DevelopmentWorker:
         if diagnostics:
             info["previous_failure"] = diagnostics
         try:
-            result = self.agent.execute(ctx, IMPLEMENT_RULES + "\n\n" + json.dumps(info, ensure_ascii=False))
+            result = ctx.workspace.agent.execute(ctx, IMPLEMENT_RULES + "\n\n" + json.dumps(info, ensure_ascii=False))
         except StageError as error:
             ctx.save(agent_session_id=error.result.get("session_id"))
             raise
         ctx.save(agent_session_id=result.get("session_id"))
-        snapshot = self.git.snapshot(ctx, ctx.task)
+        snapshot = ctx.workspace.git.snapshot(ctx, ctx.task)
         if not snapshot.changes:
             raise StageError("no_changes", "Codex finished without a deliverable Git change", result=result)
         ctx.save(revision=snapshot.tree, changed_files=snapshot.changes, implementation_result={
@@ -434,19 +477,19 @@ class DevelopmentWorker:
         return self.agent_implementation(ctx, diagnostics)
 
     def stage_compile(self, ctx):
-        before = self.git.snapshot(ctx, ctx.task)
+        before = ctx.workspace.git.snapshot(ctx, ctx.task)
         if not before.changes:
             raise StageError("no_changes", "No Git differences to validate")
         ctx.save(revision=before.tree, approved_revision=None, approval=None, changed_files=before.changes,
                  compile_report=None, test_report=None, review_result=None)
-        result = self.unity.run(ctx, "compile")
+        result = ctx.workspace.unity.run(ctx, "compile")
         self.assert_same_revision(ctx, before.tree, unity=True)
         result["revision"] = before.tree
         ctx.save(compile_report=result)
         return result
 
     def assert_same_revision(self, ctx, revision, *, unity=False):
-        if self.git.snapshot(ctx, ctx.task).tree != revision:
+        if ctx.workspace.git.snapshot(ctx, ctx.task).tree != revision:
             kind = "unity_changed" if unity else "workspace_changed"
             raise StageError(kind, "Workspace changed during or after validation. Inspect the changes and recompile.")
 
@@ -455,10 +498,10 @@ class DevelopmentWorker:
         self.assert_same_revision(ctx, revision)
         selection = ctx.task.get("test_selection")
         try:
-            validate_test_selection(selection, getattr(self.cfg, "test_assemblies", {}))
+            validate_test_selection(selection, ctx.settings.test_assemblies)
         except ValueError as error:
             raise StageError("unsupported", str(error)) from error
-        selected_modes = tuple(mode for mode in self.cfg.test_modes if not selection or mode in selection)
+        selected_modes = tuple(mode for mode in ctx.settings.test_modes if not selection or mode in selection)
         reports = {mode: {"status": "not_run", "reason": "No approved scope for this mode" if selection
                           else "Disabled in Worker configuration"}
                    for mode in ("editmode", "playmode") if mode not in selected_modes}
@@ -468,7 +511,7 @@ class DevelopmentWorker:
                 reports[mode] = report = {"status": "running", "revision": revision, "runs": []}
                 for scope in selection[mode]:
                     try:
-                        result = self.unity.run(ctx, mode, scope=scope)
+                        result = ctx.workspace.unity.run(ctx, mode, scope=scope)
                     except StageError as error:
                         report["runs"].append({"status": error.kind, "scope": scope, **error.result})
                         report["status"] = error.kind
@@ -481,7 +524,7 @@ class DevelopmentWorker:
                 ctx.save(test_report=reports)
                 continue
             try:
-                reports[mode] = {"status": "passed", **self.unity.run(ctx, mode)}
+                reports[mode] = {"status": "passed", **ctx.workspace.unity.run(ctx, mode)}
             except StageError as error:
                 reports[mode] = {"status": error.kind, **error.result}
                 ctx.save(test_report=reports)
@@ -492,10 +535,10 @@ class DevelopmentWorker:
 
     def stage_review(self, ctx):
         task = ctx.task
-        snapshot = self.git.snapshot(ctx, task, check_meta=True)
+        snapshot = ctx.workspace.git.snapshot(ctx, task, check_meta=True)
         if snapshot.tree != task["revision"]:
             raise StageError("workspace_changed", "Workspace changed after validation. Recompile before review.")
-        diff = self.clean_output(self.git.diff(ctx, task, snapshot).decode("utf-8", errors="replace"))
+        diff = self.clean_output(ctx.workspace.git.diff(ctx, task, snapshot).decode("utf-8", errors="replace"))
         patch_file = ctx.artifact("change", ".diff", "diff")
         patch_file.write_text(diff, encoding="utf-8", newline="\n")
         inputs = {
@@ -505,7 +548,7 @@ class DevelopmentWorker:
         review_input = ctx.artifact("review-input", ".json", "review_input")
         review_input.write_text(json.dumps(inputs, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
-            review = self.agent.execute(ctx, REVIEW_RULES + "\n\n" + json.dumps(inputs, ensure_ascii=False), review=True)
+            review = ctx.workspace.agent.execute(ctx, REVIEW_RULES + "\n\n" + json.dumps(inputs, ensure_ascii=False), review=True)
         except StageError as error:
             ctx.save(review_result={"verdict": "blocked", "summary": str(error), "issues": [], **error.result})
             raise
@@ -521,15 +564,15 @@ class DevelopmentWorker:
     def stage_commit(self, ctx):
         task = ctx.task
         if not task["commit_sha"]:
-            snapshot = self.git.snapshot(ctx, task, check_meta=True)
+            snapshot = ctx.workspace.git.snapshot(ctx, task, check_meta=True)
             if snapshot.tree != task["approved_revision"]:
                 raise StageError("workspace_changed", "Reviewed files changed after approval. Revalidate and obtain a new approval.")
-            commit = self.git.commit(ctx, task, snapshot, task["approval"]["commit_message"] or f"AI task {task['task_id']}")
+            commit = ctx.workspace.git.commit(ctx, task, snapshot, task["approval"]["commit_message"] or f"AI task {task['task_id']}")
             ctx.save(commit_sha=commit)
-        self.git.push(ctx, task)
+        ctx.workspace.git.push(ctx, task)
         delivery = {
             "task_branch": task["task_branch"], "base_branch": task["base_branch"], "commit_sha": task["commit_sha"],
-            "remote": self.cfg.git_remote, "pushed": True,
+            "remote": ctx.settings.git_remote, "pushed": True,
         }
         ctx.save(pushed=True, delivery=delivery)
         if task["approval"]["create_pr"]:
@@ -543,9 +586,10 @@ class DevelopmentWorker:
 
     def publish_pr(self, ctx):
         ctx.check_cancelled()
-        if self.pr_adapter is None:
+        adapter = self.adapters[ctx.task["pool_id"]]
+        if adapter is None:
             raise StageError("pr_failed", "The approved PR/MR adapter is unavailable")
-        result = self.pr_adapter.create(ctx.task)
+        result = adapter.create(ctx.task)
         ctx.save(pull_request=result, pr_error=None)
         return result
 

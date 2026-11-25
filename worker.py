@@ -2,7 +2,7 @@
 
 import json
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -15,7 +15,7 @@ from artifacts import artifact_bytes, log_page, safe_child, task_directory
 from development import DevelopmentWorker, RequestConflict, TaskNotFound
 from process_runner import reserve_project
 from pull_requests import HostedPullRequests
-from worker_config import Settings, validate_test_selection
+from worker_config import REMOTE_PATTERN, Settings, legacy_service, load_service_settings
 
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
@@ -35,12 +35,17 @@ class OperationRequest(Body):
     request_id: UUID
 
 
+class StageRequest(OperationRequest):
+    queue_wait_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] | None = None
+
+
 class TestScope(Body):
     assembly: str
     fixtures: list[str]
 
 
 class TaskRequest(OperationRequest):
+    pool_id: str | None = Field(default=None, pattern=rf"^{REMOTE_PATTERN}$")
     workflow_run_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)] | None = None
     requirement: Text
     plan: Text
@@ -65,14 +70,14 @@ class RecoveryRequest(OperationRequest):
 
 
 def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
-    cfg = settings or Settings.load()
+    cfg = legacy_service(settings) if isinstance(settings, Settings) else settings or load_service_settings()
     pr_adapter = pr_adapter or HostedPullRequests.from_env()
 
     def authorize(authorization: str = Header(default="")):
         header = authorization.encode()
-        if secrets.compare_digest(header, ("Bearer " + cfg.token).encode()):
+        if secrets.compare_digest(header, ("Bearer " + cfg.legacy.token).encode()):
             return "worker"
-        if cfg.approval_token and secrets.compare_digest(header, ("Bearer " + cfg.approval_token).encode()):
+        if cfg.legacy.approval_token and secrets.compare_digest(header, ("Bearer " + cfg.legacy.approval_token).encode()):
             return "operator"
         raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
 
@@ -82,9 +87,23 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        with reserve_project(getattr(cfg, "checkout", cfg.project)):
-            worker = DevelopmentWorker(cfg, runner, agent, pr_adapter)
+        with ExitStack() as locks:
+            locks.enter_context(reserve_project(cfg.logs))
+            unavailable = {}
+            for slot in cfg.slots.values():
+                try:
+                    checkout = slot.settings.checkout
+                    if not checkout.is_dir() or checkout.resolve(strict=True) != checkout:
+                        unavailable[slot.id] = "workspace_missing"
+                        continue
+                    locks.enter_context(reserve_project(checkout))
+                except (OSError, RuntimeError):
+                    if cfg.implicit:
+                        raise
+                    unavailable[slot.id] = "workspace_locked"
+            worker = DevelopmentWorker(cfg, runner, agent, pr_adapter, unavailable=unavailable)
             app.state.worker = worker
+            worker.start()
             try:
                 yield
             finally:
@@ -126,8 +145,8 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
 
     @app.get("/health")
     def health():
-        return {"ok": True, "busy_or_blocked": worker().worker()["status"] != "idle",
-                "library_exists": (cfg.project / "Library").is_dir(), "operation": "unity_startup_import_smoke"}
+        return {"ok": True, "busy_or_blocked": worker().worker(legacy=True)["status"] != "idle",
+                "library_exists": (cfg.legacy.project / "Library").is_dir(), "operation": "unity_startup_import_smoke"}
 
     def smoke_result(job):
         if job["action"] != "smoke":
@@ -158,16 +177,21 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     def list_workers():
         return {"workers": [worker().worker()]}
 
+    @app.get("/api/v1/pools")
+    def list_pools():
+        return {"pools": worker().pools()}
+
     @app.post("/api/v1/tasks", status_code=202)
     def create_task(request: TaskRequest):
         payload = payload_for(request)
-        try:
-            validate_test_selection(payload.get("test_selection"), getattr(cfg, "test_assemblies", {}))
-        except ValueError as error:
-            raise HTTPException(422, str(error)) from error
+        if payload.get("pool_id") in (None, cfg.default_pool):
+            payload.pop("pool_id", None)
         if payload.get("test_selection") is None:
             payload.pop("test_selection", None)
-        return worker().create(str(request.request_id), payload)
+        try:
+            return worker().create(str(request.request_id), payload)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
 
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: UUID):
@@ -225,7 +249,12 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         return worker().action(str(task_id), "commit", str(request.request_id), payload_for(request))
 
     @app.post("/api/v1/tasks/{task_id}/{action}", status_code=202)
-    def operation(task_id: UUID, action: Action, request: OperationRequest):
-        return worker().action(str(task_id), action, str(request.request_id), {})
+    def operation(task_id: UUID, action: Action, request: StageRequest):
+        payload = {}
+        if request.queue_wait_seconds is not None:
+            if action not in {"run", "prepare"}:
+                raise HTTPException(422, "Queue wait is only allowed for run or prepare")
+            payload["queue_wait_seconds"] = request.queue_wait_seconds
+        return worker().action(str(task_id), action, str(request.request_id), payload)
 
     return app

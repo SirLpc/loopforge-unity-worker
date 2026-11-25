@@ -62,7 +62,7 @@ class ApiBaseline(unittest.TestCase):
                     task_id = str(uuid4())
                     task = prior.new_task(task_id, {}, "development")
                     job = prior.new_job(task_id, str(uuid4()), action, {})
-                    task.update(lease=True, status=status, current_stage=stage, job_id=job["job_id"],
+                    task.update(lease=True, slot_id=prior.cfg.legacy_slot, status=status, current_stage=stage, job_id=job["job_id"],
                                 approved_revision="a" * 40 if action == "commit" else None)
                     with prior.store.connect(write=True) as db:
                         prior.store.save_task(db, task)
@@ -92,7 +92,7 @@ class ApiBaseline(unittest.TestCase):
                 worker = DevelopmentWorker(cfg)
                 task_id = str(uuid4())
                 task = worker.new_task(task_id, {}, "development")
-                task.update(lease=True, status="awaiting_approval", current_stage="approved", approved_revision="a" * 40)
+                task.update(lease=True, slot_id=worker.cfg.legacy_slot, status="awaiting_approval", current_stage="approved", approved_revision="a" * 40)
                 with worker.store.connect(write=True) as db:
                     worker.store.save_task(db, task)
                 with TestClient(create_app(cfg), headers={"Authorization": f"Bearer {TOKEN}"}) as client:
