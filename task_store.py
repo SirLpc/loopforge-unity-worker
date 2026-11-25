@@ -34,10 +34,20 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
         with self.connect(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError(f"Unsupported Worker database version {version}")
             if version == 0:
                 self._migrate(db)
+            if version < 2:
+                db.execute("CREATE TABLE unity_permits (job_id TEXT PRIMARY KEY REFERENCES jobs(id))")
+                # An upgrade can encounter an interrupted Editor invocation from before permits were tracked.
+                db.execute("""INSERT INTO unity_permits (job_id)
+                    SELECT jobs.id FROM jobs JOIN tasks ON jobs.task_id = tasks.id
+                    WHERE jobs.status IN ('running', 'recovery_required') AND tasks.lease = 1
+                      AND (json_extract(jobs.data, '$.action') IN ('smoke', 'compile', 'test')
+                           OR (json_extract(jobs.data, '$.action') = 'run'
+                               AND json_extract(tasks.data, '$.current_stage') IN ('compile', 'test')))""")
+                db.execute("PRAGMA user_version=2")
             self._bind(db, "identity", 1, [worker_id, path_key(project)])
             self._bind(db, "service_binding", 1, [self.default_pool, self.legacy_slot])
             if config:
@@ -177,6 +187,26 @@ class Store:
             "ON CONFLICT(id) DO UPDATE SET status = excluded.status, data = excluded.data",
             (job["job_id"], job["task_id"], job["request_id"], job["status"], encode(job)),
         )
+
+    @staticmethod
+    def take_unity_permit(db, job_id, limit):
+        if db.execute("SELECT count(*) FROM unity_permits").fetchone()[0] >= limit:
+            return False
+        db.execute("INSERT INTO unity_permits (job_id) VALUES (?)", (job_id,))
+        return True
+
+    @staticmethod
+    def give_back_unity_permit(db, job_id):
+        db.execute("DELETE FROM unity_permits WHERE job_id = ?", (job_id,))
+
+    @staticmethod
+    def has_task_permit(db, task_id):
+        return db.execute("SELECT 1 FROM unity_permits JOIN jobs ON jobs.id = unity_permits.job_id "
+                          "WHERE jobs.task_id = ?", (task_id,)).fetchone() is not None
+
+    @staticmethod
+    def clear_recovered_permits(db, task_id):
+        db.execute("DELETE FROM unity_permits WHERE job_id IN (SELECT id FROM jobs WHERE task_id = ?)", (task_id,))
 
     def recover_interrupted(self, job_id=None):
         with self.connect(write=True) as db:

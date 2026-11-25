@@ -126,6 +126,7 @@ def permission_args(settings, cwd, *, review):
         ":minimal": "read", str(Path(settings.codex_exe).parent): "read",
         str(cwd): "read" if review else "write", str(settings.codex_home): "deny",
     }
+    access.update({str(path): "deny" for path in getattr(settings, "sibling_checkouts", ())})
     if not review:
         access[str(cwd / ".git")] = "read"
         if cwd != settings.project:

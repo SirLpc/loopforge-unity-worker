@@ -78,7 +78,7 @@ class StoreTests(unittest.TestCase):
                     (task["task_id"], "service", task["lease"], encode(task)) for task in tasks
                 ])
                 job = {"job_id": "running-job", "task_id": "running-task", "status": "running",
-                       "request_id": "old-request", "signature": "old-body-signature"}
+                       "request_id": "old-request", "signature": "old-body-signature", "action": "run"}
                 db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?)", ("running-job", "running-task", "old-request", "running", encode(job)))
             store = Store.open_service(cfg)
             store.recover_interrupted()
@@ -91,6 +91,7 @@ class StoreTests(unittest.TestCase):
                 self.assertIsNone(store.task(db, "pending-task")["slot_id"])
                 self.assertEqual(store.task(db, "old-smoke")["slot_id"], "worker-01")
                 self.assertEqual(store.request(db, "old-request")["signature"], "old-body-signature")
+                self.assertTrue(store.has_task_permit(db, "running-task"))
 
     def test_rejects_rebinding_a_slot_or_moving_the_default(self):
         from dataclasses import replace

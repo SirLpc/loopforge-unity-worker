@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import re
+from contextlib import nullcontext
 from xml.etree import ElementTree
 
 from process_runner import StageError
@@ -183,8 +184,9 @@ def read_test_results(path, scope=None):
 
 
 class UnityExecutor:
-    def __init__(self, settings):
+    def __init__(self, settings, *, permit=None):
         self.settings = settings
+        self.permit = permit
 
     def validate(self):
         cfg = self.settings
@@ -223,7 +225,9 @@ class UnityExecutor:
                 argv += ["-assemblyNames", scope["assembly"], "-testFilter", fixtures, "-testCategory", "!GameAssetValidation"]
         else:
             argv += ["-quit"]
-        process = ctx.run(argv, mode, timeout=cfg.unity_timeout, env=system_env(), publish=True)
+        with self.permit(ctx) if self.permit else nullcontext():
+            assert_unity_closed(cfg.project)
+            process = ctx.run(argv, mode, timeout=cfg.unity_timeout, env=system_env(), publish=True)
         if mode == "startup_smoke":
             if process.exit_code:
                 raise StageError("startup_failed", "Unity smoke failed", process.exit_code)

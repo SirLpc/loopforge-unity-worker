@@ -2,8 +2,10 @@
 
 import logging
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+from process_runner import StageError
 from task_store import now
 
 
@@ -18,6 +20,7 @@ class PoolScheduler:
         self.config = worker.cfg
         self.unavailable = unavailable
         self.wake = threading.Event()
+        self.editors = threading.Condition()
         self.thread = threading.Thread(target=self._serve, name="unity-workspace-scheduler", daemon=True)
 
     def start(self):
@@ -102,6 +105,38 @@ class PoolScheduler:
                         self.store.save_job(db, job)
             for job in launches:
                 self.worker.spawn(job, {})
+
+    @contextmanager
+    def unity_permit(self, ctx):
+        job_id = ctx.job["job_id"]
+        with self.editors:
+            while True:
+                ctx.check_cancelled()
+                with self.store.connect(write=True) as db:
+                    if self.store.take_unity_permit(db, job_id, self.config.max_parallel_unity):
+                        break
+                self.editors.wait(0.25)
+        unverified = False
+        try:
+            yield
+        except StageError as error:
+            unverified = error.kind == "recovery_required"
+            raise
+        except Exception as error:
+            unverified = True
+            raise StageError("recovery_required", "Could not verify Unity process exit") from error
+        finally:
+            if not unverified:
+                try:
+                    with self.store.connect(write=True) as db:
+                        self.store.give_back_unity_permit(db, job_id)
+                except Exception as error:
+                    raise StageError("recovery_required", "Could not record release of the Unity permit") from error
+                self.wake_editors()
+
+    def wake_editors(self):
+        with self.editors:
+            self.editors.notify_all()
 
     def pool_status(self, db, pool):
         slots = []

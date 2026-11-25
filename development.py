@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -58,16 +59,19 @@ class DevelopmentWorker:
                          for pool in self.cfg.pools.values()}
         self.workspaces = {}
         rejected = dict(unavailable or {})
-        for slot in self.cfg.slots.values():
-            cfg = slot.settings
-            self.workspaces[slot.id] = SimpleNamespace(git=GitWorkspace(cfg), unity=UnityExecutor(cfg),
+        self.scheduler = PoolScheduler(self, rejected)
+        slots = self.cfg.slots
+        for slot in slots.values():
+            cfg = replace(slot.settings, sibling_checkouts=tuple(peer.settings.checkout for peer in slots.values()
+                                                                  if peer.id != slot.id))
+            self.workspaces[slot.id] = SimpleNamespace(git=GitWorkspace(cfg),
+                                                        unity=UnityExecutor(cfg, permit=self.scheduler.unity_permit),
                                                         agent=agent or CodexExecutor(cfg), settings=cfg)
             if not self.cfg.implicit and slot.id not in rejected:
                 with self.store.connect() as db:
                     leased = self.store.slot_lease(db, slot.id) is not None
                 if error := check_slot(slot, leased=leased):
                     rejected[slot.id] = error
-        self.scheduler = PoolScheduler(self, rejected)
 
     def start(self):
         self.scheduler.start()
@@ -79,6 +83,7 @@ class DevelopmentWorker:
             for _, cancel in active:
                 cancel.set()
         self.scheduler.close()
+        self.scheduler.wake_editors()
         deadline = time.monotonic() + 8
         for thread, _ in active:
             thread.join(max(0, deadline - time.monotonic()))
@@ -227,6 +232,8 @@ class DevelopmentWorker:
         elif active_job:
             raise RequestConflict("The task already has an active job")
         elif action == "release" and status in TERMINAL and task["lease"]:
+            if self.store.has_task_permit(db, task["task_id"]):
+                raise RequestConflict("Confirm the previous Unity process stopped before releasing the workspace")
             return
         elif action == "approve":
             if status == "awaiting_approval" and stage == "reviewed" and task["lease"]:
@@ -291,6 +298,7 @@ class DevelopmentWorker:
                 self.store.save_job(db, job)
             if action == "cancel" and task_id in self.active:
                 self.active[task_id][1].set()
+                self.scheduler.wake_editors()
             elif job["status"] == "running":
                 return self.spawn(job, payload)
             self.scheduler.wake.set()
@@ -373,6 +381,7 @@ class DevelopmentWorker:
             finally:
                 self.active.pop(job["task_id"], None)
                 self.scheduler.wake.set()
+                self.scheduler.wake_editors()
 
     def finish(self, job, result, error, duration):
         with self.store.connect(write=True) as db:
@@ -399,6 +408,7 @@ class DevelopmentWorker:
             if action == "release" and not error:
                 task.update(lease=False, released_at=timestamp)
             if action == "recover" and not error:
+                self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
             self.store.save_task(db, task)
             self.store.save_job(db, job)

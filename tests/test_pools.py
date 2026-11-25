@@ -185,3 +185,142 @@ class PoolTests(unittest.TestCase):
             finally:
                 release.set()
             self.assertEqual(self.wait(client, old)["status"], "succeeded")
+
+    def prepared_tasks(self, client):
+        tasks = [self.create(client), self.create(client)]
+        with patch.object(DevelopmentWorker, "stage_prepare", return_value={}), \
+                patch.object(DevelopmentWorker, "stage_implement", return_value={}):
+            jobs = [self.action(client, task, "prepare") for task in tasks]
+            for task, job in zip(tasks, jobs):
+                self.assertEqual(self.wait(client, job)["status"], "succeeded")
+                self.assertEqual(self.wait(client, self.action(client, task, "implement"))["status"], "succeeded")
+        return tasks
+
+    def concurrent_compile(self, parallel):
+        self.config = replace(self.config, max_parallel_unity=parallel)
+        delegate = FixtureRunner(self.root)
+        release = threading.Event()
+        active = set()
+        observed = set()
+        lock = threading.Lock()
+
+        original = delegate.run
+
+        def observe(argv, cwd, prefix, **kwargs):
+            if "-projectPath" not in argv:
+                return original(argv, cwd, prefix, **kwargs)
+            path = argv[argv.index("-projectPath") + 1]
+            with lock:
+                active.add(path)
+                observed.add(path)
+            try:
+                release.wait(12)
+                return original(argv, cwd, prefix, **kwargs)
+            finally:
+                with lock:
+                    active.remove(path)
+
+        delegate.run = observe
+        with patch.object(DevelopmentWorker, "stage_compile", lambda _, ctx: ctx.workspace.unity.run(ctx, "compile")), \
+                self.client(runner=delegate) as client:
+            tasks = self.prepared_tasks(client)
+            jobs = [self.action(client, task, "compile") for task in tasks]
+            try:
+                self.until(lambda: len(active), lambda count: count >= parallel)
+                if parallel == 1:
+                    self.assertTrue(all(self.job(client, job["job_id"])["status"] == "running" for job in jobs))
+                    self.assertFalse(release.wait(0.4))
+                self.assertEqual(len(active), parallel)
+            finally:
+                release.set()
+            self.assertTrue(all(self.wait(client, job)["status"] == "succeeded" for job in jobs))
+            self.assertEqual(observed, {str(self.first), str(self.second)})
+
+    def test_two_tasks_pass_git_and_codex_with_one_editor_permit(self):
+        self.concurrent_compile(1)
+
+    def test_editor_limit_two_allows_two_project_paths(self):
+        self.concurrent_compile(2)
+
+    def test_editor_permit_survives_unverified_exit_and_restart(self):
+        from process_runner import StageError
+
+        delegate = FixtureRunner(self.root)
+        entered = threading.Event()
+        original = delegate.run
+        fail_once = True
+
+        def run(argv, cwd, prefix, **kwargs):
+            nonlocal fail_once
+            if "-projectPath" in argv:
+                if fail_once:
+                    fail_once = False
+                    raise StageError("recovery_required", "Editor process status unknown")
+                entered.set()
+            return original(argv, cwd, prefix, **kwargs)
+
+        delegate.run = run
+        with patch.object(DevelopmentWorker, "stage_compile", lambda _, ctx: ctx.workspace.unity.run(ctx, "compile")):
+            with self.client(runner=delegate) as client:
+                first, second = self.prepared_tasks(client)
+                crashed = self.wait(client, self.action(client, first, "compile"))
+                self.assertEqual(crashed["status"], "recovery_required")
+            with self.client(runner=delegate) as client:
+                cancelled = self.action(client, second, "compile")
+                self.assertFalse(entered.wait(0.4))
+                self.action(client, second, "cancel")
+                self.assertEqual(self.wait(client, cancelled)["status"], "cancelled")
+                self.assertFalse(entered.is_set())
+                recovered = self.action(client, first, "recover", operator=True, confirmed_stopped=True, note="checked")
+                self.assertEqual(self.wait(client, recovered)["status"], "succeeded")
+                third = self.create(client, pool_id="tools")
+                with patch.object(DevelopmentWorker, "stage_prepare", return_value={}), \
+                        patch.object(DevelopmentWorker, "stage_implement", return_value={}):
+                    for action in ("prepare", "implement"):
+                        self.assertEqual(self.wait(client, self.action(client, third, action))["status"], "succeeded")
+                self.assertEqual(self.wait(client, self.action(client, third, "compile"))["status"], "succeeded")
+                self.assertTrue(entered.is_set())
+
+    def test_two_isolated_tasks_approve_push_and_release(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        overlap = threading.Barrier(2, timeout=35)
+        real = FixtureRunner(self.root)
+        project_paths = set()
+        for repo in (self.first, self.second):
+            git(repo, "config", "user.name", "Fixture")
+            git(repo, "config", "user.email", "fixture@example.invalid")
+
+        def run(argv, cwd, prefix, **kwargs):
+            if "-projectPath" in argv:
+                project_paths.add(Path(argv[argv.index("-projectPath") + 1]))
+            return real.run(argv, cwd, prefix, **kwargs)
+
+        def execute(ctx, _prompt, *, review=False):
+            if review:
+                return {"verdict": "pass", "summary": "Reviewed", "issues": [], "session_id": "review-" + ctx.task["task_id"]}
+            overlap.wait()
+            path = ctx.settings.checkout / "hello.txt"
+            path.write_text(ctx.task["task_id"] + "\n", encoding="utf-8")
+            return {"success": True, "summary": "Changed the greeting", "session_id": "implement-" + ctx.task["task_id"]}
+
+        with self.client(agent=SimpleNamespace(execute=execute), runner=SimpleNamespace(run=run)) as client:
+            tasks = [self.create(client), self.create(client)]
+            jobs = [self.action(client, task, "run", queue_wait_seconds=180) for task in tasks]
+            self.assertTrue(all(self.wait(client, job)["status"] == "succeeded" for job in jobs))
+            records = [self.task(client, task) for task in tasks]
+            self.assertEqual([task["slot_id"] for task in records], ["worker-01", "worker-02"])
+            self.assertNotEqual(records[0]["revision"], records[1]["revision"])
+            self.assertEqual(project_paths, {self.first, self.second})
+            for task in records:
+                task_id, revision = task["task_id"], task["revision"]
+                self.action(client, task_id, "approve", operator=True, revision=revision, approver="Fixture")
+                delivered = self.wait(client, self.action(client, task_id, "commit", revision=revision))
+                self.assertEqual(delivered["status"], "succeeded", delivered)
+                self.assertTrue(delivered["stage_result"]["pushed"])
+                self.assertEqual(git(self.root / "remote", "show", task["task_branch"] + ":hello.txt"), task_id)
+                self.assertEqual(self.wait(client, self.action(client, task_id, "release"))["status"], "succeeded")
+                self.assertFalse(self.task(client, task_id)["lease"])
+            self.assertEqual([slot["status"] for slot in client.get("/api/v1/pools").json()["pools"][0]["slots"]],
+                             ["idle", "idle"])

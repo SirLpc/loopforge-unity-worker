@@ -98,6 +98,7 @@ class Settings:
 
     git_root: Path | None = None
     expected_remote_identity: str | None = None
+    sibling_checkouts: tuple[Path, ...] = ()
     allowed_tracked_outputs: tuple[str, ...] = ()
     ignored_cache_paths: tuple[str, ...] = ()
     test_assemblies: dict[str, tuple[str, ...]] = field(default_factory=dict)
