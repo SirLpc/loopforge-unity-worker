@@ -218,6 +218,39 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse(client.get("/health").json()["busy_or_blocked"])
             self.assertEqual((self.project / "Library/cache").read_text(), "keep")
 
+    def test_nested_scoped_workflow_pushes_only_the_approved_tree(self):
+        unity = self.project / "client"
+        unity.mkdir()
+        for name in ("ProjectSettings", "Packages", "Library", ".gitignore"):
+            (self.project / name).rename(unity / name)
+        git(self.project, "add", "--all")
+        git(self.project, "commit", "-m", "Nested Unity project")
+        git(self.project, "push", "origin", "main")
+        config = self.root / "fixture.toml"
+        config.write_text('[test_assemblies]\neditmode = ["Game.Tests"]\n', encoding="utf-8")
+        env = {"UNITY_PROJECT": str(unity), "UNITY_GIT_ROOT": str(self.project),
+               "UNITY_WORKER_CONFIG": str(config)}
+        with patch.dict(os.environ, env), self.client() as client:
+            req = {"request_id": str(uuid4()), "requirement": "Greeting", "plan": "Edit hello.txt",
+                   "acceptance_criteria": ["Greeting is updated"]}
+            self.assertEqual(client.post("/api/v1/tasks", json=req).status_code, 422)
+            req["test_selection"] = {"editmode": [{"assembly": "Game.Tests", "fixtures": [".*"]}]}
+            self.assertEqual(client.post("/api/v1/tasks", json=req).status_code, 422)
+            scope = {"editmode": [{"assembly": "Game.Tests", "fixtures": ["Game.UnitTests"]}]}
+            task = self.create(client, test_selection=scope)
+            self.assertEqual(self.stage(client, task, "run")["status"], "succeeded")
+            reviewed = self.task(client, task)
+            self.assertEqual(reviewed["test_report"]["editmode"]["revision"], reviewed["revision"])
+            self.assertEqual(reviewed["test_report"]["editmode"]["runs"][0]["scope"], scope["editmode"][0])
+            self.assertEqual(reviewed["test_report"]["playmode"]["status"], "not_run")
+            self.approve(client, task)
+            self.assertEqual(self.stage(client, task, "commit")["status"], "succeeded")
+            self.assertEqual(self.stage(client, task, "release")["status"], "succeeded")
+            completed = self.task(client, task)
+            self.assertEqual(git(self.remote, "rev-parse", completed["task_branch"] + "^{tree}"), reviewed["revision"])
+            self.assertEqual(git(self.remote, "rev-parse", "main"), reviewed["base_commit"])
+            self.assertEqual((unity / "Library/cache").read_text(), "keep")
+
     def test_compile_failure_stops_at_retry_limit(self):
         (self.root / "broken_compile").touch()
         with self.client() as client:

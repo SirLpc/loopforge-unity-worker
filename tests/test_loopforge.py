@@ -6,6 +6,18 @@ from uuid import uuid4
 
 
 class ScriptTests(unittest.TestCase):
+    def test_handoff_selects_the_artifact_for_the_approved_plan(self):
+        from unittest.mock import patch
+        from support import test_directory
+        from integrations.loopforge.worker_client import input_json, save_json
+
+        with test_directory() as root, patch.object(Path, "cwd", return_value=root):
+            first = {"plan_request_id": "plan-1", "task_id": "task-1", "stage_result": {"revision": "r1"}}
+            other = {"plan_request_id": "plan-2", "task_id": "task-2", "stage_result": {"revision": "r2"}}
+            save_json(root / "first.json", first)
+            save_json(root / "other.json", other)
+            self.assertEqual(input_json("*.json", plan_request_id="plan-1"), first)
+
     def test_request_ids_are_stable_with_explicit_retry(self):
         from integrations.loopforge.worker_client import operation_id
 

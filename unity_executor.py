@@ -103,7 +103,39 @@ def has_test_framework(project):
     return False
 
 
-def read_test_results(path):
+def fixture_pattern(name):
+    return rf"^{re.escape(name)}(?:\([^\r\n]*\))?\.[A-Za-z_][A-Za-z0-9_]*(?:\([^\r\n]*\))?$"
+
+
+def check_test_scope(root, scope):
+    expected = scope["assembly"] + ".dll"
+    expected_fixtures = set(scope["fixtures"])
+    executed = set()
+    covered = set()
+    for suite in root.iter("test-suite"):
+        if suite.get("type") != "Assembly" or not list(suite.iter("test-case")):
+            continue
+        actual = suite.get("name", "").replace(chr(92), "/").rsplit("/", 1)[-1]
+        if actual != expected:
+            raise StageError("test_execution_failed", "Unity executed tests from an unrequested assembly")
+        for case in suite.iter("test-case"):
+            fixture = case.get("classname", "").split("(", 1)[0]
+            fullname = case.get("fullname", "")
+            categories = {prop.get("value", "").casefold() for prop in case.findall("properties/property")
+                          if prop.get("name", "").casefold() == "category"}
+            if (fixture not in expected_fixtures or not re.fullmatch(fixture_pattern(fixture), fullname)
+                    or "gameassetvalidation" in categories):
+                raise StageError("test_execution_failed", "Unity executed tests outside the approved fixture scope")
+            covered.add(case)
+            if case.get("result") in {"Passed", "Failed"}:
+                executed.add(fixture)
+    if covered != set(root.iter("test-case")):
+        raise StageError("test_execution_failed", "Test report is missing assembly evidence")
+    if executed != expected_fixtures:
+        raise StageError("not_run", "One or more approved test fixtures did not execute")
+
+
+def read_test_results(path, scope=None):
     invalid = "Unity Test Framework XML is missing, invalid or inconsistent"
     try:
         if path.stat().st_size > 32 * 1024 * 1024:
@@ -124,11 +156,25 @@ def read_test_results(path):
             raise ValueError("Inconsistent counts")
     except (OSError, ElementTree.ParseError, ValueError) as error:
         raise StageError("test_execution_failed", invalid) from error
-    if any(node.get("label") in {"Error", "Invalid", "Cancelled", "NotRunnable"}
-           for node in [root, *root.iter("test-suite"), *cases]):
+    for node in [root, *root.iter("test-suite"), *cases]:
+        label = node.get("label")
+        if label not in {"Error", "Invalid", "Cancelled", "NotRunnable"}:
+            continue
+        # NUnit uses Error on individual cases that threw in the test or setup.
+        if label == "Error" and node.tag == "test-case" and node.get("result") == "Failed" and node.find("failure") is not None:
+            continue
         raise StageError("test_execution_failed", "Unity reported a test execution error", result=counts)
+    if scope:
+        check_test_scope(root, scope)
     if counts["failed"]:
-        raise StageError("tests_failed", "Unity test assertions failed", result=counts)
+        failed_cases = [case for case in cases if case.get("result") == "Failed"]
+        failures = [
+            {"name": case.get("fullname", case.get("name", ""))[:512],
+             "message": case.findtext("failure/message", "").strip()[:1024],
+             "stack": case.findtext("failure/stack-trace", "").strip()[:1800]}
+            for case in failed_cases[:3]
+        ]
+        raise StageError("tests_failed", "Unity test cases failed", result={**counts, "failed_tests": failures})
     if not counts["passed"]:
         raise StageError("not_run", "No Unity tests passed or failed", result=counts)
     if outcome != "Passed" or counts["inconclusive"]:
@@ -155,7 +201,7 @@ class UnityExecutor:
         if os.name == "nt" and installed != project_version:
             raise StageError("unsupported", "Unity.exe product version does not match ProjectVersion.txt")
 
-    def run(self, ctx, mode, legacy_log=None):
+    def run(self, ctx, mode, legacy_log=None, *, scope=None):
         cfg = self.settings
         if mode != "startup_smoke":
             self.validate()
@@ -169,6 +215,12 @@ class UnityExecutor:
         if mode in ("editmode", "playmode"):
             xml = ctx.artifact(mode, ".xml", "test_report")
             argv += ["-runTests", "-testPlatform", mode, "-testResults", str(xml)]
+            allowed = getattr(cfg, "test_assemblies", {})
+            if allowed and not scope:
+                raise StageError("unsupported", "Formal Unity tests require an approved fixture scope")
+            if scope:
+                fixtures = ";".join(fixture_pattern(name) for name in scope["fixtures"])
+                argv += ["-assemblyNames", scope["assembly"], "-testFilter", fixtures, "-testCategory", "!GameAssetValidation"]
         else:
             argv += ["-quit"]
         process = ctx.run(argv, mode, timeout=cfg.unity_timeout, env=system_env(), publish=True)
@@ -185,7 +237,7 @@ class UnityExecutor:
         if xml:
             report["test_results"] = xml.name
             try:
-                report.update(read_test_results(xml))
+                report.update(read_test_results(xml, scope))
             except StageError as error:
                 error.exit_code = process.exit_code
                 error.result = {**report, **error.result}

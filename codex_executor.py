@@ -3,12 +3,14 @@
 import json
 import os
 import re
+import stat
 from contextlib import suppress
 from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from git_workspace import CACHES, OUTPUTS, SENSITIVE_DIRS, SECRET_SUFFIXES
 from process_runner import StageError
 from worker_config import system_env
 
@@ -83,16 +85,57 @@ def toml_string(value):
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def nested_denials(settings, cwd):
+    restricted = {
+        cwd / name for name in CACHES | OUTPUTS | {".agents", ".codex"}
+    } | {settings.project / name for name in CACHES | OUTPUTS | {".agents", ".codex", "Bundles"}}
+
+    def fail(error):
+        raise StageError("unsupported", "Could not determine protected checkout paths") from error
+
+    def linked(path):
+        return path.is_symlink() or (os.name == "nt" and
+                                     path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+    for relative in getattr(settings, "ignored_cache_paths", ()):
+        restricted.add(cwd / relative)
+
+    for root, directories, files in os.walk(cwd, onerror=fail):
+        folder = Path(root)
+        for name in directories[:]:
+            path = folder / name
+            if name.lower() == ".git":
+                directories.remove(name)
+            elif path in restricted or name.lower() in SENSITIVE_DIRS or linked(path):
+                restricted.add(path)
+                directories.remove(name)
+        for name in files:
+            path = folder / name
+            lowered = name.lower()
+            if (lowered == ".env" or lowered.startswith(".env.") or lowered in
+                    {".netrc", ".npmrc", ".pypirc", "credentials.json"} or path.suffix.lower() in SECRET_SUFFIXES
+                    or path.is_symlink()):
+                restricted.add(path)
+    for relative in getattr(settings, "allowed_tracked_outputs", ()):
+        restricted.add(cwd / relative)
+    return restricted
+
+
 def permission_args(settings, cwd, *, review):
     access = {
         ":minimal": "read", str(Path(settings.codex_exe).parent): "read",
         str(cwd): "read" if review else "write", str(settings.codex_home): "deny",
     }
     if not review:
-        for name in (".git", "Library", "Temp", "Logs", "Obj", "UserSettings", ".codex", ".agents"):
-            access[str(cwd / name)] = "read" if name == ".git" else "deny"
-        for pattern in ("**/.env", "**/.env.*", "**/.ssh", "**/.aws", "**/*.pem", "**/*.pfx"):
-            access[(cwd / pattern).as_posix()] = "deny"
+        access[str(cwd / ".git")] = "read"
+        if cwd != settings.project:
+            for path in sorted(nested_denials(settings, cwd)):
+                access[str(path)] = "deny"
+        else:
+            for name in ("Library", "Temp", "Logs", "Obj", "UserSettings", ".codex", ".agents"):
+                access[str(cwd / name)] = "deny"
+            for pattern in ("**/.env", "**/.env.*", "**/.ssh", "**/.aws", "**/*.pem", "**/*.pfx"):
+                access[(cwd / pattern).as_posix()] = "deny"
     filesystem = "{" + ",".join(f"{toml_string(path)}={toml_string(mode)}" for path, mode in access.items()) + "}"
     overrides = (
         f'windows.sandbox={toml_string(settings.codex_sandbox)}', 'approval_policy="never"',
@@ -157,7 +200,16 @@ class CodexExecutor:
         windows = Path(env.get("SystemRoot", r"C:\Windows"))
         powershell = windows / "System32/WindowsPowerShell/v1.0/powershell.exe"
         private.write_text("sandbox read sentinel", encoding="utf-8")
+        nested = None
         try:
+            if not review and cwd != self.cfg.project:
+                nested = self.cfg.project / (nonce + "-protected")
+                nested.mkdir()
+                secret = nested / ".env"
+                secret.write_text("synthetic sandbox probe", encoding="utf-8")
+                options = permission_args(self.cfg, cwd, review=False)
+                body = (f"try {{ [IO.File]::ReadAllText({quoted(secret)}) | Out-Null; exit 83 }} catch {{ }};"
+                        + body)
             process = ctx.run(
                 [self.cfg.codex_exe, *options, "sandbox", "--include-managed-config", "--permission-profile",
                  "unity_worker", "--", str(powershell), "-NoProfile", "-NonInteractive", "-Command", body],
@@ -170,12 +222,15 @@ class CodexExecutor:
             for probe in (private, forbidden, allowed):
                 with suppress(OSError):
                     probe.unlink(missing_ok=True)
+            if nested is not None:
+                (nested / ".env").unlink(missing_ok=True)
+                nested.rmdir()
 
     def execute(self, ctx, prompt, *, review=False):
         env = self.environment()
         help_text = self.capabilities(ctx, env)
         model = ReviewResult if review else ImplementationResult
-        cwd = ctx.prefix("review-workspace") if review else self.cfg.project
+        cwd = ctx.prefix("review-workspace") if review else getattr(self.cfg, "checkout", self.cfg.project)
         if review:
             cwd.mkdir()
         options = permission_args(self.cfg, cwd, review=review)

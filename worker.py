@@ -15,7 +15,7 @@ from artifacts import artifact_bytes, log_page, safe_child, task_directory
 from development import DevelopmentWorker, RequestConflict, TaskNotFound
 from process_runner import reserve_project
 from pull_requests import HostedPullRequests
-from worker_config import Settings
+from worker_config import Settings, validate_test_selection
 
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
@@ -35,12 +35,18 @@ class OperationRequest(Body):
     request_id: UUID
 
 
+class TestScope(Body):
+    assembly: str
+    fixtures: list[str]
+
+
 class TaskRequest(OperationRequest):
     workflow_run_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)] | None = None
     requirement: Text
     plan: Text
     acceptance_criteria: list[Criterion] = Field(min_length=1, max_length=50)
     project_rules: str = Field(default="", max_length=20_000)
+    test_selection: dict[str, list[TestScope]] | None = None
 
 
 class RevisionRequest(OperationRequest):
@@ -76,7 +82,7 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        with reserve_project(cfg.project):
+        with reserve_project(getattr(cfg, "checkout", cfg.project)):
             worker = DevelopmentWorker(cfg, runner, agent, pr_adapter)
             app.state.worker = worker
             try:
@@ -154,7 +160,14 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
 
     @app.post("/api/v1/tasks", status_code=202)
     def create_task(request: TaskRequest):
-        return worker().create(str(request.request_id), payload_for(request))
+        payload = payload_for(request)
+        try:
+            validate_test_selection(payload.get("test_selection"), getattr(cfg, "test_assemblies", {}))
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        if payload.get("test_selection") is None:
+            payload.pop("test_selection", None)
+        return worker().create(str(request.request_id), payload)
 
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: UUID):

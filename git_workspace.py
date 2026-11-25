@@ -3,7 +3,8 @@
 import re
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -45,6 +46,12 @@ class GitWorkspace:
     def __init__(self, settings):
         self.cfg = settings
         self.project = settings.project
+        self.root = getattr(settings, "git_root", None) or self.project
+        self.unity_prefix = PurePosixPath(self.project.relative_to(self.root).as_posix())
+        self.asset_prefix = self.unity_prefix / "Assets"
+        self.allowed_tracked_outputs = getattr(settings, "allowed_tracked_outputs", ())
+        self.ignored_cache_paths = tuple(PurePosixPath(path.lower())
+                                         for path in getattr(settings, "ignored_cache_paths", ()))
 
     def git(self, ctx, *args, allowed=(0,), data=None, index=None, limit=8_000_000, read=None):
         env = {
@@ -53,11 +60,14 @@ class GitWorkspace:
         }
         if index:
             env["GIT_INDEX_FILE"] = str(index)
-        result = ctx.run(
-            [self.cfg.git_exe, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.ignoreStat=false",
-             "-c", "protocol.ext.allow=never", *args],
-            "git", env=env, data=data, timeout=self.cfg.git_timeout, max_output=limit,
-        )
+        # Git LFS may install hooks. Keep them outside the checkout and isolate
+        # each command from hooks installed by earlier calls.
+        with TemporaryDirectory(prefix="git-hooks-", dir=ctx.directory) as hooks:
+            result = ctx.run(
+                [self.cfg.git_exe, "-c", f"core.hooksPath={Path(hooks).as_posix()}", "-c", "core.fsmonitor=false",
+                 "-c", "core.ignoreStat=false", "-c", "protocol.ext.allow=never", *args],
+                "git", cwd=self.root, env=env, data=data, timeout=self.cfg.git_timeout, max_output=limit,
+            )
         try:
             if result.exit_code not in allowed:
                 with result.stderr.open("rb") as error:
@@ -79,14 +89,14 @@ class GitWorkspace:
     def validate(self, ctx):
         assert_unity_closed(self.project)
         root = self.text(ctx, "rev-parse", "--show-toplevel")
-        if type(self.project)(root).resolve() != self.project:
-            raise StageError("invalid_repository", "Configure the root of the Git checkout as UNITY_PROJECT")
+        if type(self.root)(root).resolve() != self.root:
+            raise StageError("invalid_repository", "Configured git_root must be the Git checkout root")
         git_dir = self.text(ctx, "rev-parse", "--absolute-git-dir")
-        if type(self.project)(git_dir).resolve() != self.project / ".git":
+        if type(self.root)(git_dir).resolve() != self.root / ".git":
             raise StageError("invalid_repository", "Use a standalone Git checkout with its own .git directory")
         for path in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply",
                      "sequencer", "BISECT_START", "index.lock", "shallow.lock", "config.lock"):
-            if (self.project / ".git" / path).exists():
+            if (self.root / ".git" / path).exists():
                 raise StageError("dirty_workspace", f"Unfinished Git operation ({path}). Resolve it manually.")
         if self.text(ctx, "config", "--bool", "--get", "core.sparseCheckout", allowed=(0, 1)) == "true":
             raise StageError("unsupported", "Sparse checkout is not supported for a resident Unity project")
@@ -107,11 +117,22 @@ class GitWorkspace:
             rows.append((state, path))
         return rows
 
-    @staticmethod
-    def cache(path):
-        parts = PurePosixPath(path.lower()).parts
-        return bool(parts) and (parts[0] in CACHES
-                                or (len(parts) == 1 and parts[0].endswith((".sln", ".slnx", ".csproj", ".user"))))
+    def scoped_parts(self, path):
+        value = PurePosixPath(path.lower())
+        yield value.parts
+        prefix = PurePosixPath(self.unity_prefix.as_posix().lower())
+        if prefix.parts and value.is_relative_to(prefix):
+            yield value.relative_to(prefix).parts
+
+    def cache(self, path):
+        if any(PurePosixPath(path.lower()).is_relative_to(cache) for cache in self.ignored_cache_paths):
+            return True
+        return any(parts and (parts[0] in CACHES or
+                             (len(parts) == 1 and parts[0].endswith((".sln", ".slnx", ".csproj", ".user"))))
+                   for parts in self.scoped_parts(path))
+
+    def output(self, path):
+        return any(parts and parts[0] in OUTPUTS for parts in self.scoped_parts(path))
 
     def clean(self, ctx):
         self.validate(ctx)
@@ -126,7 +147,7 @@ class GitWorkspace:
         self.assert_submodules_clean(ctx)
 
     def assert_submodules_clean(self, ctx):
-        if not (self.project / ".gitmodules").is_file():
+        if not (self.root / ".gitmodules").is_file():
             return
         scopes = ("submodule", "foreach", "--quiet", "--recursive")
         status = (
@@ -141,9 +162,21 @@ class GitWorkspace:
             raise StageError("dirty_workspace", "An initialized submodule has local files, index flags or an unfinished operation.")
 
     def assert_safe_tree(self, ctx, revision):
-        roots = self.git(ctx, "ls-tree", "--name-only", "-z", revision)[1].decode("utf-8").split("\0")
-        if any(name.lower() in CACHES | OUTPUTS for name in roots):
-            raise StageError("invalid_repository", "The Git tree tracks a cache or build directory")
+        for path in getattr(self.cfg, "ignored_cache_paths", ()):
+            if self.git(ctx, "--literal-pathspecs", "ls-tree", "-r", "-z", revision, "--", path)[1]:
+                raise StageError("invalid_repository", "The Git tree tracks a configured dependency cache")
+        for prefix in dict.fromkeys((PurePosixPath(), self.unity_prefix)):
+            tree = f"{revision}:{prefix.as_posix()}" if prefix.parts else revision
+            names = self.git(ctx, "ls-tree", "--name-only", "-z", tree)[1].decode("utf-8").split("\0")
+            for name in names:
+                path = (prefix / name).as_posix()
+                if not name or not (self.cache(path) or self.output(path)):
+                    continue
+                tracked = self.git(ctx, "ls-tree", "-r", "-z", revision, "--", path)[1].decode("utf-8")
+                for entry in tracked.rstrip("\0").split("\0"):
+                    mode, _, tracked_path = entry.partition("\t")
+                    if tracked_path not in self.allowed_tracked_outputs or not mode.startswith(("100644 ", "100755 ")):
+                        raise StageError("invalid_repository", "The Git tree tracks a cache or build directory")
 
     def remote_identity(self, ctx):
         remote = self.cfg.git_remote
@@ -175,7 +208,7 @@ class GitWorkspace:
                  f"refs/heads/{cfg.base_branch}")
         commit = self.text(ctx, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
         self.assert_safe_tree(ctx, commit)
-        version = self.text(ctx, "show", f"{commit}:{PROJECT_VERSION}", limit=32_768)
+        version = self.text(ctx, "show", f"{commit}:{self.unity_prefix / PROJECT_VERSION}", limit=32_768)
         if f"m_EditorVersion: {cfg.unity_version}" not in version.splitlines():
             raise StageError("unsupported", "The target branch requires a different Unity Editor version")
         lfs = self.uses_lfs(ctx, commit)
@@ -189,7 +222,7 @@ class GitWorkspace:
                 raise StageError("workspace_changed", "Partially prepared task branch no longer matches the fetched base")
         else:
             self.git(ctx, "switch", "--no-overwrite-ignore", "--no-recurse-submodules", "-c", branch, commit)
-        if (self.project / ".gitmodules").is_file():
+        if (self.root / ".gitmodules").is_file():
             if cfg.init_submodules:
                 self.git(ctx, "submodule", "sync", "--recursive")
                 self.git(ctx, "submodule", "update", "--init", "--recursive", "--checkout")
@@ -224,7 +257,7 @@ class GitWorkspace:
             if state[0] not in (" ", "?"):
                 raise StageError("workspace_changed", "The Git index contains staged or unmerged changes")
             self.check_path(path)
-            if (self.project / path).is_dir():
+            if (self.root / path).is_dir():
                 raise StageError("unsafe_change", "Changes inside submodules need manual delivery")
         index = ctx.directory / f"index-{uuid4().hex}"
         try:
@@ -263,18 +296,18 @@ class GitWorkspace:
                 or (name.startswith(".env.") and name not in {".env.example", ".env.sample"})
                 or suffix in SECRET_SUFFIXES):
             raise StageError("unsafe_change", "Sensitive file in Git changes")
-        if self.cache(path) or relative.parts[0] in OUTPUTS or suffix in BUILD_SUFFIXES:
+        if self.cache(path) or self.output(path) or suffix in BUILD_SUFFIXES or path in self.allowed_tracked_outputs:
             raise StageError("unsafe_change", "Cache or build output in Git changes")
         if set(relative.parts) & GIT_CONTROLS:
             raise StageError("unsafe_change", "Git transport, attribute and submodule changes need manual delivery")
-        local = self.project.joinpath(*parts)
+        local = self.root.joinpath(*parts)
         if local.is_symlink() or local.resolve() != local:
             raise StageError("unsafe_change", "Linked files and directories need manual delivery")
 
     def check_secrets(self, path):
         chunks = tuple(secret.encode() for secret in self.cfg.secrets)
         # shortcut: bounded signatures for common secrets, extend with an organization secret scanner if required.
-        with (self.project / path).open("rb") as file:
+        with (self.root / path).open("rb") as file:
             previous = b""
             while data := file.read(512 * 1024):
                 data = previous + data
@@ -285,10 +318,11 @@ class GitWorkspace:
     def check_meta(self, changes):
         for entry in changes:
             path, status = entry["path"], entry["status"]
-            if not path.startswith("Assets/") or any(part.startswith(".") or part.endswith("~")
-                                                       for part in PurePosixPath(path).parts):
+            relative = PurePosixPath(path)
+            if self.asset_prefix not in relative.parents or any(part.startswith(".") or part.endswith("~")
+                                                               for part in relative.parts):
                 continue
-            local = self.project / path
+            local = self.root / path
             if path.endswith(".meta"):
                 target = local.with_name(local.name[:-5])
                 if ((status != "D" and (not target.exists() or not GUID.search(local.read_bytes())))

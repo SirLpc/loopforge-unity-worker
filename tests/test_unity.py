@@ -12,6 +12,36 @@ def xml_result(failed=0, passed=1):
 
 
 class UnityEvidenceTests(unittest.TestCase):
+    def test_scoped_run_uses_literal_filters_and_checks_each_fixture(self):
+        from process_runner import StageError
+        from unity_executor import UnityExecutor
+
+        with test_directory() as project:
+            (project / "Packages").mkdir()
+            (project / "Packages/manifest.json").write_text('{"dependencies":{"com.unity.test-framework":"1"}}')
+            cfg = SimpleNamespace(project=project, unity_exe="Unity.exe", unity_version="2022.3.62f3",
+                                  unity_timeout=5, test_assemblies={"editmode": ("Game.EditMode",)})
+            scope = {"assembly": "Game.EditMode", "fixtures": ["Game.ComponentTests", "Game.SecondTests"]}
+            result = project / "report.xml"
+
+            def run(argv, mode, **kwargs):
+                self.assertEqual(argv[argv.index("-assemblyNames") + 1], "Game.EditMode")
+                self.assertTrue(argv[argv.index("-testFilter") + 1].startswith("^"))
+                self.assertEqual(argv[argv.index("-testCategory") + 1], "!GameAssetValidation")
+                result.write_text('<test-run result="Passed" total="1" passed="1"><test-suite type="Assembly" '
+                                  'name="Game.EditMode.dll"><test-case fullname="Game.ComponentTests.Runs" '
+                                  'classname="Game.ComponentTests" result="Passed" /></test-suite></test-run>')
+                return SimpleNamespace(exit_code=0)
+
+            ctx = SimpleNamespace(artifact=lambda mode, suffix, kind: project / ("report" + suffix), run=run)
+            with patch.object(UnityExecutor, "validate"), patch("unity_executor.inspect_log", return_value=(None, "2022.3.62f3", True, True)):
+                with self.assertRaisesRegex(StageError, "fixture"):
+                    UnityExecutor(cfg).run(ctx, "editmode", scope=scope)
+                scope["fixtures"].pop()
+                self.assertEqual(UnityExecutor(cfg).run(ctx, "editmode", scope=scope)["passed"], 1)
+                scope["fixtures"] = ["Game"]
+                with self.assertRaisesRegex(StageError, "outside the approved fixture"):
+                    UnityExecutor(cfg).run(ctx, "editmode", scope=scope)
     def test_compile_error_beats_zero_exit_code(self):
         from unity_executor import classify_editor_log
 
@@ -36,6 +66,20 @@ class UnityEvidenceTests(unittest.TestCase):
                     self.assertEqual(error.exception.kind, expected)
             file.write_text(xml_result(), encoding="utf-8")
             self.assertEqual(read_test_results(file)["passed"], 1)
+
+    def test_nunit_failed_case_label_error_is_a_fixable_test_failure(self):
+        from process_runner import StageError
+        from unity_executor import read_test_results
+
+        with test_directory() as root:
+            report = root / "results.xml"
+            report.write_text('<test-run result="Failed" total="1" passed="0" failed="1">'
+                              '<test-case fullname="Game.Fixture.Test" result="Failed" label="Error">'
+                              '<failure><message>test threw</message></failure></test-case></test-run>')
+            with self.assertRaises(StageError) as failure:
+                read_test_results(report)
+            self.assertEqual(failure.exception.kind, "tests_failed")
+            self.assertEqual(failure.exception.result["failed_tests"][0]["message"], "test threw")
 
     def test_xml_rejects_summary_without_matching_test_cases(self):
         from process_runner import StageError

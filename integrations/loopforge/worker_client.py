@@ -57,18 +57,29 @@ def operation_id(scope, action, attempt):
     return str(uuid5(NAMESPACE_URL, f"unity-worker:{scope}:{action}:{attempt}"))
 
 
-def input_json(name):
-    path = Path(name)
-    if not path.is_file() and not path.is_absolute() and ("*" in name or "?" in name):
-        files = [item for item in Path.cwd().glob(name) if item.is_file()]
-        if len(files) != 1:
-            raise ClientError(f"Expected one artifact matching {name}. Found {len(files)}.")
-        path = files[0]
+def read_json(path):
     with path.open(encoding="utf-8-sig") as source:
         result = json.load(source)
     if not isinstance(result, dict):
         raise ClientError("Expected a JSON object")
     return result
+
+
+def input_json(name, *, plan_request_id=None):
+    path = Path(name)
+    files = [path]
+    if not path.is_file() and not path.is_absolute() and ("*" in name or "?" in name):
+        files = [item for item in Path.cwd().glob(name) if item.is_file()]
+    if plan_request_id is None:
+        if len(files) != 1:
+            raise ClientError(f"Expected one artifact matching {name}. Found {len(files)}.")
+        return read_json(files[0])
+
+    matches = [artifact for artifact in map(read_json, files) if artifact.get("plan_request_id") == plan_request_id]
+    versions = {(artifact["task_id"], artifact["stage_result"]["revision"]) for artifact in matches}
+    if len(versions) != 1:
+        raise ClientError(f"Expected one Worker task and revision for the approved plan. Found {len(versions)}.")
+    return matches[0]
 
 
 def save_json(path, data):
@@ -81,20 +92,23 @@ def save_json(path, data):
         scratch.unlink(missing_ok=True)
 
 
-def handoff(task, job):
+def handoff(task, job, plan_request_id=None):
     task_id = task["task_id"]
     summary = {key: task.get(key) for key in (
         "status", "current_stage", "revision", "retry_count", "failure_kind", "error_message", "delivery", "lease",
     )}
     if job:
         summary.update(job_status=job["status"], job_error=job.get("error_message"))
-    return {
+    result = {
         "task_id": task_id, "job_id": job.get("job_id") or task.get("job_id"),
         "stage_result": summary, "changed_files": task.get("changed_files", []),
         "review_result": task.get("review_result"),
         "artifact_reference": [f"/api/v1/tasks/{task_id}/artifacts/{entry['name']}"
                                for entry in task.get("artifacts", []) if entry["kind"] != "log"],
     }
+    if plan_request_id:
+        result["plan_request_id"] = plan_request_id
+    return result
 
 
 def check_delivery(task, previous):
@@ -137,7 +151,10 @@ def run_action(client, args):
         return 0
     if args.from_artifact and args.task_id:
         raise ClientError("Select either --from-artifact or --task-id")
-    previous = input_json(args.from_artifact) if args.from_artifact else {}
+    plan_request_id = None
+    if args.approved_plan:
+        plan_request_id = str(UUID(input_json(args.approved_plan)["request_id"]))
+    previous = input_json(args.from_artifact, plan_request_id=plan_request_id) if args.from_artifact else {}
     task_id = args.task_id or previous.get("task_id")
     if action in ("create", "develop"):
         if task_id:
@@ -148,8 +165,10 @@ def run_action(client, args):
         if not creation_id and not run_id:
             raise ClientError("Approved plan must supply request_id or workflow_run_id")
         payload = {key: plan[key] for key in ("requirement", "plan", "acceptance_criteria")}
-        payload.update(workflow_run_id=run_id, project_rules=plan.get("project_rules", ""),
-                       request_id=str(UUID(creation_id)) if creation_id else operation_id(run_id, "create", 0))
+        plan_request_id = str(UUID(creation_id)) if creation_id else operation_id(run_id, "create", 0)
+        payload.update(workflow_run_id=run_id, project_rules=plan.get("project_rules", ""), request_id=plan_request_id)
+        if "test_selection" in plan:
+            payload["test_selection"] = plan["test_selection"]
         created = client.request("/api/v1/tasks", payload)
         task_id = created["task_id"]
         operation = None if action == "create" else "run"
@@ -160,7 +179,7 @@ def run_action(client, args):
     task_path = f"/api/v1/tasks/{UUID(task_id)}"
     task = client.request(task_path)
     if operation in (None, "status", "failure"):
-        result = handoff(task, {})
+        result = handoff(task, {}, plan_request_id)
         save_json(args.output, result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0
@@ -180,19 +199,28 @@ def run_action(client, args):
         payload.update(confirmed_stopped=True, note=args.note)
     job = None
     try:
-        job = client.request(task_path + "/" + operation, payload)
-        save_json(args.output, handoff(task, job))
+        if action in ("develop", "deliver", "release") and args.attempt == 0 and task.get("job_id"):
+            previous_job = client.request(f"/api/v1/jobs/{UUID(task['job_id'])}")
+            if previous_job.get("action") == operation:
+                if previous_job["status"] == "failed":
+                    payload["request_id"] = operation_id(task_id, operation, previous_job["job_id"])
+                else:
+                    job = previous_job
+        if job is None:
+            job = client.request(task_path + "/" + operation, payload)
+        save_json(args.output, handoff(task, job, plan_request_id))
         print(f"Unity Worker task {task_id}, job {job['job_id']}", flush=True)
         task, job = wait_job(client, task_path, job["job_id"], args.wait_seconds, args.follow)
     except (Interrupted, KeyboardInterrupt):
         print(f"Cancellation requested for Worker task {task_id}. Verify Windows process status.", file=sys.stderr)
         if operation not in ("cancel", "approve", "recover"):
             try:
-                client.request(task_path + "/cancel", {"request_id": operation_id(task_id, "cancel", args.attempt)})
+                attempt_id = job["job_id"] if job else payload["request_id"]
+                client.request(task_path + "/cancel", {"request_id": operation_id(task_id, "cancel", attempt_id)})
             except ClientError as error:
                 print(str(error), file=sys.stderr)
         raise ClientError("Node stopped. Check the Worker task and job before releasing the lease.") from None
-    result = handoff(task, job)
+    result = handoff(task, job, plan_request_id)
     save_json(args.output, result)
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0 if job["status"] == "succeeded" else 1
@@ -212,6 +240,7 @@ def main(argv=None):
                                           "cancel", "release", "recover", "pr"))
     parser.add_argument("--input", default="unity-plan.json")
     parser.add_argument("--from-artifact")
+    parser.add_argument("--approved-plan")
     parser.add_argument("--output", default="unity-task.json")
     parser.add_argument("--task-id")
     parser.add_argument("--run-id")
@@ -227,6 +256,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.attempt < 0 or args.wait_seconds <= 0:
         parser.error("Select a non-negative attempt and positive wait time")
+    if args.approved_plan and (args.action not in ("deliver", "release") or not args.from_artifact):
+        parser.error("--approved-plan requires a delivery or release operation with --from-artifact")
 
     def interrupted(signum, frame):
         raise Interrupted("SOP node received a termination signal")

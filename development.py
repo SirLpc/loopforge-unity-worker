@@ -12,6 +12,7 @@ from git_workspace import GitWorkspace
 from process_runner import ProcessRunner, StageError
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
+from worker_config import validate_test_selection
 
 
 STAGES = {
@@ -401,6 +402,8 @@ class DevelopmentWorker:
         ctx.save(revision=None, approved_revision=None, approval=None, compile_report=None, test_report=None,
                  review_result=None, agent_session_id=None)
         info = self.brief(ctx.task)
+        if ctx.task.get("test_selection"):
+            info["test_selection"] = ctx.task["test_selection"]
         if diagnostics:
             info["previous_failure"] = diagnostics
         try:
@@ -449,10 +452,33 @@ class DevelopmentWorker:
     def stage_test(self, ctx):
         revision = ctx.task["compile_report"]["revision"]
         self.assert_same_revision(ctx, revision)
-        reports = {mode: {"status": "not_run", "reason": "Disabled in Worker configuration"}
-                   for mode in ("editmode", "playmode") if mode not in self.cfg.test_modes}
+        selection = ctx.task.get("test_selection")
+        try:
+            validate_test_selection(selection, getattr(self.cfg, "test_assemblies", {}))
+        except ValueError as error:
+            raise StageError("unsupported", str(error)) from error
+        selected_modes = tuple(mode for mode in self.cfg.test_modes if not selection or mode in selection)
+        reports = {mode: {"status": "not_run", "reason": "No approved scope for this mode" if selection
+                          else "Disabled in Worker configuration"}
+                   for mode in ("editmode", "playmode") if mode not in selected_modes}
         ctx.save(test_report=reports)
-        for mode in self.cfg.test_modes:
+        for mode in selected_modes:
+            if selection:
+                reports[mode] = report = {"status": "running", "revision": revision, "runs": []}
+                for scope in selection[mode]:
+                    try:
+                        result = self.unity.run(ctx, mode, scope=scope)
+                    except StageError as error:
+                        report["runs"].append({"status": error.kind, "scope": scope, **error.result})
+                        report["status"] = error.kind
+                        ctx.save(test_report=reports)
+                        raise
+                    report["runs"].append({"status": "passed", "scope": scope, **result})
+                    ctx.save(test_report=reports)
+                    self.assert_same_revision(ctx, revision, unity=True)
+                report["status"] = "passed"
+                ctx.save(test_report=reports)
+                continue
             try:
                 reports[mode] = {"status": "passed", **self.unity.run(ctx, mode)}
             except StageError as error:

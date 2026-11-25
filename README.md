@@ -22,6 +22,10 @@ $env:UNITY_WORKER_APPROVAL_TOKEN = [System.Net.NetworkCredential]::new('', (Read
 
 Codex 配置使用 Windows 原生 codex.exe。npm 安装的 PowerShell 和 CMD 包装器可以用来查询版本，Worker 进程使用 vendor 目录内的可执行文件。将 UNITY_CODEX_HOME 或 codex_home 指到专用且已初始化的目录。用专用账号和该 CODEX_HOME 完成 CLI 登录，或为服务注入专用 OPENAI_API_KEY / CODEX_API_KEY。每次服务首次用到 Codex 时检测 --version、exec --help 和 sandbox --help。0.172.0 的 MXC 实现及审查权限探针已实测。默认使用 mxc，允许在管理员已预配的机器上选择 elevated。权限探针失败时任务会停止。
 
+Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指向独立 Git 检出根。为项目在首次启动前恢复其固定版本依赖。`ignored_cache_paths` 可登记 Git 已忽略的具体依赖缓存路径。`allowed_tracked_outputs` 可登记基础树中的具体历史产物，任务修改这些文件时会被阻断。
+
+配置 `[test_assemblies]` 后，每个开发任务必须提供 `test_selection`。键为 `editmode` 或 `playmode`，值为包含 `assembly` 和 `fixtures` 的列表。填写完整测试类名，由 Worker 生成程序集和测试筛选参数，并在 XML 中核对每个夹具实际运行。省略 `[test_assemblies]` 时沿用既有测试模式。
+
 启动脚本默认监听 127.0.0.1。WSL2 NAT 部署用 Ubuntu 的 ip -4 route show default 确定 Windows 网关，在启动脚本传入 -BindAddress <网关IP> 并将防火墙来源限制到 WSL2/Docker 所需网络。配置受信任链路或 TLS。Docker Desktop 的 host.docker.internal 也可通过健康探针验证。生产运行一个服务实例且 --workers 1，状态目录固定。实例互斥由 Windows 内核对象和数据库租约共同保护。只有 Worker 使用该工程执行 Git 及 Unity 操作。
 
 ## 开发与交付

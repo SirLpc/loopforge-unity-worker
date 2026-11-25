@@ -48,12 +48,72 @@ class WorkspaceTests(unittest.TestCase):
                               max_diff_bytes=100_000, unity_version="2022.3.62f3", secrets=("fake-sensitive-token",))
         runner = ProcessRunner()
 
-        def run(argv, label, **options):
-            return runner.run(argv, project, logs / (label + "-" + uuid4().hex),
+        def run(argv, label, cwd=project, **options):
+            return runner.run(argv, cwd, logs / (label + "-" + uuid4().hex),
                               cancel=threading.Event(), **options)
 
         ctx = SimpleNamespace(run=run, directory=logs)
         return GitWorkspace(cfg), ctx, remote, project
+
+    def test_git_uses_a_fresh_hooks_directory_outside_the_checkout(self):
+        with test_directory() as root:
+            workspace, ctx, _, project = self.workspace(root)
+            commands = []
+            run = ctx.run
+
+            def observe(argv, label, **options):
+                path = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("core.hooksPath=")))
+                self.assertTrue(path.is_dir())
+                self.assertFalse(path.is_relative_to(project))
+                commands.append(path)
+                return run(argv, label, **options)
+
+            ctx.run = observe
+            workspace.text(ctx, "rev-parse", "HEAD")
+            workspace.text(ctx, "rev-parse", "HEAD")
+            self.assertNotEqual(*commands)
+            self.assertTrue(all(not path.exists() for path in commands))
+
+    def test_nested_project_keeps_cache_and_protects_baseline_log(self):
+        from git_workspace import GitWorkspace
+        from process_runner import StageError
+
+        with test_directory() as root:
+            workspace, ctx, remote, checkout = self.workspace(root)
+            unity = checkout / "client"
+            unity.mkdir()
+            for name in ("ProjectSettings", "Packages", "Library", ".gitignore"):
+                (checkout / name).rename(unity / name)
+            legacy = checkout / "Logs/LadderApproachTests.log"
+            legacy.parent.mkdir()
+            legacy.write_text("historic baseline\n")
+            with (unity / ".gitignore").open("a") as ignore:
+                ignore.write("/Assets/Packages/\n")
+            dependency = unity / "Assets/Packages/dependency.dll"
+            dependency.parent.mkdir(parents=True)
+            dependency.write_bytes(b"restored dependency")
+            git(checkout, "add", "--all")
+            git(checkout, "commit", "-m", "Use a nested Unity project")
+            git(checkout, "push", "origin", "main")
+            cfg = workspace.cfg
+            cfg.project, cfg.git_root = unity, checkout
+            cfg.allowed_tracked_outputs = ("Logs/LadderApproachTests.log",)
+            cfg.ignored_cache_paths = ("client/Assets/Packages",)
+            workspace = GitWorkspace(cfg)
+            task = workspace.prepare(ctx, "ai/task-nested")
+            self.assertEqual(task["base_commit"], git(remote, "rev-parse", "main"))
+            self.assertEqual((unity / "Library/cache").read_text(), "keep")
+            self.assertEqual(dependency.read_bytes(), b"restored dependency")
+            (unity / "Assets/New.cs").write_text("class New {}")
+            with self.assertRaisesRegex(StageError, "meta"):
+                workspace.snapshot(ctx, task, check_meta=True)
+            (unity / "Assets/New.cs.meta").write_text("guid: " + "a" * 32 + "\n")
+            snapshot = workspace.snapshot(ctx, task, check_meta=True)
+            self.assertEqual({row["path"] for row in snapshot.changes},
+                             {"client/Assets/New.cs", "client/Assets/New.cs.meta"})
+            legacy.write_text("modified\n")
+            with self.assertRaisesRegex(StageError, "Cache or build output"):
+                workspace.snapshot(ctx, task)
 
     def test_fetch_base_and_create_branch_in_place(self):
         with test_directory() as root:

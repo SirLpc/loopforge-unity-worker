@@ -5,13 +5,41 @@ import re
 import shutil
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 PROJECT_VERSION = "ProjectSettings/ProjectVersion.txt"
 VERSION_PATTERN = r"\d+\.\d+\.\d+[abfp]\d+(?:c\d+)?"
 REMOTE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 BRANCH_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}"
+ASSEMBLY_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}"
+FIXTURE_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*(?:[.+][A-Za-z_][A-Za-z0-9_]*)*"
+
+
+def validate_test_selection(selection, allowed):
+    if selection is None and not allowed:
+        return
+    if not allowed or not isinstance(selection, dict) or not selection.get("editmode"):
+        raise ValueError("Provide approved EditMode test assemblies and fixture names")
+    for mode, scopes in selection.items():
+        if mode not in allowed or not isinstance(scopes, list) or not 1 <= len(scopes) <= 8:
+            raise ValueError("Test mode is unavailable or has an invalid scope count")
+        seen = set()
+        for scope in scopes:
+            if not isinstance(scope, dict) or set(scope) != {"assembly", "fixtures"}:
+                raise ValueError("Each test scope requires an assembly and fixture names")
+            assembly, fixtures = scope["assembly"], scope["fixtures"]
+            if not isinstance(assembly, str) or assembly not in allowed[mode] or assembly in seen:
+                raise ValueError("Test assembly is not allowed or is repeated")
+            seen.add(assembly)
+            if not isinstance(fixtures, list) or not 1 <= len(fixtures) <= 20:
+                raise ValueError("Choose between one and twenty test fixtures per assembly")
+            if any(not isinstance(name, str) or len(name) > 220 or not re.fullmatch(FIXTURE_PATTERN, name)
+                   or name.rsplit(".", 1)[-1].casefold() == "shippedassettests" for name in fixtures):
+                raise ValueError("Test fixtures must use approved literal class names")
+            if len(set(fixtures)) != len(fixtures):
+                raise ValueError("Test fixtures must be distinct")
+
 
 
 def read_project_version(project):
@@ -66,6 +94,15 @@ class Settings:
     test_modes: tuple = ("editmode", "playmode")
     max_diff_bytes: int = 2_000_000
 
+    git_root: Path | None = None
+    allowed_tracked_outputs: tuple[str, ...] = ()
+    ignored_cache_paths: tuple[str, ...] = ()
+    test_assemblies: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def checkout(self):
+        return self.git_root or self.project
+
     @property
     def secrets(self):
         return tuple(value for value in (
@@ -96,10 +133,13 @@ class Settings:
         if any(not value.isascii() or any(c.isspace() for c in value) for value in (token, approval) if value):
             raise ValueError("Bearer tokens must use ASCII without whitespace")
         project = Path(get("project", "UNITY_PROJECT")).resolve(strict=True)
+        checkout = Path(get("git_root", "UNITY_GIT_ROOT", project)).resolve(strict=True)
+        if not checkout.is_dir() or not project.is_relative_to(checkout):
+            raise ValueError("Unity project must be inside its Git checkout")
         logs = Path(get("logs", "UNITY_WORKER_LOGS", Path(__file__).parent / "logs")).resolve()
         service = Path(__file__).resolve().parent
-        if logs.is_relative_to(project) or service.is_relative_to(project):
-            raise ValueError("Service and data directories must be outside the Unity project")
+        if logs.is_relative_to(checkout) or service.is_relative_to(checkout):
+            raise ValueError("Service and data directories must be outside the Git checkout")
         version = get("unity_version", "UNITY_VERSION", read_project_version(project))
         if version != read_project_version(project):
             raise ValueError("Configured Unity version does not match ProjectVersion.txt")
@@ -127,8 +167,28 @@ class Settings:
         codex_home = get("codex_home", "UNITY_CODEX_HOME")
         if codex_home:
             codex_home = Path(codex_home).resolve(strict=True)
-            if codex_home.is_relative_to(project) or project.is_relative_to(codex_home):
+            if codex_home.is_relative_to(checkout) or checkout.is_relative_to(codex_home):
                 raise ValueError("Use a separate worker Codex home outside the Unity project")
+        def relative_paths(key):
+            paths = config.get(key, [])
+            if (not isinstance(paths, list) or any(
+                    not isinstance(path, str) or not path or not PurePosixPath(path).parts
+                    or PurePosixPath(path).as_posix() != path
+                    or any(part in ("..", "/") for part in PurePosixPath(path).parts)
+                    or any(char in path for char in ("\\", ":", "\r", "\n"))
+                    for path in paths)):
+                raise ValueError(f"{key} must contain exact checkout-relative paths")
+            return tuple(paths)
+
+        allowed_outputs = relative_paths("allowed_tracked_outputs")
+        ignored_cache_paths = relative_paths("ignored_cache_paths")
+        assemblies = config.get("test_assemblies", {})
+        if (not isinstance(assemblies, dict) or (assemblies and "editmode" not in assemblies)
+                or any(mode not in modes or not isinstance(names, list) or not names
+                       or any(not isinstance(name, str) or not re.fullmatch(ASSEMBLY_PATTERN, name)
+                              or "assetvalidation" in name.casefold() for name in names)
+                       for mode, names in assemblies.items())):
+            raise ValueError("Configure valid scoped test assemblies by enabled mode")
         configured_git = get("git_exe", "UNITY_GIT_EXE", "git")
         unity_exe = executable(get("unity_exe", "UNITY_EXE"))
         logs.mkdir(parents=True, exist_ok=True)
@@ -143,4 +203,6 @@ class Settings:
             codex_home=codex_home, codex_timeout=positive("codex_timeout", "UNITY_CODEX_TIMEOUT", 1800),
             codex_sandbox=sandbox, max_fixes=max_fixes, test_modes=tuple(modes),
             max_diff_bytes=positive("max_diff_bytes", "UNITY_MAX_DIFF_BYTES", 2_000_000),
+            git_root=checkout, allowed_tracked_outputs=allowed_outputs, ignored_cache_paths=ignored_cache_paths,
+            test_assemblies={mode: tuple(names) for mode, names in assemblies.items()},
         )

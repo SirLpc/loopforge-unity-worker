@@ -1,6 +1,10 @@
 # Copy to config.toml. Paths are resolved by the Windows Worker.
 worker_id = 'worker-01'
 project = 'D:\UnityWorkers\worker-01\project'
+# git_root defaults to project. Set it to the checkout root when Unity is nested.
+# git_root = 'D:\UnityWorkers\worker-01\repo'
+# ignored_cache_paths = ['client/Assets/Packages', 'client/Assets/Packages.meta']
+# allowed_tracked_outputs = ['Logs/LadderApproachTests.log']
 logs = 'D:\UnityWorkers\worker-01\state'
 unity_exe = 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe'
 unity_version = '2022.3.62f3'
@@ -24,3 +28,8 @@ max_diff_bytes = 2000000
 
 # Set UNITY_WORKER_TOKEN and a different UNITY_WORKER_APPROVAL_TOKEN in the service environment.
 # Optional PR/MR creation uses UNITY_PR_PROVIDER, UNITY_PR_API_URL, UNITY_PR_REPOSITORY and UNITY_PR_TOKEN.
+
+# Optional per-mode assembly allowlist. When present, development requests require test_selection.
+# [test_assemblies]
+# editmode = ['Game.Tests.EditMode']
+# playmode = ['Game.Tests.PlayMode']

@@ -32,9 +32,13 @@ if "-batchmode" in args:
         assert "-quit" not in args
         failed = (root / "broken_tests").exists()
         outcome = "Failed" if failed else "Passed"
+        case = f'<test-case result="{outcome}" />'
+        if "-assemblyNames" in args:
+            case = (f'<test-suite type="Assembly" name="{argument("-assemblyNames")}.dll">'
+                    f'<test-case result="{outcome}" fullname="Game.UnitTests.Runs" classname="Game.UnitTests" /></test-suite>')
         Path(argument("-testResults")).write_text(
             f'<test-run result="{outcome}" total="1" passed="{int(not failed)}" failed="{int(failed)}">'
-            f'<test-case result="{outcome}" /></test-run>', encoding="utf-8",
+            f'{case}</test-run>', encoding="utf-8",
         )
 elif args == ["--version"]:
     print("codex-cli 0.172.0 (fixture)")
