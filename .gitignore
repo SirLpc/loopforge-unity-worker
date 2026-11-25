@@ -1,0 +1,26 @@
+# Local configuration
+/config.toml
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Worker state and test workspaces
+/logs/
+/state/
+/worker.sqlite3
+/worker.sqlite3-*
+/.tmp-test-*/
+
+# Python environment, caches, and coverage
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.coverage
+/.coverage.*
+/htmlcov/
+
+# Windows Explorer metadata
+Thumbs.db
+Desktop.ini

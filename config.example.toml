@@ -1,0 +1,26 @@
+# Copy to config.toml. Paths are resolved by the Windows Worker.
+worker_id = 'worker-01'
+project = 'D:\UnityWorkers\worker-01\project'
+logs = 'D:\UnityWorkers\worker-01\state'
+unity_exe = 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe'
+unity_version = '2022.3.62f3'
+unity_timeout = 1800
+
+git_exe = 'git'
+git_remote = 'origin'
+base_branch = 'main'
+git_timeout = 600
+init_submodules = false
+
+# Use the native executable, e.g. the vendor codex.exe from the npm installation.
+# Leave the two entries commented out to deploy startup smoke without Codex.
+# codex_exe = 'D:\UnityWorkers\tools\codex\codex.exe'
+# codex_home = 'D:\UnityWorkers\worker-01\codex-home'
+codex_sandbox = 'mxc'
+codex_timeout = 1800
+max_fixes = 3
+test_modes = ['editmode', 'playmode']
+max_diff_bytes = 2000000
+
+# Set UNITY_WORKER_TOKEN and a different UNITY_WORKER_APPROVAL_TOKEN in the service environment.
+# Optional PR/MR creation uses UNITY_PR_PROVIDER, UNITY_PR_API_URL, UNITY_PR_REPOSITORY and UNITY_PR_TOKEN.
