@@ -86,14 +86,16 @@ class GitWorkspace:
     def text(self, ctx, *args, **kwargs):
         return self.git(ctx, *args, **kwargs)[1].decode("utf-8", errors="strict").strip()
 
-    def validate(self, ctx):
-        assert_unity_closed(self.project)
+    def validate_checkout_identity(self, ctx):
         root = self.text(ctx, "rev-parse", "--show-toplevel")
         if type(self.root)(root).resolve() != self.root:
             raise StageError("invalid_repository", "Configured git_root must be the Git checkout root")
         git_dir = self.text(ctx, "rev-parse", "--absolute-git-dir")
         if type(self.root)(git_dir).resolve() != self.root / ".git":
             raise StageError("invalid_repository", "Use a standalone Git checkout with its own .git directory")
+    def validate(self, ctx):
+        assert_unity_closed(self.project)
+        self.validate_checkout_identity(ctx)
         for path in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply",
                      "sequencer", "BISECT_START", "index.lock", "shallow.lock", "config.lock"):
             if (self.root / ".git" / path).exists():
@@ -203,6 +205,9 @@ class GitWorkspace:
         self.assert_safe_tree(ctx, "HEAD")
         cfg = self.cfg
         remote_identity = self.remote_identity(ctx)
+        expected_remote = getattr(cfg, "expected_remote_identity", None)
+        if expected_remote is not None and remote_identity != expected_remote:
+            raise StageError("remote_mismatch", "The workspace Git remote differs from its pool")
         self.text(ctx, "check-ref-format", "--branch", cfg.base_branch)
         self.git(ctx, "fetch", "--no-tags", "--no-recurse-submodules", "--", cfg.git_remote,
                  f"refs/heads/{cfg.base_branch}")

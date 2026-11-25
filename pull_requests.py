@@ -37,6 +37,12 @@ class HostedPullRequests:
                        os.environ.get("UNITY_PR_REPOSITORY", ""), os.environ.get("UNITY_PR_TOKEN", ""))
         return None
 
+    @classmethod
+    def from_pool_config(cls, config):
+        if config is None:
+            return None
+        return cls(config["provider"], config["api_url"], config["repository"], os.environ.get(config["token_env"], ""))
+
     def request(self, path, payload=None):
         headers = {"Accept": "application/json", "User-Agent": "UnityWorker"}
         if self.provider == "github":

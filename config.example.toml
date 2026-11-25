@@ -33,3 +33,28 @@ max_diff_bytes = 2000000
 # [test_assemblies]
 # editmode = ['Game.Tests.EditMode']
 # playmode = ['Game.Tests.PlayMode']
+
+# To use named pools, move project, git_root and codex_home into each slot.
+# The simple single-project configuration above remains valid on its own.
+# default_pool = "game"
+# legacy_slot = "worker-01"
+# max_parallel_unity = 1
+#
+# [pools.game]
+# unity_exe = 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe'
+# unity_version = "2022.3.62f3"
+# git_remote = "origin"
+# base_branch = "main"
+# remote_identity = "<SHA-256 of fetch URL, NUL, then push URL>"
+#
+# [[pools.game.slots]]
+# id = "worker-01"
+# git_root = 'D:\UnityWorkers\worker-01'
+# project = 'D:\UnityWorkers\worker-01\client'
+# codex_home = 'D:\UnityWorkers\homes\worker-01'
+#
+# [[pools.game.slots]]
+# id = "worker-02"
+# git_root = 'D:\UnityWorkers\worker-02'
+# project = 'D:\UnityWorkers\worker-02\client'
+# codex_home = 'D:\UnityWorkers\homes\worker-02'
