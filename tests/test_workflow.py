@@ -300,6 +300,73 @@ class WorkflowTests(unittest.TestCase):
                                                           implementation_attempt=1, feedback="Keep it brief")
             self.assertEqual(current["current_stage"], "fix")
 
+    def stage_with_report_write_failure(self, client, task, action, *, error_type=OSError, **payload):
+        write_text = Path.write_text
+
+        def write_file(path, *args, **kwargs):
+            if path.name.endswith("-development-report.json"):
+                raise error_type("Simulated report write failure")
+            return write_text(path, *args, **kwargs)
+
+        with patch.object(Path, "write_text", new=write_file):
+            return self.stage(client, task, action, **payload)
+
+    def test_staged_report_io_failure_can_retry_test(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for stage in ("implement", "compile", "review"):
+                job = self.stage(client, task, stage)
+                self.assertEqual(job["status"], "succeeded", job)
+            reviewed = self.task(client, task)
+            failed = self.stage_with_report_write_failure(client, task, "test")
+            self.assertEqual(failed["status"], "failed", failed)
+            incomplete = self.task(client, task)
+            self.assertEqual(incomplete["current_stage"], "test")
+            self.assertIsNone(incomplete["verification"])
+
+            completed = self.stage(client, task, "test")
+            self.assertEqual(completed["status"], "succeeded", completed)
+            self.assertEqual(failed["failure_kind"], "report_io_failed", failed)
+            self.assertNotEqual(completed["job_id"], failed["job_id"])
+            current = self.task(client, task)
+            self.assertEqual(current["review_result"], reviewed["review_result"])
+            self.assertEqual(current["verification"], {"revision": reviewed["revision"], "test_job_id": completed["job_id"],
+                                                       "implementation_attempt": 0})
+            self.assertEqual(current["retry_count"], 0)
+
+            payload = {"workflow_run_id": "run-feature-41", "implementation_attempt": 1, "feedback": "Keep the greeting"}
+            unexpected = self.stage_with_report_write_failure(client, task, "rework", error_type=RuntimeError, **payload)
+            self.assertEqual(unexpected["failure_kind"], "worker_error", unexpected)
+            response = client.post(f"/api/v1/tasks/{task}/rework", json={"request_id": str(uuid4()), **payload})
+            self.assertEqual(response.status_code, 409, response.text)
+
+    def test_staged_report_io_failure_can_resume_rework(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for stage in ("implement", "compile", "review", "test"):
+                job = self.stage(client, task, stage)
+                self.assertEqual(job["status"], "succeeded", job)
+            payload = {"workflow_run_id": "run-feature-41", "implementation_attempt": 1,
+                       "feedback": "  Keep the welcome.  "}
+            request_id = str(uuid4())
+            failed = self.stage_with_report_write_failure(client, task, "rework", request_id=request_id, **payload)
+            self.assertEqual(failed["status"], "failed", failed)
+            incomplete = self.task(client, task)
+            self.assertEqual(incomplete["current_stage"], "fix")
+            self.assertIsNone(incomplete["verification"])
+            self.assertEqual(self.start(client, task, "rework", request_id=request_id, **payload), failed["job_id"])
+
+            resumed = self.stage(client, task, "rework", **payload)
+            self.assertEqual(resumed["status"], "succeeded", resumed)
+            self.assertEqual(failed["failure_kind"], "report_io_failed", failed)
+            self.assertNotEqual(resumed["job_id"], failed["job_id"])
+            current = self.task(client, task)
+            self.assertEqual(current["current_stage"], "implemented")
+            self.assertEqual(current["implementation_attempt"], 1)
+            self.assertEqual(current["retry_count"], 1)
+            self.assertEqual(self.agent.implementation_briefs[-1]["previous_failure"]["feedback"], payload["feedback"])
+            self.assertIsNone(current["verification"])
+
     def test_staged_review_precedes_tests_and_rework_invalidates_evidence(self):
         with self.staged_client() as client:
             task = self.accepted_staged_plan(client)

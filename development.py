@@ -41,7 +41,7 @@ TERMINAL = {"completed", "cancelled", "failed"}
 RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "license_failed", "package_failed",
              "startup_failed", "test_execution_failed", "not_run", "unsupported", "review_blocked", "dirty_workspace"}
 REWORK_RETRYABLE = {"git_failed", "timeout", "workspace_in_use", "dirty_workspace", "workspace_changed",
-                    "unsupported", "recovered"}
+                    "unsupported", "recovered", "report_io_failed"}
 
 
 class TaskNotFound(Exception):
@@ -346,6 +346,8 @@ class DevelopmentWorker:
                 return "prepare"
             if stage == "fix" and task.get("rework_pending"):
                 return None
+            if staged_feature and stage == "test" and failure == "report_io_failed":
+                return "test"
             if staged_feature and failure == "recovered" and stage in {"reviewed", "tested"} and not task.get("verification"):
                 return "test"
             if failure in FIXABLE and task["retry_count"] < self.cfg.pools[task["pool_id"]].policy.max_fixes:
@@ -573,7 +575,9 @@ class DevelopmentWorker:
             except Exception as exc:
                 logging.getLogger(__name__).error("Cannot save job report %s (%s)", job["job_id"], type(exc).__name__)
                 if error is None:
-                    error = StageError("worker_error", "Cannot save the development report")
+                    kind = ("report_io_failed" if isinstance(exc, OSError) and stage_finalizes_with_job(ctx.task, action)
+                            else "worker_error")
+                    error = StageError(kind, "Cannot save the development report")
         with self.guard:
             try:
                 cancellable = action == "accept-plan" or (ctx and stage_finalizes_with_job(ctx.task, action))
