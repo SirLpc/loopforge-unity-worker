@@ -99,10 +99,10 @@ HUMAN_APPROVAL = b"# Approval\n\nApproved by a human gate.\n"
 ARTIFACT_LIMIT = 8 * 1024 * 1024
 
 
-def feature_artifact(run, node_id, reader):
+def feature_artifact(run, node_id, reader, *, name=None):
     attempt = run["nodes"][node_id]["attempt"]
     matches = [a for a in run.get("artifacts", []) if a.get("nodeId") == node_id and a.get("attempt") == attempt
-               and a.get("name") == FEATURE_NODES[node_id]]
+               and a.get("name") == (name or FEATURE_NODES[node_id])]
     if len(matches) != 1 or matches[0].get("runId") != run["id"]:
         raise ContextError("Missing or ambiguous current artifact from " + node_id)
     meta = matches[0]
@@ -112,6 +112,54 @@ def feature_artifact(run, node_id, reader):
     if not isinstance(raw, bytes) or len(raw) > ARTIFACT_LIMIT or hashlib.sha256(raw).hexdigest() != meta["sha256"]:
         raise ContextError("Platform content differs from its recorded digest")
     return {key: meta[key] for key in ("id", "sha256", "name")}, raw
+
+
+def public_feedback(value):
+    encoded = value.encode()
+    if len(encoded) <= 800:
+        return value
+    # Go slices at a byte offset, then encoding/json replaces each incomplete UTF-8 byte.
+    clipped = encoded[:800].decode("utf-8", "surrogateescape")
+    return re.sub(r"[\udc80-\udcff]", "\ufffd", clipped) + "…"
+
+
+def full_rejection_feedback(run, feedback, reader):
+    gate = run["nodes"]["accept"]
+    source = {}
+    retry = None
+    for event in reversed(run.get("events", [])):
+        if event.get("runId") != run["id"]:
+            continue
+        if event.get("nodeId") == "accept" and event.get("type") in {"gate.rejected", "node.started"}:
+            source = event
+            break
+        if retry is None and event.get("nodeId") == "implement" and event.get("type") == "node.retry_requested":
+            retry = event["message"]
+    prefix = "打回到 implement："
+    if (source.get("runId") != run["id"] or source.get("type") != "gate.rejected"
+            or not source.get("message", "").startswith(prefix)):
+        raise ContextError("Full rejection feedback is unavailable for this implementation round")
+    reason = source["message"][len(prefix):].strip()
+    notes = [a for a in run.get("artifacts", []) if a.get("nodeId") == "accept" and a.get("name") == "human-context"
+             and a.get("attempt") == gate["attempt"]]
+    if notes:
+        _, raw = feature_artifact(run, "accept", reader, name="human-context")
+        marker = "# 人工补充上下文\n\n"
+        body = raw.decode("utf-8")
+        if not body.startswith(marker) or not body.endswith("\n"):
+            raise ContextError("Invalid rejection context artifact")
+        context = body[len(marker):-1]
+        reason = (reason + "\n\n" if reason else "") + "人工补充上下文：\n" + context
+    displayed = reason
+    if retry is not None:
+        label, separator, note = retry.partition("：")
+        if not separator or label not in {"从指定节点重跑", "从中断处继续"}:
+            raise ContextError("Unknown implementation retry feedback")
+        displayed = note
+    if public_feedback(displayed) != feedback or len(reason) > 4000 or "\0" in reason:
+        raise ContextError("Full rejection feedback differs from the current node or exceeds the Worker limit")
+    return reason
+
 
 
 def feature_context(run, run_id, project_id, artifact_reader, approval_key, now):
@@ -143,6 +191,11 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now)
     scope = {"workflow_project_id": project_id, "workflow_id": workflow_id, "workflow_run_id": run_id}
     context = {**scope, "node_id": node, "node_attempt": attempt, "rework": rework, "feedback": feedback,
                "operation": "feature-" + ("delivery" if node == "deliver" else node)}
+    if node == "implement" and rework:
+        try:
+            context["feedback"] = full_rejection_feedback(run, feedback, artifact_reader)
+        except (ContextError, UnicodeError) as error:
+            context.update(feedback="", feedback_error=str(error))
     if node == "clarify":
         requirement = run.get("input", "").strip()
         if not 0 < len(requirement) <= 20000 or "\0" in requirement:
@@ -164,7 +217,7 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now)
             continue
         try:
             record = json.loads(raw)
-        except (UnicodeError, ValueError) as error:
+        except (RecursionError, UnicodeError, ValueError) as error:
             raise ContextError("Invalid feature evidence JSON") from error
         expected = {**binding, "node_id": upstream, "node_attempt": prior["attempt"],
                     "parent_artifact_id": previous["id"] if previous else None}
@@ -180,7 +233,7 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now)
             binding.update(revision=record["revision"], implementation_attempt=rework)
         if upstream == "review":
             review = record.get("review_result") or {}
-            if review.get("verdict") != "pass" or review.get("revision") != binding["revision"]:
+            if not isinstance(review, dict) or review.get("verdict") != "pass" or review.get("revision") != binding["revision"]:
                 raise ContextError("Missing current passing review")
         if upstream == "test":
             checked = {"revision": binding["revision"], "test_job_id": record["job_id"], "implementation_attempt": rework}
@@ -198,7 +251,6 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now)
                       test_artifact_id=previous["id"], test_digest=previous["sha256"])
         context["approval"] = sign_approval(claims, approval_key, now)
     return context
-
 
 
 def service_client(base_url, secret):
@@ -276,7 +328,7 @@ def publish_workspace_contexts(workspace_root, context_secret, platform_call, pr
             else:
                 operation = "plan" if run.get("nodes", {}).get("worker-plan", {}).get("status") == "running" else "approve"
                 record = run_context(run, run_id, operation, project_id)
-        except (ContextError, KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError):
+        except (ContextError, AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError, subprocess.SubprocessError):
             continue
         workspaces.setdefault(workspace_owner, {})[sandbox] = {"operation": operation, **record}
     for owner, records in workspaces.items():

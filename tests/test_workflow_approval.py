@@ -64,6 +64,29 @@ class WorkflowDeliveryTests(WorkflowFixture):
         with patch.dict(os.environ, {"UNITY_WORKER_WORKFLOW_APPROVAL_KEY": self.key}):
             return self.staged_client(pr_adapter=pr_adapter)
 
+    def test_staged_operation_lookup_is_task_scoped(self):
+        with self.delivery_client() as client:
+            tasks = []
+            for mode in ("staged-feature", "staged-feature", None):
+                request = {"request_id": str(uuid4()), "planning_profile": "feature", "requirement": "Find receipts",
+                           "workflow_run_id": "run-44"}
+                if mode:
+                    request.update(workflow_mode=mode, workflow_project_id="garden")
+                job = client.post("/api/v1/planning-tasks", json=request).json()
+                tasks.append((job, request["request_id"]))
+            (job, request_id), (other, _), (legacy, legacy_request) = tasks
+            url = lambda owner, request: f"/api/v1/tasks/{owner['task_id']}/operations/{request}"
+            response = client.get(url(job, request_id))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["job"]["job_id"], job["job_id"])
+            self.assertIsNone(client.get(url(other, request_id)).json()["job"])
+            self.assertEqual(client.get(url(legacy, legacy_request)).status_code, 404)
+            # The predecessor can change between the Runner's GET and POST.
+            route = f"/api/v1/tasks/{job['task_id']}/clarify?after_job={other['job_id']}"
+            late_id = str(uuid4())
+            self.assertEqual(client.post(route, json={"request_id": late_id}).status_code, 409)
+            self.assertIsNone(client.get(url(job, late_id)).json()["job"])
+
     def test_key_is_private_and_independent(self):
         from codex_executor import CodexExecutor
         from worker_config import Settings, system_env
@@ -255,12 +278,17 @@ class WorkflowDeliveryTests(WorkflowFixture):
             def interrupted(job, *args):
                 worker.store.recover_interrupted(job["job_id"])
 
+            request_id = str(uuid4())
+            route = f"/api/v1/tasks/{task['task_id']}/operations/{request_id}"
             with patch.object(worker, "finish", side_effect=interrupted):
-                first = self.current_delivery_job(client, task)
+                first = self.current_delivery_job(client, task, request_id)
+            self.assertIsNone(client.get(route).json()["recovered_by"])
             self.assertEqual(first["status"], "recovery_required")
             pushed = self.task(client, task["task_id"])
             self.assertEqual(pushed["delivery"]["pull_request"]["id"], 12)
             self.recover(client, task["task_id"])
+            recovery_id = self.task(client, task["task_id"])["job_id"]
+            self.assertEqual(client.get(route).json()["recovered_by"], recovery_id)
             with patch.object(adapter, "create", side_effect=AssertionError("MR was already recorded")), \
                     patch("git_workspace.GitWorkspace.push", side_effect=AssertionError("branch was already pushed")):
                 with patch.object(worker, "report", side_effect=OSError("fixture report directory offline")):

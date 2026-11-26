@@ -204,6 +204,17 @@ class Store:
     def request(self, db, request_id):
         return self._one(db.execute("SELECT data FROM jobs WHERE request_id = ?", (request_id,)))
 
+    @staticmethod
+    def recovery_after(db, task_id, job_id):
+        # A failed recovery can be repeated. Any other admitted operation ends this recovery window.
+        row = db.execute(
+            """SELECT id, json_extract(data, '$.action') FROM jobs
+               WHERE task_id = ? AND rowid > (SELECT rowid FROM jobs WHERE id = ?)
+                 AND (json_extract(data, '$.action') != 'recover' OR status = 'succeeded')
+               ORDER BY rowid LIMIT 1""", (task_id, job_id),
+        ).fetchone()
+        return row[0] if row and row[1] == "recover" else None
+
     def active_job(self, db, task_id):
         return self._one(db.execute("SELECT data FROM jobs WHERE task_id = ? AND status IN ('queued', 'running')", (task_id,)))
 

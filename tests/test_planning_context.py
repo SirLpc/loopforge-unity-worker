@@ -160,3 +160,43 @@ class FeatureContextTests(unittest.TestCase):
             with (self.subTest(node=node, values=values), patch.dict(self.bodies, {meta["id"]: body}),
                   patch.dict(meta, sha256=hashlib.sha256(body).hexdigest()), self.assertRaises(ContextError)):
                 self.context()
+
+    def test_reconstruct_clipped_rejection_from_event_and_current_gate_context(self):
+        import hashlib
+        nodes = self.run["nodes"]
+        nodes["mr"]["status"] = "pending"
+        nodes["implement"]["status"] = "running"
+        nodes["accept"]["status"] = "pending"
+        reason = "修改树木" * 100
+        note = "结尾需要再次核对。"
+        full = reason + "\n\n人工补充上下文：\n" + note
+        # Go JSON encoding replaces each byte of the trailing incomplete rune.
+        clipped = "修改树木" * 66 + "修改" + "\ufffd\ufffd…"
+        nodes["implement"]["feedback"] = clipped
+        self.run["events"] = [{"runId": self.run_id, "nodeId": "accept", "type": "gate.rejected",
+                              "message": "打回到 implement：" + reason}]
+        raw = ("# 人工补充上下文\n\n" + note + "\n").encode()
+        self.bodies["extra-context"] = raw
+        self.run["artifacts"].append({"id": "extra-context", "runId": self.run_id, "nodeId": "accept", "attempt": 3,
+                                      "name": "human-context", "sha256": hashlib.sha256(raw).hexdigest()})
+        self.assertEqual(self.context()["feedback"], full)
+        self.run["events"].append({"runId": self.run_id, "nodeId": "implement", "type": "node.retry_requested",
+                                   "message": "从指定节点重跑：Retry transport"})
+        nodes["implement"]["feedback"] = "Retry transport"
+        self.assertEqual(self.context()["feedback"], full)
+        self.run["events"].pop()
+        nodes["implement"]["feedback"] = clipped
+        self.run["events"][0]["message"] = "打回到 implement：different"
+        result = self.context()
+        self.assertTrue(result["feedback_error"])
+        self.assertFalse(result["feedback"])
+
+    def test_malformed_review_blocks_only_its_run(self):
+        import hashlib
+        meta = self.run["artifacts"][3]
+        body = json.loads(self.bodies[meta["id"]])
+        for invalid in ("pass", ["pass"]):
+            raw = json.dumps({**body, "review_result": invalid}).encode()
+            with (self.subTest(invalid=invalid), patch.dict(self.bodies, {meta["id"]: raw}),
+                  patch.dict(meta, sha256=hashlib.sha256(raw).hexdigest()), self.assertRaises(ContextError)):
+                self.context()

@@ -281,6 +281,10 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         task = worker().task(str(task_id))
         return {key: value for key, value in task.items() if key != "remote_identity"}
 
+    @app.get("/api/v1/tasks/{task_id}/operations/{request_id}")
+    def staged_operation(task_id: UUID, request_id: UUID):
+        return worker().staged_operation(str(task_id), str(request_id))
+
     @app.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: UUID):
         return worker().job(str(job_id))
@@ -328,10 +332,10 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         return worker().action(str(task_id), "recover", str(request.request_id), payload_for(request))
 
     @app.post("/api/v1/tasks/{task_id}/workflow-deliver", status_code=202)
-    def workflow_deliver(task_id: UUID, request: WorkflowDeliveryRequest):
+    def workflow_deliver(task_id: UUID, request: WorkflowDeliveryRequest, after_job: UUID | None = None):
         approval = payload_for(request)["approval"]
         try:
-            return worker().workflow_deliver(str(task_id), str(request.request_id), approval)
+            return worker().workflow_deliver(str(task_id), str(request.request_id), approval, after_job=after_job)
         except ApprovalError as error:
             raise HTTPException(403, "Invalid or expired workflow approval") from error
 
@@ -340,24 +344,24 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         return worker().action(str(task_id), "commit", str(request.request_id), payload_for(request))
 
     @app.post("/api/v1/tasks/{task_id}/plan", status_code=202)
-    def plan(task_id: UUID, request: PlanRequest):
-        return worker().action(str(task_id), "plan", str(request.request_id), payload_for(request))
+    def plan(task_id: UUID, request: PlanRequest, after_job: UUID | None = None):
+        return worker().action(str(task_id), "plan", str(request.request_id), payload_for(request), after_job=after_job)
 
     @app.post("/api/v1/tasks/{task_id}/accept-plan", status_code=202)
-    def accept_plan(task_id: UUID, request: AcceptPlanRequest):
-        return worker().action(str(task_id), "accept-plan", str(request.request_id), payload_for(request))
+    def accept_plan(task_id: UUID, request: AcceptPlanRequest, after_job: UUID | None = None):
+        return worker().action(str(task_id), "accept-plan", str(request.request_id), payload_for(request), after_job=after_job)
 
     @app.post("/api/v1/tasks/{task_id}/rework", status_code=202)
-    def rework(task_id: UUID, request: ReworkRequest):
-        return worker().action(str(task_id), "rework", str(request.request_id), payload_for(request))
+    def rework(task_id: UUID, request: ReworkRequest, after_job: UUID | None = None):
+        return worker().action(str(task_id), "rework", str(request.request_id), payload_for(request), after_job=after_job)
 
     @app.post("/api/v1/tasks/{task_id}/{action}", status_code=202)
-    def operation(task_id: UUID, action: Action, request: StageRequest):
+    def operation(task_id: UUID, action: Action, request: StageRequest, after_job: UUID | None = None):
         payload = {}
         if request.queue_wait_seconds is not None:
             if action not in {"run", "prepare", "clarify"}:
                 raise HTTPException(422, "Queue wait is only allowed for run, prepare or clarify")
             payload["queue_wait_seconds"] = request.queue_wait_seconds
-        return worker().action(str(task_id), action, str(request.request_id), payload)
+        return worker().action(str(task_id), action, str(request.request_id), payload, after_job=after_job)
 
     return app

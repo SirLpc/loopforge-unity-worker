@@ -246,6 +246,7 @@ class FeatureScriptTests(unittest.TestCase):
                   "test_job_id": test_id, "accept_attempt": 1, "approval_artifact_id": "accept-1",
                   "approval_digest": "a" * 64, "test_artifact_id": "test-1"}
         requests, jobs, side_effects = {}, {}, []
+        recovered = {}
         deny_new_operation = [False]
         finishing = []
         finishing_task = {}
@@ -253,6 +254,9 @@ class FeatureScriptTests(unittest.TestCase):
                    "base_branch": "main", "remote": "origin"}
         def request(path, payload=None):
             if payload is None:
+                if "/operations/" in path:
+                    admitted = requests.get(path.rsplit("/", 1)[-1])
+                    return {"job": jobs.get(admitted), "recovered_by": recovered.get(admitted)}
                 if "/jobs/" in path:
                     result = jobs[path.rsplit("/", 1)[-1]]
                     if finishing and result["job_id"] == finishing[-1]:
@@ -262,7 +266,10 @@ class FeatureScriptTests(unittest.TestCase):
                         return {**result, "status": "running"}
                     return result
                 return dict(task)
+            path, _, check = path.partition("?after_job=")
             action = path.rsplit("/", 1)[-1]
+            if action != "planning-tasks":
+                self.assertEqual(check, task["job_id"])
             if payload["request_id"] in requests:
                 return jobs[requests[payload["request_id"]]]
             self.assertFalse(deny_new_operation[0], "A completed operation was admitted again after reconnect")
@@ -303,12 +310,24 @@ class FeatureScriptTests(unittest.TestCase):
                    "node_id": "mr", "node_attempt": 1, "rework": 0, "feedback": "",
                    "upstream": {"id": "test-1", "name": "unity-verification", "sha256": claims["test_digest"]},
                    "approval": {"claims": claims, "issued_at": 1000, "signature": "s" * 64}}
-            with patch.object(worker_client, "planning_context", return_value=ctx), patch.object(
-                    worker_client, "Client", return_value=SimpleNamespace(request=request)):
+            with (patch.object(worker_client, "planning_context", return_value=ctx),
+                  patch.object(worker_client, "Client", return_value=SimpleNamespace(request=request)),
+                  patch.object(worker_client.time, "sleep")):
                 args = ["feature-mr", "--pool", "pool"]
                 self.assertEqual(worker_client.main(args), 1)
                 self.assertEqual(worker_client.main(args), 1)
+                interrupted_job = task["job_id"]
+                jobs[interrupted_job].update(status="recovery_required", failure_kind="recovery_required")
+                task.update(status="recovery_required", failure_kind="recovery_required")
                 ctx["node_attempt"] = 2
+                self.assertEqual(worker_client.main(args), 1)
+                self.assertEqual(side_effects, ["commit"])
+                recovery = str(uuid4())
+                recovered[interrupted_job] = recovery
+                jobs[recovery] = {"job_id": recovery, "task_id": task_id, "action": "recover", "status": "succeeded",
+                                  "stage_result": {"recovered": True}}
+                task.update(job_id=recovery, status="failed", failure_kind="recovered")
+                ctx["node_attempt"] = 3
                 self.assertEqual(worker_client.main(args), 0)
                 self.assertEqual(worker_client.main(args), 0)
                 for checkpoint in Path(".").glob(".unity-feature-*.json"):
@@ -317,7 +336,7 @@ class FeatureScriptTests(unittest.TestCase):
                 finishing.append(task["job_id"])
                 finishing_task.update(status="completed", current_stage="delivered")
                 task.update(status="failed", current_stage="commit")
-                ctx["node_attempt"] = 3
+                ctx["node_attempt"] = 4
                 self.assertEqual(worker_client.main(args), 0)
                 deny_new_operation[0] = False
                 self.assertEqual(side_effects, ["commit", "pr"])
@@ -370,9 +389,13 @@ class FeatureScriptTests(unittest.TestCase):
                 "implementation_attempt": 0, "artifacts": [], "revision": None, "approved_plan_digest": None}
         ctx = {"workflow_run_id": "run-90", "workflow_project_id": "garden", "workflow_id": "garden-feature",
                "node_id": "clarify", "node_attempt": 1, "rework": 0, "feedback": "", "requirement": "Grow"}
-        jobs, ids, operations = {}, {}, []
+        jobs, ids, operations, recovered = {}, {}, [], {}
+        pre_admission_drop = [True]
         def request(path, payload=None):
             if payload is None:
+                if "/operations/" in path:
+                    admitted = ids.get(path.rsplit("/", 1)[-1])
+                    return {"job": jobs.get(admitted), "recovered_by": recovered.get(admitted)}
                 if "/jobs/" in path:
                     job = jobs[path.rsplit("/", 1)[-1]]
                     if job["action"] == "accept-plan":
@@ -380,9 +403,15 @@ class FeatureScriptTests(unittest.TestCase):
                         job["status"] = "succeeded"
                     return job
                 return dict(task)
+            path, _, check = path.partition("?after_job=")
             action = path.rsplit("/", 1)[-1]
+            if action != "planning-tasks":
+                self.assertEqual(check, task["job_id"])
             if payload["request_id"] in ids:
                 return jobs[ids[payload["request_id"]]]
+            if action == "plan" and pre_admission_drop:
+                pre_admission_drop.pop()
+                raise worker_client.ClientError("Lost transport before Worker admission")
             operations.append(action)
             job = {"task_id": task_id, "action": action, "job_id": str(uuid4()), "status": "succeeded"}
             if action == "planning-tasks":
@@ -415,8 +444,12 @@ class FeatureScriptTests(unittest.TestCase):
             elif action == "review":
                 task.update(current_stage="reviewed", review_result={"verdict": "pass", "revision": task["revision"]})
             elif action == "test":
+                if operations.count("test") == 1:
+                    job.update(status="recovery_required", failure_kind="recovery_required")
                 task.update(status="awaiting_approval", current_stage="tested", test_report={"editmode": {"status": "passed"}},
                             verification={"revision": task["revision"], "implementation_attempt": 0, "test_job_id": job["job_id"]})
+                if job["status"] == "recovery_required":
+                    task.update(status="recovery_required", current_stage="test", failure_kind="recovery_required", verification=None)
             else:
                 self.fail("Unexpected operation " + action)
             jobs[job["job_id"]] = job
@@ -432,14 +465,32 @@ class FeatureScriptTests(unittest.TestCase):
             for node, output in (("clarify", "scope"), ("design", "planning"), ("implement", "implementation"),
                                  ("review", "review"), ("test", "verification")):
                 ctx["node_id"] = node
-                if node in ("review", "test"):
+                if node == "design":
+                    self.assertEqual(worker_client.main(["feature-design", "--pool", "pool"]), 1)
+                if node in ("design", "review", "test"):
                     current = task["job_id"]
                     task["job_id"] = str(uuid4())
                     with self.subTest(concurrent=node):
                         self.assertEqual(worker_client.main(["feature-" + node, "--pool", "pool"]), 1)
-                        self.assertNotIn(node, operations)
+                        self.assertNotIn("plan" if node == "design" else node, operations)
                     task["job_id"] = current
+                if node == "test":
+                    self.assertEqual(worker_client.main(["feature-test", "--pool", "pool"]), 1)
+                    stopped = task["job_id"]
+                    for checkpoint in Path(".").glob(".unity-feature-*.json"):
+                        checkpoint.unlink()
+                    ctx["node_attempt"] = 2
+                    self.assertEqual(worker_client.main(["feature-test", "--pool", "pool"]), 1)
+                    recovery = str(uuid4())
+                    recovered[stopped] = recovery
+                    jobs[recovery] = {"job_id": recovery, "task_id": task_id, "action": "recover", "status": "succeeded",
+                                      "stage_result": {"recovered": True}}
+                    task.update(job_id=recovery, status="failed", failure_kind="recovered")
                 self.assertEqual(worker_client.main(["feature-" + node, "--pool", "pool"]), 0)
+                if node in ("design", "review", "test"):
+                    for checkpoint in Path(".").glob(".unity-feature-*.json"):
+                        checkpoint.unlink()
+                    self.assertEqual(worker_client.main(["feature-" + node, "--pool", "pool"]), 0)
                 source = Path("unity-" + output + ".json")
                 (mounted / source.name).write_bytes(source.read_bytes())
                 upstream[node] = {"id": "artifact-" + node, "name": source.stem,
@@ -447,10 +498,24 @@ class FeatureScriptTests(unittest.TestCase):
                 ctx["upstream"] = upstream[node]
             self.assertEqual(json.loads(source.read_bytes())["verification"], task["verification"])
             self.assertEqual(operations, ["planning-tasks", "clarify", "plan", "accept-plan", "implement", "compile",
-                                          "review", "test"])
+                                          "review", "test", "test"])
             ctx.update(node_id="implement", node_attempt=3, rework=1, feedback="Use two trees", upstream=upstream["design"])
+            ctx.update(feedback="", feedback_error="Full rejection unavailable")
             self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+            self.assertNotIn("rework", operations)
+            ctx.pop("feedback_error")
+            ctx["feedback"] = "Use two trees"
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+            interrupted_job = task["job_id"]
+            jobs[interrupted_job].update(status="recovery_required", failure_kind="recovery_required")
+            task.update(status="recovery_required", failure_kind="recovery_required")
             ctx.update(node_attempt=4, feedback="Retry after recovering machine")
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+            recovery = str(uuid4())
+            recovered[interrupted_job] = recovery
+            jobs[recovery] = {"job_id": recovery, "task_id": task_id, "action": "recover", "status": "succeeded",
+                              "stage_result": {"recovered": True}}
+            task.update(job_id=recovery, status="failed", failure_kind="recovered")
             self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
             self.assertEqual(operations[-3:], ["rework", "rework", "compile"])
             data = json.loads(Path("unity-implementation.json").read_bytes())

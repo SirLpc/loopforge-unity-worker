@@ -57,6 +57,11 @@ def publishable(job):
     return {key: value for key, value in job.items() if key not in {"signature", "request_id"}}
 
 
+def check_predecessor(task, after_job):
+    if after_job is not None and task.get("workflow_mode") == "staged-feature" and task["job_id"] != str(after_job):
+        raise RequestConflict("Worker advanced past the expected predecessor")
+
+
 def plan_binding(task):
     return {"slot_id": task["slot_id"], "base_commit": task["base_commit"],
             "plan_digest": task["planning"]["plan_digest"]}
@@ -183,6 +188,19 @@ class DevelopmentWorker:
             if job := self.store.job(db, job_id):
                 return publishable(job)
         raise TaskNotFound
+
+    def staged_operation(self, task_id, request_id):
+        with self.store.connect() as db:
+            task = self.require_task(db, task_id)
+            if task.get("workflow_mode") != "staged-feature":
+                raise TaskNotFound
+            job = self.store.request(db, request_id)
+            if not job or job["task_id"] != task_id:
+                return {"job": None, "recovered_by": None}
+            recovered = None
+            if job["status"] == "recovery_required":
+                recovered = self.store.recovery_after(db, task_id, job["job_id"])
+            return {"job": publishable(job), "recovered_by": recovered}
 
     def pools(self):
         with self.store.connect() as db:
@@ -492,7 +510,7 @@ class DevelopmentWorker:
                 return "commit"
         raise RequestConflict("Delivery is unavailable at the current stage")
 
-    def workflow_deliver(self, task_id, request_id, envelope):
+    def workflow_deliver(self, task_id, request_id, envelope, *, after_job=None):
         claims = authenticate_approval(envelope, self.cfg.legacy.workflow_approval_key)
         payload = {"workflow_approval": claims}
         with self.guard:
@@ -505,6 +523,7 @@ class DevelopmentWorker:
                     return publishable(previous)
                 check_freshness(envelope, time.time())
                 task = self.require_task(db, task_id)
+                check_predecessor(task, after_job)
                 action = self.workflow_delivery_action(db, task, claims)
                 job = self.new_job(task_id, request_id, action, payload)
                 if not task.get("approval"):
@@ -516,7 +535,7 @@ class DevelopmentWorker:
                 self.store.save_job(db, job)
             return self.spawn(job, {})
 
-    def action(self, task_id, action, request_id, payload):
+    def action(self, task_id, action, request_id, payload, *, after_job=None):
         with self.guard:
             with self.store.connect(write=True) as db:
                 task = self.store.task(db, task_id)
@@ -526,6 +545,7 @@ class DevelopmentWorker:
                     return publishable(previous)
                 if task is None:
                     raise TaskNotFound
+                check_predecessor(task, after_job)
                 self.check_action(db, task, action, payload)
                 job = self.new_job(task_id, request_id, action, payload)
                 inline_accept = action == "accept-plan" and task.get("workflow_mode") != "staged-feature"

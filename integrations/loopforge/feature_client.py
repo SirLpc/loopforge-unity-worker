@@ -87,7 +87,9 @@ class FeatureStage:
                        "workflow_project_id": context["workflow_project_id"], "workflow_run_id": context["workflow_run_id"],
                        "requirement": context["requirement"],
                        "request_id": api.operation_id(context["workflow_run_id"], "feature-create", 0)}
-            task_id = client.request("/api/v1/planning-tasks", payload)["task_id"]
+            created = client.request("/api/v1/planning-tasks", payload)
+            self.create_job = created["job_id"]
+            task_id = created["task_id"]
         self.task_id = str(UUID(task_id))
         self.path = "/api/v1/tasks/" + self.task_id
         self.task = client.request(self.path)
@@ -109,43 +111,63 @@ class FeatureStage:
         return Path(".unity-feature-" + api.operation_id(self.scope, operation, 0) + ".json")
 
     def job(self, action, payload=None, *, version="", predecessor=None):
-        """Replay the bound request. Only a later platform attempt can replace a failed request."""
-        payload = payload or {}
+        """Use the Worker's admission record to join a phase or retry a failed attempt."""
         operation = action + ":" + version
         path = self.state_file(operation)
-        saved = api.read_json(path) if path.is_file() else {}
-        if not saved and predecessor is not None:
-            require(self.task["job_id"] == predecessor, "Current Worker job differs from the upstream evidence")
-        first = saved.get("attempt", self.attempt)
-        require(type(first) is int and 1 <= first <= self.attempt, "Invalid operation checkpoint")
-        for attempt in dict.fromkeys((first, self.attempt)):
-            generation = saved.get("generation", 0) if attempt == first else attempt
-            require(type(generation) is int and generation in (0, attempt), "Invalid operation generation")
+        actions = {"commit", "pr"} if action == "workflow-deliver" else {action}
+        # The first client version used generation zero for the original admission.
+        # New admissions use the platform attempt, which survives loss of the Runner workspace.
+        for generation in range(self.attempt, -1, -1):
             request_id = api.operation_id(self.scope, operation, generation)
-            api.save_json(path, {"attempt": attempt, "generation": generation, "request_id": request_id})
-            submitted = self.client.request(self.path + "/" + action, {**payload, "request_id": request_id})
-            actions = {"commit", "pr"} if action == "workflow-deliver" else {action}
-            require(submitted["task_id"] == self.task_id and submitted["action"] in actions,
-                    "Worker returned a different operation")
-            job_id = str(UUID(submitted["job_id"]))
-            try:
-                self.task, job = api.wait_job(self.client, self.path, job_id, self.args.wait_seconds, self.args.follow,
-                                             queue_wait_seconds=self.args.queue_wait_seconds)
-            except (KeyboardInterrupt, api.Interrupted):
-                current = self.client.request(self.path)
-                running = self.client.request("/api/v1/jobs/" + job_id)
-                if current.get("job_id") == job_id and running["status"] in {"queued", "running"}:
-                    self.client.request(self.path + "/cancel", {"request_id": api.operation_id(job_id, "cancel", 0)})
-                raise api.ClientError("Node stopped while waiting for Worker job " + job_id) from None
-            self.check_task()
-            require(job["task_id"] == self.task_id and job["job_id"] == job_id and job["action"] in actions,
-                    "Worker polling returned a different operation")
-            self.last_job = job
-            if job["status"] == "succeeded":
-                return job
-            if (attempt == self.attempt or submitted["status"] in {"queued", "running"}
-                    or job["status"] != "failed"):
+            receipt = self.client.request(self.path + "/operations/" + request_id)
+            job = receipt["job"]
+            if job:
+                require(job["task_id"] == self.task_id and job["action"] in actions, "Foreign operation receipt")
                 break
+        self.task = self.client.request(self.path)
+        self.check_task()
+        current = self.task.get("job_id")
+        if job and generation == 0:
+            saved = api.read_json(path) if path.is_file() else {}
+            if saved.get("request_id") == request_id:
+                generation = saved["attempt"]
+                require(type(generation) is int and 1 <= generation <= self.attempt, "Invalid legacy operation checkpoint")
+            elif not receipt.get("recovered_by"):
+                generation = self.attempt
+                api.save_json(path, {"attempt": generation, "generation": 0, "request_id": request_id})
+        if job and job["status"] in {"queued", "running"}:
+            require(job["job_id"] == current, "Another Worker job is active")
+        if job and generation < self.attempt:
+            recovered = receipt.get("recovered_by")
+            if (job["status"] == "failed" and current == job["job_id"]
+                    or job["status"] == "recovery_required" and recovered and current == recovered
+                    and self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"):
+                job = None
+                predecessor = current
+        if job is None:
+            require(predecessor is None or current == predecessor, "Current Worker job differs from the upstream evidence")
+            request_id = api.operation_id(self.scope, operation, self.attempt)
+            api.save_json(path, {"attempt": self.attempt, "generation": self.attempt, "request_id": request_id})
+            route = self.path + "/" + action + "?after_job=" + str(UUID(current))
+            job = self.client.request(route, {**(payload or {}), "request_id": request_id})
+            require(job["task_id"] == self.task_id and job["action"] in actions, "Worker admitted a different operation")
+        job_id = str(UUID(job["job_id"]))
+        try:
+            self.task, job = api.wait_job(self.client, self.path, job_id, self.args.wait_seconds, self.args.follow,
+                                         queue_wait_seconds=self.args.queue_wait_seconds)
+        except (KeyboardInterrupt, api.Interrupted):
+            current_task = self.client.request(self.path)
+            running = self.client.request("/api/v1/jobs/" + job_id)
+            if current_task.get("job_id") == job_id and running["status"] in {"queued", "running"}:
+                self.client.request(self.path + "/cancel", {"request_id": api.operation_id(job_id, "cancel", 0)})
+            raise api.ClientError("Node stopped while waiting for Worker job " + job_id) from None
+        self.check_task()
+        require(job["task_id"] == self.task_id and job["job_id"] == job_id and job["action"] in actions,
+                "Worker polling returned a different operation")
+        self.last_job = job
+        if job["status"] == "succeeded":
+            return job
+
         failure = {k: job.get(k) for k in ("job_id", "action", "status", "failure_kind", "error_message", "stage_result")}
         evidence = {"Worker 作业": failure, "Worker 产物": api.handoff(self.task, job)["artifact_reference"]}
         if self.task.get("delivery"):
@@ -159,7 +181,7 @@ class FeatureStage:
 
     def clarify(self):
         options = {"queue_wait_seconds": self.args.queue_wait_seconds} if self.args.queue_wait_seconds else {}
-        self.job("clarify", options)
+        self.job("clarify", options, predecessor=self.create_job)
         self.current("clarified")
         require(self.task["lease"], "No active clarification lease")
         return {"clarification": self.task["clarification"]}, {"需求": self.ctx["requirement"], "定型结果": self.task["clarification"]}
@@ -197,16 +219,22 @@ class FeatureStage:
             edit["attempt"] = self.attempt
             api.save_json(edit_path, edit)
         if edit.get("fix"):
-            self.job("fix", version=str(UUID(edit["fix"])))
+            self.job("fix", version=str(UUID(edit["fix"])), predecessor=edit["fix"])
         elif target:
-            feedback = self.task["rework_feedback"] if worker_round == target else self.ctx["feedback"]
+            if worker_round == target:
+                feedback = self.task["rework_feedback"]
+            else:
+                require(not self.ctx.get("feedback_error"), self.ctx.get("feedback_error"))
+                feedback = self.ctx["feedback"]
             self.job("rework", {"workflow_run_id": self.ctx["workflow_run_id"], "implementation_attempt": target,
-                                "feedback": feedback})
+                                "feedback": feedback}, predecessor=(self.task.get("verification") or {}).get("test_job_id", ""))
         else:
-            self.job("implement")
+            # A new initial edit follows the accepted plan. Existing edits use their admitted request.
+            accepted = self.task["job_id"] if self.task["current_stage"] == "plan_accepted" else ""
+            self.job("implement", predecessor=accepted)
         require(self.task["implementation_attempt"] == target, "Worker edited a different round")
         compile_version = edit.get("recompile") or self.last_job["job_id"]
-        self.job("compile", version=compile_version)
+        self.job("compile", version=compile_version, predecessor=compile_version)
         self.current("compiled")
         revision = self.task["revision"]
         require(revision and self.task["compile_report"]["revision"] == revision, "Compiled tree changed")
@@ -253,19 +281,6 @@ class FeatureStage:
                 "Worker verification or tests differ from the current platform evidence")
         return {**fields, "verification": verification, "test_report": self.source["test_report"]}
 
-    def resume_receipt(self, actions):
-        job_id = str(UUID(self.task["job_id"]))
-        job = self.client.request("/api/v1/jobs/" + job_id)
-        require(job["task_id"] == self.task_id and job["job_id"] == job_id, "Worker returned a foreign receipt")
-        if job["action"] not in actions or job["status"] not in {"running", "queued", "succeeded"}:
-            return False
-        if job["status"] in {"queued", "running"}:
-            self.task, job = api.wait_job(self.client, self.path, job_id, self.args.wait_seconds, self.args.follow)
-            self.check_task()
-        require(job["status"] == "succeeded", "Missing completed Worker receipt")
-        self.last_job = job
-        return True
-
     def mr(self):
         fields = self.checked_tests()
         approval = self.ctx["approval"]
@@ -278,9 +293,8 @@ class FeatureStage:
         previous = self.task.get("approval")
         if previous:
             require(previous.get("claims") == claims, "Worker is delivering a different approval")
-        if not previous or not self.resume_receipt({"commit", "pr"}):
-            self.job("workflow-deliver", {"approval": approval}, version=claims["approval_artifact_id"],
-                     predecessor=None if previous else self.source["job_id"])
+        self.job("workflow-deliver", {"approval": approval}, version=claims["approval_artifact_id"],
+                 predecessor=self.source["job_id"])
         self.current("delivered")
         self.checked_tests()
         require(self.task["status"] == "completed" and self.task["approval"]["claims"] == claims,
@@ -297,9 +311,7 @@ class FeatureStage:
                 and delivery == self.source["delivery"] and delivery["pushed"]
                 and self.task["approval"]["claims"]["approval_artifact_id"] == self.source["approval_artifact_id"],
                 "Worker delivery changed before release")
-        if self.task["job_id"] == self.source["job_id"] or not self.resume_receipt({"release"}):
-            require(self.task["lease"], "Worker has already released the slot without a matching receipt")
-            self.job("release", predecessor=self.source["job_id"])
+        self.job("release", predecessor=self.source["job_id"])
         self.current("delivered")
         require(self.task["lease"] is False and self.last_job["stage_result"].get("released") is True,
                 "Worker did not confirm release")
