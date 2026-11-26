@@ -98,6 +98,7 @@ def stage_finalizes_with_job(task, action):
     stage = task["current_stage"]
     return task.get("workflow_mode") == "staged-feature" and (
         (action == "rework" and stage == "fix") or (action in {"run", "test"} and stage == "test")
+        or (action == stage and stage in {"compile", "review"})
     )
 
 
@@ -179,9 +180,47 @@ class DevelopmentWorker:
             return {key: self.clean_output(item) for key, item in value.items()}
         return value
 
-    def task(self, task_id):
+    def task(self, task_id, *, include_implementation_correction=False):
         with self.store.connect() as db:
-            return self.require_task(db, task_id)
+            if include_implementation_correction:
+                db.execute("BEGIN")
+            task = self.require_task(db, task_id)
+            if include_implementation_correction and task.get("workflow_mode") == "staged-feature":
+                task["implementation_correction"] = self.implementation_correction(db, task)
+            return task
+
+    def implementation_correction(self, db, task):
+        correction = {"plan_digest": task.get("approved_plan_digest"),
+                      "implementation_attempt": task["implementation_attempt"]}
+        following = None
+        for job_id, action, status, failure in self.store.staged_job_history(db, task["task_id"]):
+            if action == "compile":
+                correction.setdefault("compile_job_id", job_id)
+            if action in {"implement", "rework"}:
+                correction["edit_job_id"] = job_id
+                break
+            if action in {"run", "accept-plan"}:
+                break
+            if status == "failed" and "fix" not in correction:
+                if following == "fix" and failure in FIXABLE:
+                    correction["fix"] = job_id
+                elif following == "compile" and failure in {"workspace_changed", "unity_changed"}:
+                    correction.setdefault("recompile", job_id)
+            following = action
+        return correction
+
+    def recovered_delivery_release(self, db, task):
+        if (task.get("workflow_mode") != "staged-feature" or task["current_stage"] != "delivered"
+                or task["status"] != "failed" or task.get("failure_kind") != "recovered"):
+            return False
+        confirmed = False
+        for job_id, action, status, _ in self.store.staged_job_history(db, task["task_id"]):
+            if action == "release":
+                if status == "recovery_required" and self.store.recovery_after(db, task["task_id"], job_id):
+                    confirmed = True
+            elif action != "recover":
+                return confirmed and action in {"commit", "pr"} and status == "succeeded"
+        return False
 
     def job(self, job_id):
         with self.store.connect() as db:
@@ -378,8 +417,10 @@ class DevelopmentWorker:
                 return "prepare"
             if stage == "fix" and task.get("rework_pending"):
                 return None
-            if staged_feature and stage == "test" and failure == "report_io_failed":
-                return "test"
+            if staged_feature and stage == "implement" and failure in {"git_failed", "timeout"}:
+                return "implement"
+            if staged_feature and stage in {"compile", "review", "test"} and failure == "report_io_failed":
+                return stage
             if staged_feature and failure == "recovered" and stage in {"reviewed", "tested"} and not task.get("verification"):
                 return "test"
             if failure in FIXABLE and task["retry_count"] < self.cfg.pools[task["pool_id"]].policy.max_fixes:
@@ -719,6 +760,9 @@ class DevelopmentWorker:
                 task.update(lease=False, status="failed" if error else "completed", finished_at=timestamp,
                             exit_code=error.exit_code if error else 0)
             if action == "release" and not error:
+                if self.recovered_delivery_release(db, task):
+                    task.update(status="completed", finished_at=timestamp, failure_kind=None, error_message=None,
+                                stage_result=task["delivery"], exit_code=0)
                 task.update(lease=False, released_at=timestamp)
             if action == "clarify" and not error:
                 task.update(status="pending", current_stage="clarified", clarification=result,
@@ -736,7 +780,7 @@ class DevelopmentWorker:
                 if finished == "tested":
                     task["verification"] = {"revision": task["revision"], "test_job_id": job["job_id"],
                                             "implementation_attempt": task.get("implementation_attempt", 0)}
-                else:
+                elif action == "rework":
                     task.pop("rework_pending", None)
             if action == "pr" and task.get("workflow_mode") == "staged-feature":
                 task.update(self.clean_output(workflow_pr_outcome(task, error, timestamp)))

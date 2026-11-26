@@ -208,6 +208,49 @@ class WorkflowFixture(unittest.TestCase):
 
 
 class WorkflowTests(WorkflowFixture):
+    def test_staged_implement_retries_transient_failure_only_on_the_frozen_clean_checkout(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            workspace = client.app.state.worker.workspaces[self.task(client, task)["slot_id"]]
+            for kind in ("git_failed", "timeout"):
+                with patch.object(workspace.git, "clean", side_effect=StageError(kind, "Transient Git failure")):
+                    failed = self.stage(client, task, "implement")
+                self.assertEqual(failed["failure_kind"], kind, failed)
+            self.assertEqual(self.stage(client, task, "implement")["status"], "succeeded")
+
+    def test_staged_implement_retry_preserves_changes_left_after_timeout(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            with patch.object(self.agent, "execute", side_effect=StageError("timeout", "Stopped before completion")):
+                self.assertEqual(self.stage(client, task, "implement")["failure_kind"], "timeout")
+            greeting = self.project / "hello.txt"
+            greeting.write_text("unconfirmed work")
+            with patch.object(self.agent, "execute", side_effect=AssertionError("Must preserve the workspace")):
+                blocked = self.stage(client, task, "implement")
+            self.assertEqual(blocked["failure_kind"], "dirty_workspace", blocked)
+            self.assertEqual(greeting.read_text(), "unconfirmed work")
+
+    def test_staged_standalone_compile_review_retry_report_io_and_interruption(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            self.assertEqual(self.stage(client, task, "implement")["status"], "succeeded")
+        for stage, checkpoint in (("compile", "compiled"), ("review", "reviewed")):
+            with self.staged_client() as client:
+                failed = self.stage_with_report_write_failure(client, task, stage)
+                self.assertEqual(failed["failure_kind"], "report_io_failed", failed)
+                self.assertEqual(self.task(client, task)["current_stage"], stage)
+                reached_finish = threading.Event()
+                with patch.object(client.app.state.worker, "finish", side_effect=lambda *_: reached_finish.set()):
+                    interrupted = self.start(client, task, stage)
+                    self.assertTrue(reached_finish.wait(45))
+                self.assertEqual(self.task(client, task)["current_stage"], stage)
+            with self.staged_client() as client:
+                self.assertEqual(client.get(f"/api/v1/jobs/{interrupted}").json()["status"], "recovery_required")
+                self.recover(client, task)
+                completed = self.stage(client, task, stage)
+                self.assertEqual(completed["status"], "succeeded", completed)
+                self.assertEqual(self.task(client, task)["current_stage"], checkpoint)
+
     def test_staged_recovery_resumes_reserved_rework_without_spending_another_correction(self):
         with self.staged_client() as client:
             task = self.accepted_staged_plan(client)
@@ -442,6 +485,31 @@ class WorkflowTests(WorkflowFixture):
                                                        "implementation_attempt": 1})
             self.assertEqual(current["retry_count"], 1)
             self.assertEqual(action("rework", **{**rework, "implementation_attempt": 2}).status_code, 409)
+
+    def test_staged_correction_records_the_actual_fix_and_recompile_predecessors(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            edit = self.stage(client, task, "implement")
+            self.assertEqual(edit["status"], "succeeded")
+            worker = client.app.state.worker
+            with patch.object(worker, "stage_compile", side_effect=StageError("compile_failed", "Invalid script")):
+                broken = self.stage(client, task, "compile")
+            self.assertEqual(broken["failure_kind"], "compile_failed")
+            self.assertEqual(self.stage(client, task, "fix")["status"], "succeeded")
+            compiled = self.stage(client, task, "compile")
+            self.assertEqual(compiled["status"], "succeeded")
+            current = self.task(client, task)
+            correction = {"fix": broken["job_id"], "edit_job_id": edit["job_id"], "implementation_attempt": 0,
+                          "plan_digest": current["approved_plan_digest"], "compile_job_id": compiled["job_id"]}
+            path = f"/api/v1/tasks/{task}?include_implementation_correction=true"
+            self.assertEqual(client.get(path).json().get("implementation_correction"), correction)
+            (self.project / "hello.txt").write_text("greeting changed after compile")
+            drift = self.stage(client, task, "review")
+            self.assertEqual(drift["failure_kind"], "workspace_changed", drift)
+            recompiled = self.stage(client, task, "compile")
+            self.assertEqual(recompiled["status"], "succeeded")
+            self.assertEqual(client.get(path).json()["implementation_correction"],
+                             {**correction, "recompile": drift["job_id"], "compile_job_id": recompiled["job_id"]})
 
     def test_staged_compile_failure_preserves_bounded_implementation_corrections(self):
         (self.root / "broken_compile").touch()

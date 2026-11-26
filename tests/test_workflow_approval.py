@@ -265,6 +265,31 @@ class WorkflowDeliveryTests(WorkflowFixture):
             report = client.get(f"/api/v1/tasks/{task['task_id']}/artifacts/{finished['report']}").json()
             self.assertEqual((report["status"], report["delivery"]["mr_status"]), ("completed", "pending"))
 
+    def test_recovered_release_completes_original_delivery_and_returns_lease(self):
+        with self.delivery_client() as client:
+            task = self.verified_task(client)
+            delivery = self.current_delivery_job(client, task)
+            self.assertEqual(delivery["status"], "succeeded", delivery)
+            task_id = task["task_id"]
+            worker = client.app.state.worker
+            with patch.object(worker, "finish", side_effect=lambda job, *_: worker.store.recover_interrupted(job["job_id"])):
+                request_id = str(uuid4())
+                interrupted = self.stage(client, task_id, "release", request_id=request_id)
+            self.assertEqual(interrupted["status"], "recovery_required", interrupted)
+            self.recover(client, task_id)
+            current = self.task(client, task_id)
+            lookup = client.get(f"/api/v1/tasks/{task_id}/operations/{request_id}").json()
+            self.assertEqual(lookup["recovered_by"], current["job_id"])
+            self.assertTrue(current["lease"])
+            self.assertEqual(current["failure_kind"], "recovered")
+            resumed = self.stage(client, task_id, "release")
+            self.assertEqual(resumed["stage_result"], {"released": True})
+            current = self.task(client, task_id)
+            self.assertEqual(current["status"], "completed")
+            self.assertFalse(current["lease"])
+            self.assertEqual(current["verification"], task["verification"])
+            self.assertEqual(current["delivery"], delivery["stage_result"])
+
     def test_reconcile_persisted_mr_after_worker_recovery(self):
         class Adapter:
             def create(self, task):

@@ -92,7 +92,8 @@ class FeatureStage:
             task_id = created["task_id"]
         self.task_id = str(UUID(task_id))
         self.path = "/api/v1/tasks/" + self.task_id
-        self.task = client.request(self.path)
+        query = "?include_implementation_correction=true" if self.node == "implement" else ""
+        self.task = client.request(self.path + query)
         self.check_task()
         self.scope = ":".join((self.task_id, self.node, self.ref["id"] if self.ref else "create",
                                str(context["rework"])))
@@ -110,20 +111,25 @@ class FeatureStage:
     def state_file(self, operation):
         return Path(".unity-feature-" + api.operation_id(self.scope, operation, 0) + ".json")
 
-    def job(self, action, payload=None, *, version="", predecessor=None):
-        """Use the Worker's admission record to join a phase or retry a failed attempt."""
-        operation = action + ":" + version
-        path = self.state_file(operation)
-        actions = {"commit", "pr"} if action == "workflow-deliver" else {action}
+    def operation_receipt(self, operation):
         # The first client version used generation zero for the original admission.
         # New admissions use the platform attempt, which survives loss of the Runner workspace.
         for generation in range(self.attempt, -1, -1):
             request_id = api.operation_id(self.scope, operation, generation)
             receipt = self.client.request(self.path + "/operations/" + request_id)
-            job = receipt["job"]
-            if job:
-                require(job["task_id"] == self.task_id and job["action"] in actions, "Foreign operation receipt")
+            if receipt["job"]:
                 break
+        return generation, request_id, receipt
+
+    def job(self, action, payload=None, *, version="", predecessor=None):
+        """Use the Worker's admission record to join a phase or retry a failed attempt."""
+        operation = action + ":" + version
+        path = self.state_file(operation)
+        actions = {"commit", "pr"} if action == "workflow-deliver" else {action}
+        generation, request_id, receipt = self.operation_receipt(operation)
+        job = receipt["job"]
+        if job:
+            require(job["task_id"] == self.task_id and job["action"] in actions, "Foreign operation receipt")
         self.task = self.client.request(self.path)
         self.check_task()
         current = self.task.get("job_id")
@@ -206,21 +212,21 @@ class FeatureStage:
         require(self.task["approved_plan_digest"] == plan["plan_digest"], "Worker did not freeze the matched plan")
         worker_round, target = self.task["implementation_attempt"], self.ctx["rework"]
         require(worker_round <= target <= worker_round + 1, "Stale or skipped Worker rework round")
-        edit_path = self.state_file("edit-selection")
-        edit = api.read_json(edit_path) if edit_path.is_file() else {}
-        if edit.get("attempt") != self.attempt:
-            if (self.task["status"] == "failed" and self.task.get("failure_kind") in
-                    {"compile_failed", "tests_failed", "review_changes", "asset_metadata"}):
-                edit["fix"] = self.task["job_id"]
-                edit.pop("recompile", None)
-            elif (self.task["status"] == "failed" and self.task.get("failure_kind") in {"workspace_changed", "unity_changed"}
-                  and self.task["current_stage"] in {"compile", "review", "test", "commit"}):
-                edit["recompile"] = self.task["job_id"]
-            edit["attempt"] = self.attempt
-            api.save_json(edit_path, edit)
-        if edit.get("fix"):
-            self.job("fix", version=str(UUID(edit["fix"])), predecessor=edit["fix"])
-        elif target:
+        edit = (self.task.get("implementation_correction") or {}) if worker_round == target else {}
+        if edit:
+            require(edit["implementation_attempt"] == target and edit["plan_digest"] == plan["plan_digest"],
+                    "Correction does not belong to this frozen plan and round")
+        failed = None
+        failure = self.task.get("failure_kind")
+        drift = failure in {"workspace_changed", "unity_changed"}
+        if (worker_round == target and self.task["status"] == "failed"
+                and (drift or failure in {"compile_failed", "tests_failed", "review_changes", "asset_metadata"})
+                and self.task["current_stage"] in {"compile", "review", "test", "commit"}):
+            failed = self.client.request("/api/v1/jobs/" + self.task["job_id"])
+            require(failed["task_id"] == self.task_id and failed["job_id"] == self.task["job_id"]
+                    and failed["action"] == self.task["current_stage"] and failed["status"] == "failed"
+                    and failed.get("failure_kind") == failure, "Worker correction has no matching failed phase")
+        if target:
             if worker_round == target:
                 feedback = self.task["rework_feedback"]
             else:
@@ -233,8 +239,7 @@ class FeatureStage:
             accepted = self.task["job_id"] if self.task["current_stage"] == "plan_accepted" else ""
             self.job("implement", predecessor=accepted)
         require(self.task["implementation_attempt"] == target, "Worker edited a different round")
-        compile_version = edit.get("recompile") or self.last_job["job_id"]
-        self.job("compile", version=compile_version, predecessor=compile_version)
+        self.compile_edit(edit, failed)
         self.current("compiled")
         revision = self.task["revision"]
         require(revision and self.task["compile_report"]["revision"] == revision, "Compiled tree changed")
@@ -242,6 +247,30 @@ class FeatureStage:
                   "changed_files": self.task.get("changed_files", []), "compile_report": self.task["compile_report"]}
         return fields, {"修改": fields["changed_files"], "实现结果": self.task.get("implementation_result"),
                         "编译结果": fields["compile_report"]}
+
+    def compile_edit(self, edit, failed):
+        # Resolve both operations from deterministic receipts before adopting a correction from Worker history.
+        if failed or edit.get("fix") or edit.get("recompile"):
+            require(edit.get("edit_job_id") == self.last_job["job_id"], "Correction belongs to a different edit")
+        if edit.get("fix"):
+            self.job("fix", version=str(UUID(edit["fix"])), predecessor=edit["fix"])
+        compile_version = edit.get("recompile") or self.last_job["job_id"]
+        if failed:
+            generation, _, receipt = self.operation_receipt("compile:" + compile_version)
+            prior = receipt["job"]
+            require(prior and prior["action"] == "compile" and prior["task_id"] == self.task_id
+                    and prior["job_id"] == edit.get("compile_job_id"), "Failed phase belongs to a different compile")
+            if failed["action"] == "compile":
+                require(prior["job_id"] == failed["job_id"], "Worker compile changed before correction")
+            else:
+                require(prior["status"] == "succeeded", "Downstream phase lacks a successful scoped compile")
+            if failed["action"] != "compile" or generation < self.attempt:
+                if failed["failure_kind"] in {"workspace_changed", "unity_changed"}:
+                    compile_version = failed["job_id"]
+                else:
+                    self.job("fix", version=failed["job_id"], predecessor=failed["job_id"])
+                    compile_version = self.last_job["job_id"]
+        self.job("compile", version=compile_version, predecessor=compile_version)
 
     def validated_tree(self):
         require(all(self.source.get(k) == self.task.get(k) for k in ("revision", "implementation_attempt"))
@@ -307,13 +336,19 @@ class FeatureStage:
     def deliver(self):
         self.checked_tests()
         delivery = self.task["delivery"]
-        require(self.task["status"] == "completed" and self.task["current_stage"] == "delivered"
+        recovered = (self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"
+                     and self.task["lease"])
+        require((self.task["status"] == "completed" or recovered) and self.task["current_stage"] == "delivered"
                 and delivery == self.source["delivery"] and delivery["pushed"]
                 and self.task["approval"]["claims"]["approval_artifact_id"] == self.source["approval_artifact_id"],
                 "Worker delivery changed before release")
         self.job("release", predecessor=self.source["job_id"])
         self.current("delivered")
-        require(self.task["lease"] is False and self.last_job["stage_result"].get("released") is True,
+        self.checked_tests()
+        require(self.task["status"] == "completed" and self.task["lease"] is False
+                and self.task["delivery"] == delivery
+                and self.task["approval"]["claims"]["approval_artifact_id"] == self.source["approval_artifact_id"]
+                and self.last_job["stage_result"].get("released") is True,
                 "Worker did not confirm release")
         return {}, {"验证记录": self.source["verification"], "测试结果与范围": self.source["test_report"],
                     "分支和 MR": delivery, "槽位归还": {"slot_id": self.task["slot_id"], "released": True,

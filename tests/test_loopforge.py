@@ -288,7 +288,7 @@ class FeatureScriptTests(unittest.TestCase):
                 receipt.update(mr_status="created", pull_request={"url": "https://example.invalid/mr/3"})
                 task.update(delivery=dict(receipt), status="completed", current_stage="delivered", failure_kind=None)
             if action == "release":
-                task.update(lease=False, released_at="2026-11-26")
+                task.update(lease=False, released_at="2026-11-26", status="completed", failure_kind=None)
             task["job_id"] = job_id
             jobs[job_id] = {"task_id": task_id, "job_id": job_id, "action": action,
                             "status": "failed" if action == "commit" else "succeeded",
@@ -358,6 +358,24 @@ class FeatureScriptTests(unittest.TestCase):
                 ctx["node_attempt"] = 2
                 self.assertEqual(worker_client.main(["feature-delivery", "--pool", "pool"]), 0)
                 self.assertEqual(side_effects, ["commit", "pr", "release"])
+                release = task["job_id"]
+                jobs[release].update(status="recovery_required", failure_kind="recovery_required", stage_result={})
+                task.update(lease=True, status="recovery_required", failure_kind="recovery_required")
+                ctx["node_attempt"] = 3
+                self.assertEqual(worker_client.main(["feature-delivery", "--pool", "pool"]), 1)
+                recovery = str(uuid4())
+                recovered[release] = recovery
+                jobs[recovery] = {"job_id": recovery, "task_id": task_id, "action": "recover", "status": "succeeded",
+                                  "stage_result": {"recovered": True}}
+                task.update(job_id=recovery, status="failed", failure_kind="recovered")
+                ctx["upstream"]["id"] = "foreign-mr"
+                self.assertEqual(worker_client.main(["feature-delivery", "--pool", "pool"]), 1)
+                ctx["upstream"]["id"] = "mr-2"
+                deny_new_operation[0] = False
+                self.assertEqual(worker_client.main(["feature-delivery", "--pool", "pool"]), 0)
+                self.assertEqual(side_effects, ["commit", "pr", "release", "release"])
+                self.assertFalse(task["lease"])
+                self.assertEqual(task["status"], "completed")
                 self.assertIn("8", Path("delivery.md").read_text(encoding="utf-8"))
                 self.assertIn("not_run", Path("delivery.md").read_text(encoding="utf-8"))
 
@@ -414,6 +432,9 @@ class FeatureScriptTests(unittest.TestCase):
                 raise worker_client.ClientError("Lost transport before Worker admission")
             operations.append(action)
             job = {"task_id": task_id, "action": action, "job_id": str(uuid4()), "status": "succeeded"}
+            if action in {"implement", "rework"}:
+                task["implementation_correction"] = {"plan_digest": planning["plan_digest"],
+                    "implementation_attempt": payload.get("implementation_attempt", 0), "edit_job_id": job["job_id"]}
             if action == "planning-tasks":
                 self.assertEqual({k: payload[k] for k in ("workflow_mode", "workflow_project_id", "workflow_run_id",
                                                          "planning_profile", "pool_id", "requirement")},
@@ -439,8 +460,17 @@ class FeatureScriptTests(unittest.TestCase):
                     task.update(status="failed", current_stage="fix", rework_pending=True, failure_kind="timeout")
                 else:
                     task.update(status="fixing", current_stage="implemented", rework_pending=False, revision="c" * 40)
+            elif action == "fix":
+                task.update(current_stage="implemented", status="fixing", failure_kind=None, revision="d" * 40,
+                            implementation_correction={**task["implementation_correction"], "fix": check})
             elif action == "compile":
-                task.update(current_stage="compiled", compile_report={"revision": task["revision"]})
+                if task.get("failure_kind") in {"workspace_changed", "unity_changed"}:
+                    task["implementation_correction"] = {**task.get("implementation_correction", {}),
+                        "plan_digest": task["approved_plan_digest"], "implementation_attempt": task["implementation_attempt"],
+                        "recompile": check}
+                task["implementation_correction"]["compile_job_id"] = job["job_id"]
+                task.update(current_stage="compiled", status="compiling", failure_kind=None,
+                            compile_report={"revision": task["revision"]})
             elif action == "review":
                 task.update(current_stage="reviewed", review_result={"verdict": "pass", "revision": task["revision"]})
             elif action == "test":
@@ -524,9 +554,38 @@ class FeatureScriptTests(unittest.TestCase):
             task["job_id"] = str(uuid4())
             self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
 
-            # Downstream tree drift invalidates the previous successful compile for this edit.
-            task.update(current_stage="test", status="failed", failure_kind="workspace_changed",
-                        compile_report=None, review_result=None, verification=None)
-            ctx.update(node_attempt=5)
-            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
-            self.assertEqual(operations.count("compile"), 3)
+            for attempt, stage, failure, expected in (
+                (5, "review", "review_changes", ["fix", "compile"]),
+                (7, "test", "workspace_changed", ["compile"]),
+                (9, "compile", "unity_changed", ["compile"]),
+            ):
+                stopped = task["job_id"] if stage == "compile" else str(uuid4())
+                jobs[stopped] = {"job_id": stopped, "task_id": task_id, "action": stage, "status": "failed",
+                                 "failure_kind": failure, "stage_result": {}}
+                task.update(current_stage=stage, status="failed", failure_kind=failure, job_id=stopped,
+                            compile_report=None, review_result=None, verification=None)
+                ctx.update(node_attempt=attempt)
+                before = len(operations)
+                self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
+                self.assertEqual(operations[before:], expected)
+                corrected = task["job_id"]
+                for checkpoint in Path(".").glob(".unity-feature-*.json"):
+                    checkpoint.unlink()
+                Path("unity-implementation.json").unlink()
+                ctx["node_attempt"] += 1
+                self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
+                self.assertEqual(json.loads(Path("unity-implementation.json").read_bytes())["job_id"], corrected)
+                self.assertEqual(operations[before:], expected)
+                original_ref = ctx["upstream"]
+                ctx["upstream"] = {**original_ref, "id": "different-plan-artifact"}
+                self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+                self.assertEqual(operations[before:], expected)
+                ctx["upstream"] = original_ref
+
+            # A redelivery of the very attempt whose compile failed must report that failure again.
+            jobs[corrected].update(status="failed", failure_kind="unity_changed", stage_result={})
+            task.update(current_stage="compile", status="failed", failure_kind="unity_changed")
+            ctx["node_attempt"] = attempt
+            before = len(operations)
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+            self.assertEqual(len(operations), before)

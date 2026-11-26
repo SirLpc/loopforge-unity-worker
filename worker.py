@@ -277,8 +277,8 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
             raise HTTPException(422, str(error)) from error
 
     @app.get("/api/v1/tasks/{task_id}")
-    def get_task(task_id: UUID):
-        task = worker().task(str(task_id))
+    def get_task(task_id: UUID, include_implementation_correction: bool = False):
+        task = worker().task(str(task_id), include_implementation_correction=include_implementation_correction)
         return {key: value for key, value in task.items() if key != "remote_identity"}
 
     @app.get("/api/v1/tasks/{task_id}/operations/{request_id}")

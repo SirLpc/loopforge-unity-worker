@@ -205,6 +205,17 @@ class Store:
         return self._one(db.execute("SELECT data FROM jobs WHERE request_id = ?", (request_id,)))
 
     @staticmethod
+    def staged_job_history(db, task_id):
+        # A cancel that only signalled the running process never became the task's current Job.
+        return db.execute(
+            """SELECT id, json_extract(data, '$.action'), status, json_extract(data, '$.failure_kind')
+               FROM jobs WHERE task_id = ?
+                 AND NOT (json_extract(data, '$.action') = 'cancel' AND status = 'succeeded'
+                          AND COALESCE(json_extract(data, '$.stage_result.cancel_requested'), 0) = 1)
+               ORDER BY rowid DESC""", (task_id,),
+        )
+
+    @staticmethod
     def recovery_after(db, task_id, job_id):
         # An in-flight cancellation only signals the running job. A failed recovery may be repeated.
         row = db.execute(
