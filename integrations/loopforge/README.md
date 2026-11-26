@@ -41,6 +41,42 @@ python3 -m integrations.loopforge.planning_context \
 
 让中继随 Runner 常驻，项目 ID 与安装器保持一致。在运行安装器的进程里通过 `UNITY_PLANNING_CONTEXT_TOKEN` 注入同一签名密钥，再追加 `--windows-planning`。中继向当前容器的工作目录写入短时有效的签名记录，用于绑定需求、审批状态和当前计划产物的摘要。用测试 SOP 验证规划、打回重做和审批后交接，再更新正式项目。
 
+
+### 八节点功能交付
+
+1. 升级 Windows Worker。为运行 Worker 的 Windows 账号在 `start_worker.ps1 -CredentialDirectory` 指定的目录配置 `UNITY_WORKER_WORKFLOW_APPROVAL_KEY.dpapi`。它对应一份独立的交付签名密钥。Runner 主机上为中继准备同一密钥的受保护文件，通过 `--approval-key-file` 传入。从项目凭据和沙箱配置中隔离该密钥。
+2. 升级并启动专用 Runner 的中继。沿用上节的 `--platform-token-file` 和 `--context-token-file`，追加 `--approval-key-file /protected/path/workflow-approval.key`。项目现有 Worker 凭据提供 `UNITY_WORKER_URL` 和 `UNITY_WORKER_TOKEN`，另一个自定义项目凭据提供与中继一致的 `UNITY_PLANNING_CONTEXT_TOKEN`。安装器按已有引用和变量名检查这两个凭据。发布进程沿用项目 Owner 的 `UNITY_FORMAL_STUDIO_TOKEN` 和用于 Worker 探测的普通 `UNITY_WORKER_TOKEN`。
+3. 预览目标项目的现有 `<project>-feature`。此命令只读取 LoopForge 和 Worker，将当前定义和候选图写入本地输出目录。确认 Worker 声明 `staged-feature` 能力，池 ID 和启用槽位与配置一致。健康的已租赁槽位通过预检，需求定型节点在同一个池中最多排队 5400 秒。只检查 Worker 时可用 `--staged-feature --preflight`。
+4. 先在隔离项目完成一次交付和一次验收打回。正式安装时加上 `--publish --expected-revision`，传入正式预览输出的 `base_revision`。正式安装更新同一个功能 SOP 的图并发布，保留其名称、沙箱、凭据引用和项目入口。发布 CLI 会输出被确认的 revision。
+
+~~~~powershell
+$stagedArgs = @('--staged-feature', '--config', '.\config.toml', '--project-id', 'GAME-PROJECT',
+                '--api-url', 'http://LOOPFORGE-HOST:8090', '--worker-url', $workerUrl,
+                '--probe-url', $probeUrl, '--pool', 'game')
+$preview = .\.venv\Scripts\python.exe -m integrations.loopforge.install_sops @stagedArgs | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Staged feature preview failed' }
+# 核对预览，然后单独执行发布命令。
+.\.venv\Scripts\python.exe -m integrations.loopforge.install_sops @stagedArgs --publish --expected-revision $preview.base_revision
+~~~~
+
+画布顺序为需求定型 → 方案设计 → 开发实现 → 独立评审 → 测试验证 → 人工验收 → 发起 MR → 交付汇总。人工验收是唯一审批点，打回后由开发实现重新开始，Worker 的池策略限制实际执行的代码返工。发起 MR 使用中继签发且绑定当前验收与测试证据的授权，交付汇总记录归还结果。
+
+| 节点 | Markdown | JSON |
+| --- | --- | --- |
+| 需求定型 | requirement.md | unity-scope.json |
+| 方案设计 | design.md | unity-planning.json |
+| 开发实现 | implementation.md | unity-implementation.json |
+| 独立评审 | review.md | unity-review.json |
+| 测试验证 | test-report.md | unity-verification.json |
+| 发起 MR | mr-body.md | unity-delivery.json |
+| 交付汇总 | delivery.md | |
+
+#### 回退功能 SOP
+
+暂停新功能运行，在 Studio 的该 SOP 版本历史中，按发布输出的 `base_revision` 找到发布前的快照。用发布输出的 `backup` 路径比对本地定义后，恢复该历史版本并重新发布同一个 SOP。检查旧画布、两项凭据引用、沙箱和项目默认入口，再恢复新运行。运行中的任务使用启动时冻结的图，回退期间保留兼容的 Worker 和中继，并按原图完成或处理这些任务的租约。
+
+收到 HTTP 409 后重新预览并核对并发改动。平台的发布端点缺少 revision 条件，安装器会在发布前重新读取已保存的定义，并核对发布返回的内容。若发布结果与已保存定义不匹配，检查该 SOP 当前画布和版本历史，再决定是否恢复。
+
 ## 生成 Script 节点内容
 
 在服务源代码目录用 python3 integrations/loopforge/worker_client.py render <命令> [参数] 生成节点正文，将输出完整复制进 SOP 的 Script 节点，语言选 Python。每个节点使用同一客户端实现。LoopForge 将 Python 节点正文交给 python3 -c，stdout 出现在节点输出。JSON 文件由节点产物定义收集。根目录执行，工作流运行目录按节点依赖挂载上游产物。 [脚本执行源码](https://github.com/Tencent/LoopForge/blob/main/internal/engine/node_execute.go) [产物挂载源码](https://github.com/Tencent/LoopForge/blob/main/internal/engine/artifacts.go)

@@ -158,3 +158,150 @@ class InstallSopsTests(unittest.TestCase):
         self.assertEqual(calls, ["GET"])
         install_sops.save_workflow(target, api, draft, publish=True)
         self.assertEqual(calls, ["GET", "GET", "PUT", "POST"])
+
+    def test_staged_feature_has_reference_order_and_one_gate(self):
+        target = install_sops.Target("garden", "custom-sandbox", "https://worker.example.test")
+        workflow = install_sops.staged_feature_workflow(target, "worker-key", "context-key", "game")
+        expected = [
+            ("clarify", "需求定型", ["requirement.md", "unity-scope.json"]),
+            ("design", "方案设计", ["design.md", "unity-planning.json"]),
+            ("implement", "开发实现", ["implementation.md", "unity-implementation.json"]),
+            ("review", "独立评审", ["review.md", "unity-review.json"]),
+            ("test", "测试验证", ["test-report.md", "unity-verification.json"]),
+            ("accept", "人工验收", []),
+            ("mr", "发起 MR", ["mr-body.md", "unity-delivery.json"]),
+            ("deliver", "交付汇总", ["delivery.md"]),
+        ]
+        nodes = workflow["nodes"]
+        self.assertEqual(workflow["id"], "garden-feature")
+        self.assertEqual(workflow["sandboxProfileId"], "custom-sandbox")
+        self.assertEqual(workflow["projectCredentialIds"], ["worker-key", "context-key"])
+        self.assertEqual([n["id"] for n in nodes], [item[0] for item in expected])
+        self.assertEqual([(n["id"], n.get("rejectTo")) for n in nodes if n["type"] == "approval"],
+                         [("accept", "implement")])
+        self.assertEqual([(e["source"], e["target"], e["when"]) for e in workflow["edges"]],
+                         [(a[0], b[0], "success") for a, b in zip(expected, expected[1:])])
+        for node, (node_id, title, outputs) in zip(nodes, expected):
+            with self.subTest(node=node_id):
+                self.assertEqual(node["name"], title)
+                self.assertEqual(node["maxAttempts"], 1 if node_id == "accept" else 2)
+                self.assertEqual(node["maxReworks"], 0)
+                self.assertEqual(node.get("artifactOutputs", []), [
+                    {"name": Path(path).stem, "path": path, "required": True,
+                     "mediaType": "application/json" if path.endswith(".json") else "text/markdown"}
+                    for path in outputs
+                ])
+                if node_id == "accept":
+                    continue
+                self.assertEqual(node["type"], "script")
+                command = shlex.split(node["script"])
+                self.assertEqual(command[:-1], ["exec", "/usr/bin/python3", "-I", "-c"])
+                compile(command[-1], node_id, "exec")
+                arguments = ast.literal_eval(command[-1].splitlines()[0].removeprefix("SOP_ARGS = "))
+                self.assertEqual(arguments[0], "feature-delivery" if node_id == "deliver" else f"feature-{node_id}")
+                self.assertEqual(arguments[arguments.index("--pool") + 1], "game")
+                if node_id == "clarify":
+                    self.assertEqual(int(arguments[arguments.index("--queue-wait-seconds") + 1]), 5400)
+
+    def test_staged_publish_preserves_project_bindings_on_conflict(self):
+        for outcome in ("preview", "stale-preview", "put-conflict", "changed-before-publish", "changed-on-publish",
+                        "no-capability", "wrong-credentials", "published", "published-draft"):
+            with self.subTest(outcome=outcome):
+                self._check_staged_install(outcome)
+
+    def _check_staged_install(self, outcome):
+        feature_path = "/api/workflows/garden-feature"
+        project = {"id": "garden", "workflowId": "garden-feature", "sopPlaybooks": [
+            {"id": "feature", "default": True, "bindings": [{"workflowId": "garden-feature", "order": 1}]},
+            {"id": "ui", "bindings": [{"workflowId": "garden-ui", "order": 1}]},
+        ]}
+        original_project = json.dumps(project)
+        original = {
+            "id": "garden-feature", "name": "现有功能流程", "projectId": "garden",
+            "status": "published", "revision": 6, "publishedRevision": 6, "version": 3,
+            "tags": ["unity-worker-formal", "user-tag"], "sandboxProfileId": "existing-sandbox",
+            "projectCredentialIds": ["context-key", "worker-key"], "description": "现有介绍",
+            "nodes": [{"id": "previous"}], "edges": [],
+        }
+        if outcome == "published-draft":
+            original.update(status="draft", revision=1, version=1)
+            original.pop("publishedRevision")
+        live = original
+        writes = []
+        workflow_writes = []
+        credentials = [
+            {"id": "worker-key", "kind": "custom", "variables": ["UNITY_WORKER_URL", "UNITY_WORKER_TOKEN"]},
+            {"id": "context-key", "kind": "custom", "variables": ["UNITY_PLANNING_CONTEXT_TOKEN"]},
+        ]
+        if outcome == "wrong-credentials":
+            credentials[0]["variables"] = ["UNITY_WORKER_TOKEN"]
+        self.responses["/api/v1/workers"]["workers"][0]["capabilities"] = (
+            [] if outcome == "no-capability" else ["staged-feature"])
+        self.responses["/api/v1/pools"]["pools"][0]["slots"][0]["status"] = "leased"
+
+        def api(method, path, value=None, *, missing=False):
+            nonlocal live
+            if method == "GET":
+                return {"/api/projects/garden": project,
+                        "/api/projects/garden/credentials": {"canManage": True, "credentials": credentials},
+                        feature_path: live}[path]
+            writes.append((method, path))
+            if (method, path) == ("PUT", "/api/workflows"):
+                workflow_writes.append(value["id"])
+                self.assertEqual({k: v for k, v in value.items() if k not in {"nodes", "edges"}}, {
+                    k: v for k, v in original.items() if k not in {"nodes", "edges"}
+                })
+                if outcome == "put-conflict":
+                    raise RuntimeError("PUT /api/workflows: HTTP 409")
+                saved = {**value, "revision": value["revision"] + 1}
+                if outcome == "published-draft":
+                    saved["nodes"] = [{k: v for k, v in node.items() if k != "maxReworks" or v}
+                                      for node in value["nodes"]]
+                live = {**saved, "revision": 8} if outcome == "changed-before-publish" else saved
+                return saved
+            if (method, path) == ("POST", feature_path + "/publish"):
+                revision = live["revision"] + 1
+                live = {**live, "status": "published", "revision": revision,
+                        "publishedRevision": revision, "version": live["version"] + 1}
+                if outcome == "changed-on-publish":
+                    live = {**live, "nodes": [{"id": "someone-else"}]}
+                return live
+            self.fail(f"Unexpected staged install write {method} {path}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "worker.toml"
+            config.write_text('worker_id = "worker-host"\ndefault_pool = "game"\n'
+                              '[[pools.game.slots]]\nid = "primary"\n'
+                              '[[pools.game.slots]]\nid = "reserve"\nenabled = false\n', encoding="utf-8")
+            args = ["--staged-feature", "--config", str(config), "--output-dir", str(root),
+                    "--project-id", "garden", "--api-url", "https://studio.example.test",
+                    "--worker-url", "https://worker.example.test"]
+            if outcome != "preview":
+                args.append("--publish")
+            if outcome == "stale-preview":
+                args.extend(("--expected-revision", "5"))
+            env = {"UNITY_FORMAL_STUDIO_TOKEN": "studio-token", "UNITY_WORKER_TOKEN": "worker-token"}
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(install_sops, "call_factory", side_effect=[self.probe, api]):
+                errors = {"stale-preview": "expected 5, found 6", "put-conflict": "HTTP 409",
+                          "changed-before-publish": "changed",
+                          "changed-on-publish": "published.*match", "no-capability": "staged-feature",
+                          "wrong-credentials": "credential"}
+                if outcome in errors:
+                    with self.assertRaisesRegex(RuntimeError, errors[outcome]):
+                        install_sops.main(args)
+                else:
+                    install_sops.main(args)
+                    backup = json.loads((root / "garden-feature-before.json").read_text(encoding="utf-8"))
+                    self.assertEqual(backup, original)
+
+        self.assertEqual(json.dumps(project), original_project)
+        if outcome in {"preview", "stale-preview", "no-capability", "wrong-credentials"}:
+            self.assertEqual(writes, [])
+        else:
+            self.assertEqual(workflow_writes, ["garden-feature"])
+            expected = [("PUT", "/api/workflows")]
+            if outcome in {"published", "published-draft", "changed-on-publish"}:
+                expected.append(("POST", feature_path + "/publish"))
+            self.assertEqual(writes, expected)

@@ -351,6 +351,112 @@ def windows_workflow(target, row, worker_credentials, context_credential, pool_i
     return workflow
 
 
+def staged_feature_workflow(target, worker_credential, context_credential, pool_id):
+    if not pool_id:
+        raise ValueError("Staged feature delivery requires a named pool")
+    key, title, _, lane = STARTERS[0]
+    stages = (
+        ("clarify", "需求定型", "feature-clarify", "requirement", "unity-scope", "clarification"),
+        ("design", "方案设计", "feature-design", "design", "unity-planning", "clarification"),
+        ("implement", "开发实现", "feature-implement", "implementation", "unity-implementation", "development"),
+        ("review", "独立评审", "feature-review", "review", "unity-review", "development"),
+        ("test", "测试验证", "feature-test", "test-report", "unity-verification", "testing"),
+        ("mr", "发起 MR", "feature-mr", "mr-body", "unity-delivery", "none"),
+        ("deliver", "交付汇总", "feature-delivery", "delivery", None, "none"),
+    )
+    nodes = []
+    for node_id, label, action, report, evidence, metric_stage in stages:
+        args = ("--queue-wait-seconds", "5400") if node_id == "clarify" else ()
+        node = script_node(node_id, label, render(action, "--pool", pool_id, "--follow", *args))
+        node.update(artifactOutputs=[artifact(report, report + ".md")], metricStage=metric_stage,
+                    maxAttempts=2, maxReworks=0)
+        if evidence:
+            node["artifactOutputs"].append(artifact(evidence, evidence + ".json", "application/json"))
+        nodes.append(node)
+    gate = approval("accept", "人工验收",
+                    "核对需求和方案、实现、独立评审与 Unity 测试报告，确认本轮验证证据和未覆盖项。"
+                    "批准后发起 MR；需要修改时填写完整意见并打回开发实现。", "implement")
+    gate["maxReworks"] = 0
+    nodes.insert(5, gate)
+    return definition(target, f"{target.project_id}-{key}", title, lane, nodes, (worker_credential, context_credential))
+
+
+def staged_credential_ids(api, project_path, workflow):
+    refs = workflow.get("projectCredentialIds", [])
+    items = {entry["id"]: entry for entry in api("GET", project_path + "/credentials")["credentials"]}
+    bound = {}
+    for ref in refs:
+        entry = items.get(ref, {})
+        if entry.get("kind") != "custom":
+            raise RuntimeError("The feature workflow must bind two existing custom project credentials")
+        bound[frozenset(entry.get("variables", []))] = ref
+    worker = frozenset(("UNITY_WORKER_URL", "UNITY_WORKER_TOKEN"))
+    context = frozenset(("UNITY_PLANNING_CONTEXT_TOKEN",))
+    if len(refs) != 2 or bound.keys() != {worker, context}:
+        raise RuntimeError("The feature workflow must bind its existing Worker and planning context credentials")
+    return bound[worker], bound[context]
+
+
+def workflow_content(workflow, *, publishing=False):
+    ignored = {"revision", "publishedRevision", "updatedAt"}
+    if publishing:
+        ignored.update(("status", "version"))
+    content = {key: value for key, value in workflow.items() if key not in ignored}
+    # Some platform releases omit the zero value for script nodes.
+    content["nodes"] = [{"maxReworks": 0, **node} for node in content["nodes"]]
+    return content
+
+
+def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, expected_revision=None):
+    identifier = target.project_id + "-feature"
+    project_path = "/api/projects/" + target.project_id
+    project = api("GET", project_path)
+    if project.get("id") != target.project_id:
+        raise RuntimeError("LoopForge project does not match --project-id")
+    route = "/api/workflows/" + identifier
+    live = api("GET", route)
+    revision = live.get("revision")
+    if (live.get("id") != identifier or live.get("projectId") != target.project_id
+            or live.get("generic") or TAG not in live.get("tags", [])
+            or live.get("status") not in ("draft", "published") or not isinstance(revision, int) or revision < 1
+            or live.get("autoSelectSandbox") or not live.get("sandboxProfileId")):
+        raise RuntimeError(f"Expected an existing draft or published project feature workflow with a fixed sandbox: {identifier}")
+    if expected_revision is not None and expected_revision != revision:
+        raise RuntimeError(f"Feature workflow revision changed: expected {expected_revision}, found {revision}")
+    worker, context = staged_credential_ids(api, project_path, live)
+    live_target = Target(target.project_id, live["sandboxProfileId"], target.worker_url)
+    graph = staged_feature_workflow(live_target, worker, context, pool_id)
+    value = {**live, "nodes": graph["nodes"], "edges": graph["edges"]}
+    # Keep the exact input revision for recovery, even on repeated deployments.
+    backup = output_dir / f"{identifier}-before.json"
+    if backup.exists():
+        if json.loads(backup.read_text(encoding="utf-8")) != live:
+            backup = output_dir / f"{identifier}-before-r{revision}.json"
+    if not backup.exists():
+        save_json(backup, live)
+    report = {"id": identifier, "base_revision": revision, "pool": pool_id, "backup": str(backup)}
+    if not publish:
+        preview = output_dir / f"{identifier}-staged-preview.json"
+        save_json(preview, value)
+        return {**report, "mode": "preview", "preview": str(preview)}
+
+    # LoopForge checks the revision in the PUT body and reports a stale write as HTTP 409.
+    saved = api("PUT", "/api/workflows", value)
+    if (saved.get("revision") not in (revision, revision + 1)
+            or workflow_content(saved) != workflow_content(value)):
+        raise RuntimeError(f"The saved feature workflow does not match the requested graph: {identifier}")
+    if api("GET", route) != saved:
+        raise RuntimeError(f"Feature workflow changed before publishing: {identifier}")
+    # Publish has no revision precondition. Detect an intervening edit through its response.
+    published = api("POST", route + "/publish", {})
+    if (published.get("status") != "published"
+            or published.get("revision") not in (saved["revision"], saved["revision"] + 1)
+            or published.get("publishedRevision", published.get("revision")) != published.get("revision")
+            or workflow_content(published, publishing=True) != workflow_content(saved, publishing=True)):
+        raise RuntimeError(f"The published feature workflow does not match the saved graph: {identifier}")
+    return {**report, "mode": "published", "revision": published["revision"]}
+
+
 def preflight_executors(target, api, *, windows_planning=False):
     for key, _, template_id, _ in STARTERS:
         if windows_planning and key != "product":
@@ -385,13 +491,15 @@ def read_pool(settings, pool_id):
     return pool
 
 
-def preflight_worker(api, settings, pool_id):
+def preflight_worker(api, settings, pool_id, *, staged_feature=False):
     pool = read_pool(settings, pool_id)
     worker_id = os.environ.get("UNITY_WORKER_ID", settings.get("worker_id", "worker-01"))
     workers = api("GET", "/api/v1/workers")["workers"]
     if len(workers) != 1 or workers[0]["worker_id"] != worker_id:
         raise RuntimeError(f"Worker endpoint does not match configured worker {worker_id}")
     worker = workers[0]
+    if staged_feature and "staged-feature" not in worker.get("capabilities", []):
+        raise RuntimeError("Worker does not advertise the staged-feature capability")
     if pool is None:
         if worker["status"] != "idle":
             raise RuntimeError(f"Worker {worker_id} is not ready: {worker['status']}")
@@ -410,7 +518,10 @@ def preflight_worker(api, settings, pool_id):
             raise RuntimeError(f"Worker slot {slot_id} is not ready: {slots[slot_id]}")
         if not enabled and slots[slot_id] == "idle":
             raise RuntimeError(f"Worker slot {slot_id} is enabled on the server")
-    if "idle" not in slots.values():
+    if staged_feature:
+        if not any(expected.values()):
+            raise RuntimeError(f"Worker pool {pool_id} has no enabled slot")
+    elif "idle" not in slots.values():
         raise RuntimeError(f"Worker pool {pool_id} has no idle enabled slot")
     return {"worker": worker, "pool": ready}
 
@@ -434,7 +545,8 @@ def require_env(name):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--publish", action="store_true", help="Publish the SOPs and set the project's defaults")
+    mode.add_argument("--publish", action="store_true",
+                      help="Publish the selected SOPs (sets project defaults in legacy mode)")
     mode.add_argument("--preflight", action="store_true", help="Check Worker readiness without changing LoopForge")
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument("--output-dir", type=Path, default=Path("state/loopforge"))
@@ -445,15 +557,26 @@ def main(argv=None):
                         help="Worker URL reachable by LoopForge script nodes")
     parser.add_argument("--probe-url", help="Worker URL reachable by the machine running this installer")
     parser.add_argument("--pool", help="Use a named pool instead of the default pool")
-    parser.add_argument("--windows-planning", action="store_true",
+    layout = parser.add_mutually_exclusive_group()
+    layout.add_argument("--staged-feature", action="store_true",
+                        help="Preview or publish only the existing project feature SOP")
+    layout.add_argument("--windows-planning", action="store_true",
                         help="Use the Windows Worker for code investigation and planning before approval")
+    parser.add_argument("--expected-revision", type=int,
+                        help="With --staged-feature, stop if the existing feature revision differs")
     args = parser.parse_args(argv)
+    if args.expected_revision is not None and (not args.staged_feature or args.preflight
+                                                or args.expected_revision < 1):
+        parser.error("--expected-revision requires staged preview or publish and a positive revision")
 
     settings = tomllib.loads(args.config.read_text(encoding="utf-8-sig"))
     pool_id = args.pool or settings.get("default_pool")
     pool = read_pool(settings, pool_id)
-    if args.windows_planning and pool is None:
-        raise ValueError("Windows planning requires a named pool")
+    if pool is None:
+        if args.windows_planning:
+            raise ValueError("Windows planning requires a named pool")
+        if args.staged_feature:
+            raise ValueError("Staged feature delivery requires a named pool")
     if not args.worker_url:
         parser.error("set --worker-url or UNITY_WORKER_URL")
     worker_url = endpoint(args.worker_url)
@@ -461,7 +584,8 @@ def main(argv=None):
     probe_url = endpoint(args.probe_url) if args.probe_url else worker_url
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.preflight:
-        result = preflight_worker(call_factory(worker_token, probe_url), settings, pool_id)
+        result = preflight_worker(call_factory(worker_token, probe_url), settings, pool_id,
+                                  staged_feature=args.staged_feature)
         save_json(args.output_dir / "worker-preflight.json", result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
@@ -469,6 +593,16 @@ def main(argv=None):
     if not args.project_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.project_id):
         parser.error("set --project-id to a LoopForge project ID")
     target = Target(args.project_id, args.sandbox_profile, worker_url)
+    if args.staged_feature:
+        worker_health = preflight_worker(call_factory(worker_token, probe_url), settings, pool_id,
+                                        staged_feature=True)
+        save_json(args.output_dir / "worker-preflight.json", worker_health)
+        api = call_factory(require_env("UNITY_FORMAL_STUDIO_TOKEN"), endpoint(args.api_url))
+        result = install_staged_feature(target, api, pool_id, args.output_dir, publish=args.publish,
+                                        expected_revision=args.expected_revision)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return
+
     assemblies = (pool or {}).get("test_assemblies", settings.get("test_assemblies"))
     if not assemblies and not args.windows_planning:
         raise ValueError("Configure test_assemblies for the LoopForge plan handoff")
