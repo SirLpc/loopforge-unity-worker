@@ -1,4 +1,4 @@
-"""Codex implementation and independent, input-only review sessions."""
+"""Codex implementation, read-only planning, and independent review sessions."""
 
 import json
 import os
@@ -11,7 +11,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from git_workspace import CACHES, OUTPUTS, SENSITIVE_DIRS, SECRET_SUFFIXES
-from planning import PLANNING_RULES, PlanResult
+from planning import CLARIFICATION_RULES, PLANNING_RULES, ClarificationResult, PlanResult
 from process_runner import StageError
 from worker_config import system_env
 
@@ -50,6 +50,8 @@ class ReviewResult(StructuredOutput):
 
 class AgentExecutor(Protocol):
     def execute(self, ctx, prompt: str, *, review: bool = False) -> dict: ...
+
+    def clarify(self, ctx, briefing: dict) -> dict: ...
 
     def plan(self, ctx, briefing: dict) -> dict: ...
 
@@ -232,14 +234,24 @@ class CodexExecutor:
                 (nested / ".env").unlink(missing_ok=True)
                 nested.rmdir()
 
+    def clarify(self, ctx, briefing):
+        prompt = CLARIFICATION_RULES + "\n\nTask data:\n" + json.dumps(briefing, ensure_ascii=False)
+        return self._execute(ctx, prompt, "clarify", ClarificationResult)
+
     def plan(self, ctx, briefing):
         prompt = PLANNING_RULES + "\n\nTask and baseline data:\n" + json.dumps(briefing, ensure_ascii=False)
-        return self.execute(ctx, prompt, planning=True)
+        return self._execute(ctx, prompt, "plan", PlanResult)
 
-    def execute(self, ctx, prompt, *, review=False, planning=False):
+    def execute(self, ctx, prompt, *, review=False):
+        if review:
+            return self._execute(ctx, prompt, "review", ReviewResult)
+        return self._execute(ctx, prompt, "implement", ImplementationResult)
+
+    def _execute(self, ctx, prompt, action, model):
         env = self.environment()
         help_text = self.capabilities(ctx, env)
-        model = PlanResult if planning else ReviewResult if review else ImplementationResult
+        review = action == "review"
+        planning = action in {"clarify", "plan"}
         cwd = ctx.prefix("review-workspace") if review else getattr(self.cfg, "checkout", self.cfg.project)
         if review:
             cwd.mkdir()
@@ -249,7 +261,7 @@ class CodexExecutor:
         switches = ["--strict-config", "--ignore-user-config", "--ignore-rules", "--output-last-message", str(output)]
         if review or planning:
             if "--skip-git-repo-check" not in help_text:
-                raise StageError("unsupported", "Codex cannot review outside the Unity checkout")
+                raise StageError("unsupported", "Codex cannot run a read-only session without Git metadata")
             switches.append("--skip-git-repo-check")
         json_events = "--json" in help_text
         if json_events:
@@ -260,7 +272,7 @@ class CodexExecutor:
             switches.extend(("--output-schema", str(schema)))
         process = ctx.run(
             [self.cfg.codex_exe, *options, "exec", *switches, "-"],
-            "codex-plan" if planning else "codex-review" if review else "codex",
+            "codex" if action == "implement" else f"codex-{action}",
             cwd=cwd, timeout=self.cfg.codex_timeout, env=env, publish=True, data=prompt.encode("utf-8"),
         )
         identifier = session_id(process.stdout) if json_events else None

@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from artifacts import artifact_bytes, log_page, safe_child, task_directory
 from development import DevelopmentWorker, RequestConflict, SlotNotFound, TaskNotFound
@@ -21,7 +21,7 @@ from workspace_storage import CacheName
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
 Criterion = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2_000)]
-Action = Literal["prepare", "implement", "compile", "test", "review", "fix", "run", "cancel", "release", "pr"]
+Action = Literal["clarify", "prepare", "implement", "compile", "test", "review", "fix", "run", "cancel", "release", "pr"]
 
 
 class Body(BaseModel):
@@ -63,8 +63,16 @@ class TaskRequest(OperationRequest):
 class PlanningTaskRequest(OperationRequest):
     pool_id: str | None = Field(default=None, pattern=rf"^{REMOTE_PATTERN}$")
     workflow_run_id: str = Field(pattern=r"^run-[A-Za-z0-9_-]{1,120}$")
+    workflow_mode: Literal["staged-feature"] | None = None
+    workflow_project_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     requirement: Text
     planning_profile: Literal["feature", "ui", "issue-fix"]
+
+    @model_validator(mode="after")
+    def staged_feature_requires_project(self):
+        if self.workflow_mode == "staged-feature" and self.workflow_project_id is None:
+            raise ValueError("Staged feature tasks require a LoopForge project ID")
+        return self
 
 
 class PlanRequest(StageRequest):
@@ -248,6 +256,9 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         payload = payload_for(request)
         if payload["pool_id"] in (None, cfg.default_pool):
             del payload["pool_id"]
+        for field in ("workflow_mode", "workflow_project_id"):
+            if payload[field] is None:
+                del payload[field]
         try:
             return worker().create(str(request.request_id), payload)
         except ValueError as error:
@@ -320,8 +331,8 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     def operation(task_id: UUID, action: Action, request: StageRequest):
         payload = {}
         if request.queue_wait_seconds is not None:
-            if action not in {"run", "prepare"}:
-                raise HTTPException(422, "Queue wait is only allowed for run or prepare")
+            if action not in {"run", "prepare", "clarify"}:
+                raise HTTPException(422, "Queue wait is only allowed for run, prepare or clarify")
             payload["queue_wait_seconds"] = request.queue_wait_seconds
         return worker().action(str(task_id), action, str(request.request_id), payload)
 

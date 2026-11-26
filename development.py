@@ -16,7 +16,7 @@ from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, AgentExecutor, CodexEx
 from git_workspace import GitWorkspace
 from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
-from planning import investigate
+from planning import clarify_requirements, investigate
 from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
@@ -342,7 +342,13 @@ class DevelopmentWorker:
                 return
         elif active_job:
             raise RequestConflict("The task already has an active job")
+        elif action == "clarify" and task.get("workflow_mode") == "staged-feature":
+            if (status in {"pending", "failed"} and stage in {"created", "clarify"}
+                    and (task["lease"] or task["slot_id"] is None)):
+                return
         elif action == "plan" and task.get("planning_profile") and not task.get("approved_plan_digest"):
+            if task.get("workflow_mode") == "staged-feature" and not (task["lease"] and task.get("clarification")):
+                raise RequestConflict("Clarify the requirement in the assigned workspace before planning")
             if (status in {"pending", "failed", "awaiting_plan_approval"}
                     and (task["lease"] or task["slot_id"] is None)):
                 return
@@ -474,6 +480,8 @@ class DevelopmentWorker:
             ctx.workspace = workspace
             if action == "run":
                 result = self.run(ctx)
+            elif action == "clarify":
+                result = self.build_clarification(ctx)
             elif action == "plan":
                 result = self.build_plan(ctx)
             elif action == "smoke":
@@ -539,6 +547,9 @@ class DevelopmentWorker:
                             exit_code=error.exit_code if error else 0)
             if action == "release" and not error:
                 task.update(lease=False, released_at=timestamp)
+            if action == "clarify" and not error:
+                task.update(status="pending", current_stage="clarified", clarification=result,
+                            failure_kind=None, error_message=None, exit_code=0)
             if action == "plan" and not error:
                 task.update(status="awaiting_plan_approval", current_stage="plan_ready", planning=result,
                             failure_kind=None, error_message=None, exit_code=0)
@@ -581,6 +592,15 @@ class DevelopmentWorker:
         prepared = ctx.workspace.git.prepare(ctx, branch)
         ctx.save(**prepared)
         return {"base_commit": prepared["base_commit"], "task_branch": branch}
+
+    def build_clarification(self, ctx):
+        ctx.save(status="clarifying", current_stage="clarify", finished_at=None)
+        if not ctx.task["base_commit"]:
+            self.stage_prepare(ctx)
+        clarification = self.clean_output(clarify_requirements(ctx))
+        path = ctx.artifact("unity-clarification", ".json", "clarification")
+        path.write_text(json.dumps(clarification, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return clarification
 
     def build_plan(self, ctx):
         ctx.save(status="planning", current_stage="plan", finished_at=None)

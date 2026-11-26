@@ -3,11 +3,13 @@ import sys
 import time
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from codex_executor import CodexExecutor, toml_string
 from planning import record_baseline
 from process_runner import StageError
 from support import test_directory
@@ -22,6 +24,12 @@ class PlanningAgent:
     def __init__(self, project):
         self.project = project
         self.calls = []
+
+    def clarify(self, ctx, briefing):
+        text = (self.project / 'hello.txt').read_text().strip()
+        return {'goal': briefing['requirement'], 'audience': ['Players'],
+                'scope': [f'Replace the current greeting {text!r}'],
+                'acceptance_criteria': ['The greeting updates'], 'open_questions': []}
 
     def plan(self, ctx, briefing):
         self.calls.append((ctx.task['slot_id'], briefing))
@@ -56,16 +64,21 @@ class PlanningTests(unittest.TestCase):
         self.client = self.enterContext(TestClient(create_app(config, runner=self.runner, agent=self.agent),
                                                    headers={'Authorization': f'Bearer {TOKEN}'}))
 
-    def create(self, requirement='Change the greeting', request_id=None):
+    def create_response(self, requirement='Change the greeting', request_id=None, **extra):
         response = self.client.post('/api/v1/planning-tasks', json={
             'request_id': request_id or str(uuid4()), 'workflow_run_id': 'run-123',
-            'requirement': requirement, 'planning_profile': 'feature',
+            'requirement': requirement, 'planning_profile': 'feature', **extra,
         })
+        return response
+
+    def create(self, **extra):
+        response = self.create_response(**extra)
         self.assertEqual(response.status_code, 202, response.text)
         return response.json()['task_id']
 
-    def action(self, task, operation, **payload):
-        return self.client.post(f'/api/v1/tasks/{task}/{operation}', json={'request_id': str(uuid4()), **payload})
+    def action(self, task, operation, request_id=None, **payload):
+        return self.client.post(f'/api/v1/tasks/{task}/{operation}',
+                                json={'request_id': request_id or str(uuid4()), **payload})
 
     def wait(self, action):
         self.assertEqual(action.status_code, 202, action.text)
@@ -80,6 +93,104 @@ class PlanningTests(unittest.TestCase):
 
     def task(self, task):
         return self.client.get(f'/api/v1/tasks/{task}').json()
+
+    def test_staged_planning_task_requires_a_valid_project_id(self):
+        for project_id in (None, '', '-game', 'a/b', 'a b', 'a' * 65):
+            with self.subTest(project_id=project_id):
+                response = self.create_response(workflow_mode='staged-feature', workflow_project_id=project_id)
+                self.assertEqual(response.status_code, 422, response.text)
+        response = self.create_response(workflow_mode='staged-feature')
+        self.assertEqual(response.status_code, 422, response.text)
+        task_id = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        self.assertEqual(self.task(task_id)['workflow_project_id'], 'Game_Project-1')
+        self.assertEqual(self.task(task_id)['workflow_mode'], 'staged-feature')
+
+    def test_staged_clarify_and_plan_share_the_checkout(self):
+        task_id = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        self.assertEqual(self.action(task_id, 'plan').status_code, 409)
+        request_id = str(uuid4())
+        action = self.action(task_id, 'clarify', request_id=request_id, queue_wait_seconds=10)
+        clarification_job = self.wait(action)
+        self.assertEqual(clarification_job['status'], 'succeeded', clarification_job)
+        clarified = self.task(task_id)
+        self.assertTrue(clarified['lease'])
+        self.assertTrue(clarified['pool_id'])
+        self.assertEqual(clarified['workflow_run_id'], 'run-123')
+        self.assertEqual(clarified['current_stage'], 'clarified')
+        self.assertEqual(clarified['base_commit'], git(self.project, 'rev-parse', 'HEAD'))
+        self.assertEqual(clarified['task_branch'], git(self.project, 'branch', '--show-current'))
+        self.assertEqual(clarified['clarification']['scope'], ["Replace the current greeting 'old'"])
+        repeated = self.action(task_id, 'clarify', request_id=request_id, queue_wait_seconds=10)
+        self.assertEqual(repeated.status_code, 202, repeated.text)
+        self.assertEqual(repeated.json()['job_id'], clarification_job['job_id'])
+
+        plan_job = self.wait(self.action(task_id, 'plan'))
+        self.assertEqual(plan_job['status'], 'succeeded', plan_job)
+        planned = self.task(task_id)
+        self.assertEqual((planned['slot_id'], planned['base_commit']), (clarified['slot_id'], clarified['base_commit']))
+        self.assertEqual(self.agent.calls[-1][1]['clarification'], clarified['clarification'])
+        self.assertEqual(planned['planning']['source_evidence'][0], {'path': 'hello.txt', 'line': 1, 'excerpt': 'old'})
+        self.assertEqual(self.action(task_id, 'implement').status_code, 409)
+
+    def test_staged_plan_freeze_rejects_stale_workspace_and_plan(self):
+        task_id = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        self.assertEqual(self.wait(self.action(task_id, 'clarify'))['status'], 'succeeded')
+        self.assertEqual(self.wait(self.action(task_id, 'plan'))['status'], 'succeeded')
+        first = self.task(task_id)
+        binding = {'slot_id': first['slot_id'], 'base_commit': first['base_commit'],
+                   'plan_digest': first['planning']['plan_digest']}
+        for wrong in ({'slot_id': 'other-slot'}, {'base_commit': 'a' * 40}):
+            self.assertEqual(self.action(task_id, 'accept-plan', **{**binding, **wrong}).status_code, 409)
+        self.assertEqual(self.wait(self.action(task_id, 'plan', feedback='Keep the text short'))['status'], 'succeeded')
+        self.assertEqual(self.action(task_id, 'accept-plan', **binding).status_code, 409)
+        latest = self.task(task_id)['planning']['plan_digest']
+        self.assertEqual(self.action(task_id, 'accept-plan', **{**binding, 'plan_digest': latest}).status_code, 202)
+
+    def test_clarify_waits_for_a_slot_and_can_reconnect_to_the_queued_job(self):
+        first = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        second = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        self.assertEqual(self.wait(self.action(first, 'clarify'))['status'], 'succeeded')
+        request_id = str(uuid4())
+        queued = self.action(second, 'clarify', request_id=request_id, queue_wait_seconds=10)
+        self.assertEqual(queued.status_code, 202, queued.text)
+        self.assertEqual(queued.json()['status'], 'queued')
+        self.assertFalse(self.task(second)['lease'])
+        repeated = self.action(second, 'clarify', request_id=request_id, queue_wait_seconds=10)
+        self.assertEqual(repeated.json()['job_id'], queued.json()['job_id'])
+        self.assertEqual(self.action(first, 'cancel').status_code, 202)
+        self.assertEqual(self.wait(self.action(first, 'release'))['status'], 'succeeded')
+        self.assertEqual(self.wait(queued)['status'], 'succeeded')
+        self.assertTrue(self.task(second)['lease'])
+
+    def test_codex_clarification_reads_the_assigned_checkout_with_planning_permissions(self):
+        import json
+        from pathlib import Path
+
+        sibling = self.root / 'unleased-checkout'
+        cfg = SimpleNamespace(project=self.project, checkout=self.project, codex_exe=str(self.root / 'codex.exe'),
+                              codex_home=self.root / 'codex-home', codex_sandbox='mxc', codex_timeout=10,
+                              sibling_checkouts=(sibling,))
+        agent = CodexExecutor(cfg)
+        self.assertTrue(hasattr(agent, 'clarify'), 'CodexExecutor must have a native clarification stage')
+
+        def run(argv, label, *, cwd, data, **options):
+            permissions = ' '.join(argv)
+            self.assertIn(f'{toml_string(self.project)}="read"', permissions)
+            self.assertIn(f'{toml_string(self.project / ".git")}="deny"', permissions)
+            self.assertIn(f'{toml_string(sibling)}="deny"', permissions)
+            self.assertIn('permissions.unity_worker.network.enabled=false', permissions)
+            self.assertEqual(cwd, self.project)
+            self.assertIn('Change the greeting', data.decode())
+            response = {'goal': 'Change the greeting', 'audience': ['Players'], 'open_questions': [],
+                        'scope': [(cwd / 'hello.txt').read_text().strip()], 'acceptance_criteria': ['Greeting changes']}
+            Path(argv[argv.index('--output-last-message') + 1]).write_text(json.dumps(response), encoding='utf-8')
+            return SimpleNamespace(exit_code=0)
+
+        ctx = SimpleNamespace(prefix=lambda name: self.root / name, run=run)
+        with patch.object(agent, 'capabilities', return_value='--skip-git-repo-check --output-schema'), \
+                patch.object(agent, 'verify_sandbox'):
+            result = agent.clarify(ctx, {'requirement': 'Change the greeting'})
+        self.assertEqual(result['scope'], ['old'])
 
     def test_plan_prepares_readable_checkout_and_blocks_stale_or_unapproved_development(self):
         task_id = self.create()
@@ -146,7 +257,6 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.agent.calls[-1][1]['baseline_results'], records)
 
     def test_baseline_keeps_scoped_assertion_failure_as_evidence(self):
-        from types import SimpleNamespace
 
         scope = {'assembly': 'Tests', 'fixtures': ['Example.ExistingTests']}
         result = {'failed': 1, 'test_results': 'baseline.xml', 'failed_tests': [{'name': 'Example.ExistingTests.Case'}]}
