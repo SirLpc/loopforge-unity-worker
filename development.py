@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import get_args
 from uuid import uuid4
 
 from artifacts import RunContext, log_page, redact_text, safe_child
@@ -18,6 +19,7 @@ from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
 from worker_config import Settings, check_slot, legacy_service, validate_test_selection
+from workspace_storage import CacheName, measure_directory, volume_usage
 
 
 STAGES = {
@@ -38,6 +40,10 @@ RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "lice
 
 
 class TaskNotFound(Exception):
+    pass
+
+
+class SlotNotFound(Exception):
     pass
 
 
@@ -123,6 +129,32 @@ class DevelopmentWorker:
     def pools(self):
         with self.store.connect() as db:
             return [self.scheduler.pool_status(db, pool) for pool in self.cfg.pools.values()]
+
+    def storage_overview(self) -> dict:
+        pools = self.pools()
+        slots = self.cfg.slots
+        for pool in pools:
+            for slot in pool["slots"]:
+                path = slots[slot["id"]].settings.checkout
+                slot.update(path=str(path), volume=volume_usage(path))
+        state = {"path": str(self.cfg.logs), "volume": volume_usage(self.cfg.logs)}
+        return self.clean_output({"pools": pools, "state": state})
+
+    def storage_measure(self, slot_id: str | None = None, cache: CacheName | None = None) -> dict:
+        if slot_id is None:
+            root, groups = self.cfg.logs, {}
+        else:
+            slot = self.cfg.slots.get(slot_id)
+            if slot is None:
+                raise SlotNotFound
+            if cache is None:
+                root = slot.settings.checkout
+                groups = {name: slot.settings.project / name for name in get_args(CacheName)}
+                groups[".git"] = root / ".git"
+            else:
+                root = slot.settings.project / cache
+                groups = {cache: root}
+        return self.clean_output({**measure_directory(root, groups), "volume": volume_usage(root)})
 
     def worker(self, *, legacy=False):
         with self.store.connect() as db:

@@ -12,10 +12,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from artifacts import artifact_bytes, log_page, safe_child, task_directory
-from development import DevelopmentWorker, RequestConflict, TaskNotFound
+from development import DevelopmentWorker, RequestConflict, SlotNotFound, TaskNotFound
 from process_runner import reserve_project
 from pull_requests import HostedPullRequests
 from worker_config import REMOTE_PATTERN, Settings, legacy_service, load_service_settings
+from workspace_storage import CacheName
 
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
@@ -144,6 +145,10 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     async def not_found(request: Request, exc):
         return JSONResponse(status_code=404, content={"detail": "Unknown task or job"})
 
+    @app.exception_handler(SlotNotFound)
+    async def slot_not_found(request: Request, exc):
+        return JSONResponse(status_code=404, content={"detail": "Unknown slot"})
+
     def payload_for(body):
         payload = body.model_dump(mode="json", exclude={"request_id"})
         serialized = json.dumps(payload, ensure_ascii=False)
@@ -197,6 +202,18 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     @app.get("/api/v1/pools")
     def list_pools():
         return {"pools": worker().pools()}
+
+    @app.get("/api/v1/storage", dependencies=[Depends(operator)])
+    def storage_overview():
+        return worker().storage_overview()
+
+    @app.get("/api/v1/storage/state", dependencies=[Depends(operator)])
+    def storage_state():
+        return worker().storage_measure()
+
+    @app.get("/api/v1/storage/slots/{slot_id}", dependencies=[Depends(operator)])
+    def storage_slot(slot_id: str, cache: CacheName | None = None):
+        return worker().storage_measure(slot_id, cache)
 
     @app.post("/api/v1/tasks", status_code=202)
     def create_task(request: TaskRequest):
