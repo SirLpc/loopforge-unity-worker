@@ -217,3 +217,108 @@ class WorkflowDeliveryTests(WorkflowFixture):
             self.assertEqual(self.deliver(client, tested, sign({}), retry_id).json()["job_id"], result["job_id"])
             self.assertEqual(self.deliver(client, tested, sign({})).status_code, 409)
             self.assertEqual(adapter.commits, [pushed["commit_sha"], pushed["commit_sha"]])
+
+    def current_delivery_job(self, client, task, request_id=None):
+        proof = envelope(claims_for(task), self.key, int(time.time()))
+        response = self.deliver(client, task, proof, request_id)
+        self.assertEqual(response.status_code, 202, response.text)
+        return self.wait(client, response.json()["job_id"])
+
+    def test_reconcile_branch_delivery_after_report_failure(self):
+        with self.delivery_client() as client:
+            task = self.verified_task(client)
+            original_id = str(uuid4())
+            with patch.object(client.app.state.worker, "report", side_effect=OSError("fixture disk offline")):
+                original = self.current_delivery_job(client, task, original_id)
+            self.assertEqual(original["failure_kind"], "report_io_failed")
+            pushed = self.task(client, task["task_id"])
+            self.assertTrue(pushed["pushed"])
+            self.assertEqual(self.current_delivery_job(client, task, original_id)["job_id"], original["job_id"])
+            with patch("git_workspace.GitWorkspace.push", side_effect=AssertionError("branch was already pushed")):
+                recovered = self.current_delivery_job(client, task)
+            self.assertEqual((recovered["action"], recovered["status"]), ("commit", "succeeded"), recovered)
+            self.assertEqual(recovered["stage_result"], pushed["delivery"])
+            finished = self.task(client, task["task_id"])
+            report = client.get(f"/api/v1/tasks/{task['task_id']}/artifacts/{finished['report']}").json()
+            self.assertEqual((report["status"], report["delivery"]["mr_status"]), ("completed", "pending"))
+
+    def test_reconcile_persisted_mr_after_worker_recovery(self):
+        class Adapter:
+            def create(self, task):
+                return {"provider": "gitlab", "id": 12, "state": "opened", "url": "https://example.test/mr/12"}
+
+        adapter = Adapter()
+        with self.delivery_client(adapter) as client:
+            task = self.verified_task(client)
+            worker = client.app.state.worker
+
+            def interrupted(job, *args):
+                worker.store.recover_interrupted(job["job_id"])
+
+            with patch.object(worker, "finish", side_effect=interrupted):
+                first = self.current_delivery_job(client, task)
+            self.assertEqual(first["status"], "recovery_required")
+            pushed = self.task(client, task["task_id"])
+            self.assertEqual(pushed["delivery"]["pull_request"]["id"], 12)
+            self.recover(client, task["task_id"])
+            with patch.object(adapter, "create", side_effect=AssertionError("MR was already recorded")), \
+                    patch("git_workspace.GitWorkspace.push", side_effect=AssertionError("branch was already pushed")):
+                with patch.object(worker, "report", side_effect=OSError("fixture report directory offline")):
+                    lost_report = self.current_delivery_job(client, task)
+                self.assertEqual(lost_report["failure_kind"], "report_io_failed", lost_report)
+                self.assertEqual(self.task(client, task["task_id"])["delivery"], pushed["delivery"])
+                reconciled = self.current_delivery_job(client, task)
+            self.assertEqual((reconciled["action"], reconciled["status"]), ("pr", "succeeded"), reconciled)
+            self.assertEqual(reconciled["stage_result"], pushed["pull_request"])
+            finished = self.task(client, task["task_id"])
+            report = client.get(f"/api/v1/tasks/{task['task_id']}/artifacts/{finished['report']}").json()
+            self.assertEqual((report["status"], report["delivery"]), ("completed", pushed["delivery"]))
+
+    def test_reconcile_lost_push_acknowledgement_without_recreating_branch(self):
+        from git_workspace import GitWorkspace
+
+        push_remote = self.root / "push-remote"
+        git(self.root, "clone", "--bare", str(self.remote), str(push_remote))
+        git(self.project, "remote", "set-url", "--push", "origin", str(push_remote))
+        with self.delivery_client() as client:
+            task = self.verified_task(client)
+            ref = "refs/heads/" + task["task_branch"]
+            real_git = GitWorkspace.git
+            states_at_push = []
+
+            def lose_ack(workspace, ctx, *args, **kwargs):
+                if args[0] == "push":
+                    states_at_push.append(client.app.state.worker.task(task["task_id"]).get("push_state"))
+                    real_git(workspace, ctx, *args, **kwargs)
+                    raise StageError("git_failed", "fixture connection lost after remote update")
+                return real_git(workspace, ctx, *args, **kwargs)
+
+            with patch.object(GitWorkspace, "git", lose_ack):
+                original = self.current_delivery_job(client, task)
+            self.assertEqual(original["failure_kind"], "git_failed")
+            interrupted = self.task(client, task["task_id"])
+            self.assertFalse(interrupted["pushed"])
+            commit = interrupted["commit_sha"]
+            self.assertEqual(git(push_remote, "rev-parse", ref), commit)
+            self.assertEqual(states_at_push, ["in_flight"])
+            git(push_remote, "update-ref", "-d", ref, commit)
+            with patch.object(GitWorkspace, "push", side_effect=AssertionError("uncertain push was repeated")):
+                missing = self.current_delivery_job(client, task)
+                self.assertEqual(missing["failure_kind"], "push_ambiguous", missing)
+                self.assertEqual(git(push_remote, "branch", "--list", task["task_branch"]), "")
+                git(push_remote, "update-ref", ref, task["base_commit"])
+                changed = self.current_delivery_job(client, task)
+                self.assertEqual(changed["failure_kind"], "push_conflict", changed)
+                self.assertEqual(git(push_remote, "rev-parse", ref), task["base_commit"])
+                # An interrupted staged task saved by the earlier Worker has no push journal.
+                store = client.app.state.worker.store
+                with store.connect(write=True) as db:
+                    previous = store.task(db, task["task_id"])
+                    previous.pop("push_state")
+                    previous["failure_kind"] = "recovered"
+                    store.save_task(db, previous)
+                git(push_remote, "update-ref", ref, commit)
+                recovered = self.current_delivery_job(client, task)
+            self.assertEqual((recovered["action"], recovered["status"]), ("commit", "succeeded"), recovered)
+            self.assertEqual(recovered["stage_result"]["commit_sha"], commit)
+            self.assertTrue(self.task(client, task["task_id"])["pushed"])

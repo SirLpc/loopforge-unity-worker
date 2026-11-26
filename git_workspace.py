@@ -292,6 +292,19 @@ class GitWorkspace:
         identity = sha256("\0".join(items[0] for items in urls).encode()).hexdigest()
         return identity, urls[1][0]
 
+    def remote_task_tip(self, ctx, task):
+        identity, push_url = self.remote_binding(ctx)
+        if identity != task["remote_identity"]:
+            raise StageError("push_conflict", "Configured push target changed after preparation")
+        ref = "refs/heads/" + task["task_branch"]
+        line = self.text(ctx, "ls-remote", "--refs", "--", push_url, ref)
+        if not line:
+            return None
+        commit, _, branch = line.partition("\t")
+        if branch != ref or not SHA.fullmatch(commit):
+            raise StageError("push_conflict", "Push target returned an unexpected task reference")
+        return commit
+
     def uses_lfs(self, ctx, revision):
         code, _ = self.git(ctx, "grep", "-I", "-l", "-F", "filter=lfs", revision,
                            "--", ".gitattributes", ":(glob)**/.gitattributes", allowed=(0, 1))
@@ -477,6 +490,8 @@ class GitWorkspace:
             raise StageError("workspace_changed", "Committed tree no longer matches approval")
         if self.remote_identity(ctx) != task["remote_identity"]:
             raise StageError("workspace_changed", "Configured Git remote changed after preparation")
+        if task.get("workflow_mode") == "staged-feature":
+            ctx.save(push_state="in_flight")
         if task["lfs"]:
             self.git(ctx, "lfs", "push", cfg.git_remote, branch)
         ref = f"refs/heads/{branch}"

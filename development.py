@@ -483,12 +483,13 @@ class DevelopmentWorker:
         if (approval.get("claims") != claims or task["approved_revision"] != claims["revision"]
                 or status != "failed"):
             raise RequestConflict("Delivery is unavailable for this approval")
-        if task["pushed"] and task["commit_sha"] and approval["create_pr"] and not task.get("pull_request"):
-            if task.get("failure_kind") in {"pr_failed", "recovered"}:
-                return "pr"
-        if (not task["pushed"] and stage in {"approved", "commit"} and
-                task.get("failure_kind") in {"git_failed", "push_failed", "recovered"}):
-            return "commit"
+        failure = task.get("failure_kind")
+        if task["pushed"] and task["commit_sha"] and failure in {"pr_failed", "recovered", "report_io_failed", "worker_error"}:
+            return "pr" if approval["create_pr"] else "commit"
+        if not task["pushed"] and stage in {"approved", "commit"}:
+            if (failure in {"git_failed", "push_failed", "recovered", "push_ambiguous", "push_conflict"}
+                    or (task["commit_sha"] and task.get("push_state") != "ready")):
+                return "commit"
         raise RequestConflict("Delivery is unavailable at the current stage")
 
     def workflow_deliver(self, task_id, request_id, envelope):
@@ -655,8 +656,9 @@ class DevelopmentWorker:
             except Exception as exc:
                 logging.getLogger(__name__).error("Cannot save job report %s (%s)", job["job_id"], type(exc).__name__)
                 if error is None:
-                    kind = ("report_io_failed" if isinstance(exc, OSError) and stage_finalizes_with_job(ctx.task, action)
-                            else "worker_error")
+                    staged_delivery = ctx.task.get("workflow_mode") == "staged-feature" and action in {"commit", "pr"}
+                    retry_report = staged_delivery or stage_finalizes_with_job(ctx.task, action)
+                    kind = "report_io_failed" if isinstance(exc, OSError) and retry_report else "worker_error"
                     error = StageError(kind, "Cannot save the development report")
         with self.guard:
             try:
@@ -718,6 +720,9 @@ class DevelopmentWorker:
                     task.pop("rework_pending", None)
             if action == "pr" and task.get("workflow_mode") == "staged-feature":
                 task.update(self.clean_output(workflow_pr_outcome(task, error, timestamp)))
+                if error and error.kind == "report_io_failed":
+                    task.update(status="failed", failure_kind=error.kind, error_message=message,
+                                finished_at=timestamp, exit_code=error.exit_code)
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
@@ -935,21 +940,32 @@ class DevelopmentWorker:
 
     def stage_commit(self, ctx):
         task = ctx.task
+        staged = task.get("workflow_mode") == "staged-feature"
+        if staged and task["pushed"]:
+            return task["delivery"]
         if not task["commit_sha"]:
             snapshot = ctx.workspace.git.snapshot(ctx, task, check_meta=True)
             if snapshot.tree != task["approved_revision"]:
                 raise StageError("workspace_changed", "Reviewed files changed after approval. Revalidate and obtain a new approval.")
             commit = ctx.workspace.git.commit(ctx, task, snapshot, task["approval"]["commit_message"] or f"AI task {task['task_id']}")
-            ctx.save(commit_sha=commit)
-        ctx.workspace.git.push(ctx, task)
+            ctx.save(commit_sha=commit, **({"push_state": "ready"} if staged else {}))
+        if staged and task.get("push_state") != "ready":
+            # A pre-journal staged task with a saved SHA has the same uncertainty as an interrupted push.
+            tip = ctx.workspace.git.remote_task_tip(ctx, task)
+            if tip is None:
+                raise StageError("push_ambiguous", "A previous push may have completed. The task branch is absent. "
+                                 "An operator must reconcile it against the recorded commit.")
+            if tip != task["commit_sha"]:
+                raise StageError("push_conflict", "The remote task branch references a different commit")
+        else:
+            ctx.workspace.git.push(ctx, task)
         delivery = {
             "task_branch": task["task_branch"], "base_branch": task["base_branch"], "commit_sha": task["commit_sha"],
             "remote": ctx.settings.git_remote, "pushed": True,
         }
-        staged = task.get("workflow_mode") == "staged-feature"
         if staged:
             delivery["mr_status"] = "pending"
-        ctx.save(pushed=True, delivery=delivery)
+        ctx.save(pushed=True, delivery=delivery, **({"push_state": "confirmed"} if staged else {}))
         if task["approval"]["create_pr"]:
             try:
                 delivery["pull_request"] = self.publish_pr(ctx)
@@ -967,23 +983,21 @@ class DevelopmentWorker:
 
     def publish_pr(self, ctx):
         ctx.check_cancelled()
-        adapter = self.adapters[ctx.task["pool_id"]]
+        task = ctx.task
+        staged = task.get("workflow_mode") == "staged-feature"
+        if staged and task.get("pull_request"):
+            return task["pull_request"]
+        adapter = self.adapters[task["pool_id"]]
         if adapter is None:
             raise StageError("pr_failed", "The approved PR/MR adapter is unavailable")
-        staged = ctx.task.get("workflow_mode") == "staged-feature"
         if staged:
-            git = ctx.workspace.git
-            task = ctx.task
-            ref = "refs/heads/" + task["task_branch"]
             try:
-                identity, push_url = git.remote_binding(ctx)
-                tip_matches = (identity == task["remote_identity"] and
-                               git.text(ctx, "ls-remote", "--refs", "--", push_url, ref) == task["commit_sha"] + "\t" + ref)
+                tip = ctx.workspace.git.remote_task_tip(ctx, task)
             except StageError as error:
-                if error.kind not in {"timeout", "git_failed"}:
+                if error.kind not in {"timeout", "git_failed", "push_conflict"}:
                     raise
                 raise StageError("pr_failed", "Could not verify the pushed task branch") from error
-            if not tip_matches:
+            if tip != task["commit_sha"]:
                 raise StageError("pr_failed", "Task branch no longer references the approved pushed commit")
         result = adapter.create(ctx.task)
         fields = {"pull_request": result, "pr_error": None}
