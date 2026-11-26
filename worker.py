@@ -16,6 +16,7 @@ from development import DevelopmentWorker, RequestConflict, SlotNotFound, TaskNo
 from process_runner import StageError, reserve_project
 from pull_requests import HostedPullRequests
 from worker_config import REMOTE_PATTERN, Settings, legacy_service, load_service_settings
+from workflow_approval import ApprovalError
 from workspace_storage import CacheName
 
 
@@ -100,6 +101,10 @@ class ApprovalRequest(RevisionRequest):
     approver: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
     commit_message: str = Field(default="", max_length=2000)
     create_pr: bool = False
+
+
+class WorkflowDeliveryRequest(OperationRequest):
+    approval: dict
 
 
 class RecoveryRequest(OperationRequest):
@@ -321,6 +326,14 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     @app.post("/api/v1/tasks/{task_id}/recover", status_code=202, dependencies=[Depends(operator)])
     def recover(task_id: UUID, request: RecoveryRequest):
         return worker().action(str(task_id), "recover", str(request.request_id), payload_for(request))
+
+    @app.post("/api/v1/tasks/{task_id}/workflow-deliver", status_code=202)
+    def workflow_deliver(task_id: UUID, request: WorkflowDeliveryRequest):
+        approval = payload_for(request)["approval"]
+        try:
+            return worker().workflow_deliver(str(task_id), str(request.request_id), approval)
+        except ApprovalError as error:
+            raise HTTPException(403, "Invalid or expired workflow approval") from error
 
     @app.post("/api/v1/tasks/{task_id}/commit", status_code=202)
     def commit(task_id: UUID, request: RevisionRequest):

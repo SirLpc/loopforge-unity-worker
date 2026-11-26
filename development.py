@@ -21,6 +21,7 @@ from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
 from worker_config import Settings, check_slot, legacy_service, validate_test_selection
+from workflow_approval import authenticate_approval, check_freshness
 from workspace_storage import CacheName, clean_cache, cleanup_remnants, measure_directory, volume_usage
 
 
@@ -74,6 +75,18 @@ def validation_reset(task):
     if task.get("workflow_mode") == "staged-feature":
         fields["verification"] = None
     return fields
+
+
+def workflow_pr_outcome(task, error, timestamp):
+    if error is None:
+        return dict(status="completed", current_stage="delivered", stage_result=task["delivery"],
+                    finished_at=timestamp, failure_kind=None, error_message=None, exit_code=0)
+    if error.kind == "pr_failed":
+        message = str(error)
+        return dict(status="failed", finished_at=timestamp, failure_kind=error.kind, error_message=message,
+                    exit_code=error.exit_code, pr_error=message,
+                    delivery={**task["delivery"], "mr_status": "failed", "pr_error": message})
+    return {}
 
 
 def stage_finalizes_with_job(task, action):
@@ -252,7 +265,8 @@ class DevelopmentWorker:
         leased = [slot for slot in slots if slot["task_id"]]
         current = leased[0] if len(leased) == 1 else {}
         return {"worker_id": self.cfg.worker_id, "status": status, "task_id": current.get("task_id"),
-                "current_stage": current.get("current_stage")}
+                "current_stage": current.get("current_stage"),
+                **({"capabilities": ["staged-feature"]} if self.cfg.legacy.workflow_approval_key and not legacy else {})}
 
     def require_task(self, db, task_id):
         if task := self.store.task(db, task_id):
@@ -414,8 +428,7 @@ class DevelopmentWorker:
                     raise RequestConflict("The task has reached its correction limit")
                 return
         elif action == "approve":
-            ready = (stage == "tested" and task.get("verification")) if staged_feature else stage == "reviewed"
-            if status == "awaiting_approval" and ready and task["lease"]:
+            if status == "awaiting_approval" and stage == "reviewed" and task["lease"]:
                 if task["revision"] != payload["revision"]:
                     raise RequestConflict("Approval revision does not match the reviewed revision")
                 if payload["create_pr"] and self.adapters.get(task["pool_id"]) is None:
@@ -439,12 +452,79 @@ class DevelopmentWorker:
                     return
         raise RequestConflict(f"Operation is unavailable at {status}/{stage}")
 
+    def workflow_delivery_action(self, db, task, claims):
+        if task.get("workflow_mode") != "staged-feature" or task.get("planning_profile") != "feature":
+            raise RequestConflict("Workflow delivery requires a staged feature")
+        verification = task.get("verification") or {}
+        expected = {
+            "project_id": task["workflow_project_id"], "workflow_id": task["workflow_project_id"] + "-feature",
+            "workflow_run_id": task["workflow_run_id"], "task_id": task["task_id"], "pool_id": task["pool_id"],
+            "slot_id": task["slot_id"], "base_commit": task["base_commit"], "plan_digest": task.get("approved_plan_digest"),
+            "revision": task["revision"], "implementation_attempt": task["implementation_attempt"],
+            "test_job_id": verification.get("test_job_id"),
+        }
+        if (any(claims[key] != value for key, value in expected.items())
+                or any(verification.get(key) != claims[key] for key in ("revision", "implementation_attempt"))
+                or (task.get("planning") or {}).get("plan_digest") != claims["plan_digest"]):
+            raise RequestConflict("Approval does not match the verified task, plan and assignment")
+        tested = self.store.job(db, claims["test_job_id"])
+        if (not tested or tested["task_id"] != task["task_id"] or tested["action"] not in {"run", "test"}
+                or tested["status"] != "succeeded"):
+            raise RequestConflict("Approval requires the current successful test job")
+        slot = self.cfg.slots.get(task["slot_id"])
+        lease = self.store.slot_lease(db, task["slot_id"])
+        if (self.stopping or not slot or slot.pool_id != task["pool_id"] or not lease or lease["task_id"] != task["task_id"]
+                or self.scheduler.slot_blocked(slot.id) or self.store.active_job(db, task["task_id"])):
+            raise RequestConflict("The assigned workspace is unavailable or busy")
+        stage, status = task["current_stage"], task["status"]
+        if (stage, status) == ("tested", "awaiting_approval") and not task["commit_sha"]:
+            return "commit"
+        approval = task.get("approval") or {}
+        if (approval.get("claims") != claims or task["approved_revision"] != claims["revision"]
+                or status != "failed"):
+            raise RequestConflict("Delivery is unavailable for this approval")
+        if task["pushed"] and task["commit_sha"] and approval["create_pr"] and not task.get("pull_request"):
+            if task.get("failure_kind") in {"pr_failed", "recovered"}:
+                return "pr"
+        if (not task["pushed"] and stage in {"approved", "commit"} and
+                task.get("failure_kind") in {"git_failed", "push_failed", "recovered"}):
+            return "commit"
+        raise RequestConflict("Delivery is unavailable at the current stage")
+
+    def workflow_deliver(self, task_id, request_id, envelope):
+        claims = authenticate_approval(envelope, self.cfg.legacy.workflow_approval_key)
+        payload = {"workflow_approval": claims}
+        with self.guard:
+            with self.store.connect(write=True) as db:
+                previous = self.store.request(db, request_id)
+                if previous:
+                    if (previous["action"] not in {"commit", "pr"} or previous["task_id"] != task_id
+                            or previous["signature"] != signature(payload)):
+                        raise RequestConflict("Request ID is already bound to a different operation")
+                    return publishable(previous)
+                check_freshness(envelope, time.time())
+                task = self.require_task(db, task_id)
+                action = self.workflow_delivery_action(db, task, claims)
+                job = self.new_job(task_id, request_id, action, payload)
+                if not task.get("approval"):
+                    task.update(current_stage="approved", approved_revision=claims["revision"],
+                                approval={"claims": claims, "approved_at": now(), "commit_message": "",
+                                          "create_pr": self.adapters.get(task["pool_id"]) is not None})
+                task.update(job_id=job["job_id"], cancel_requested=False, finished_at=None)
+                self.store.save_task(db, task)
+                self.store.save_job(db, job)
+            return self.spawn(job, {})
+
     def action(self, task_id, action, request_id, payload):
         with self.guard:
             with self.store.connect(write=True) as db:
+                task = self.store.task(db, task_id)
+                if task and task.get("workflow_mode") == "staged-feature" and action in {"approve", "commit", "pr"}:
+                    raise RequestConflict("Staged features require LoopForge workflow delivery approval")
                 if previous := self.previous(db, action, task_id, request_id, payload):
                     return publishable(previous)
-                task = self.require_task(db, task_id)
+                if task is None:
+                    raise TaskNotFound
                 self.check_action(db, task, action, payload)
                 job = self.new_job(task_id, request_id, action, payload)
                 inline_accept = action == "accept-plan" and task.get("workflow_mode") != "staged-feature"
@@ -636,6 +716,8 @@ class DevelopmentWorker:
                                             "implementation_attempt": task.get("implementation_attempt", 0)}
                 else:
                     task.pop("rework_pending", None)
+            if action == "pr" and task.get("workflow_mode") == "staged-feature":
+                task.update(self.clean_output(workflow_pr_outcome(task, error, timestamp)))
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
@@ -864,12 +946,21 @@ class DevelopmentWorker:
             "task_branch": task["task_branch"], "base_branch": task["base_branch"], "commit_sha": task["commit_sha"],
             "remote": ctx.settings.git_remote, "pushed": True,
         }
+        staged = task.get("workflow_mode") == "staged-feature"
+        if staged:
+            delivery["mr_status"] = "pending"
         ctx.save(pushed=True, delivery=delivery)
         if task["approval"]["create_pr"]:
             try:
                 delivery["pull_request"] = self.publish_pr(ctx)
+                if staged:
+                    delivery["mr_status"] = "created"
             except StageError as error:
                 delivery["pr_error"] = self.clean_output(str(error))
+                if staged:
+                    delivery["mr_status"] = "failed"
+                    ctx.save(pr_error=delivery["pr_error"], delivery=delivery)
+                    raise
                 ctx.save(pr_error=delivery["pr_error"])
         ctx.save(delivery=delivery)
         return delivery
@@ -879,13 +970,35 @@ class DevelopmentWorker:
         adapter = self.adapters[ctx.task["pool_id"]]
         if adapter is None:
             raise StageError("pr_failed", "The approved PR/MR adapter is unavailable")
+        staged = ctx.task.get("workflow_mode") == "staged-feature"
+        if staged:
+            git = ctx.workspace.git
+            task = ctx.task
+            ref = "refs/heads/" + task["task_branch"]
+            try:
+                identity, push_url = git.remote_binding(ctx)
+                tip_matches = (identity == task["remote_identity"] and
+                               git.text(ctx, "ls-remote", "--refs", "--", push_url, ref) == task["commit_sha"] + "\t" + ref)
+            except StageError as error:
+                if error.kind not in {"timeout", "git_failed"}:
+                    raise
+                raise StageError("pr_failed", "Could not verify the pushed task branch") from error
+            if not tip_matches:
+                raise StageError("pr_failed", "Task branch no longer references the approved pushed commit")
         result = adapter.create(ctx.task)
-        ctx.save(pull_request=result, pr_error=None)
+        fields = {"pull_request": result, "pr_error": None}
+        if staged:
+            delivery = dict(ctx.task["delivery"], pull_request=result, mr_status="created")
+            delivery.pop("pr_error", None)
+            fields["delivery"] = delivery
+        ctx.save(**fields)
         return result
 
     def report(self, ctx, error):
         task = ctx.task
         data = {key: value for key, value in task.items() if key not in {"remote_identity", "artifacts"}}
+        if ctx.job["action"] == "pr" and task.get("workflow_mode") == "staged-feature":
+            data.update(workflow_pr_outcome(task, error, now()))
         if error:
             data["operation_error"] = {"kind": error.kind, "message": str(error), "result": error.result}
             if ctx.job["action"] not in {"recover", "pr"}:

@@ -17,6 +17,8 @@ class NoRedirect(HTTPRedirectHandler):
 
 class HostedPullRequests:
     def __init__(self, provider, api, repository, token):
+        if token and token == os.environ.get("UNITY_WORKER_WORKFLOW_APPROVAL_KEY"):
+            raise ValueError("PR/MR adapter needs its own credential")
         parsed = urlsplit(api)
         if (provider not in {"github", "gitlab"} or parsed.scheme != "https" or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query or parsed.fragment

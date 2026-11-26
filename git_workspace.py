@@ -273,6 +273,10 @@ class GitWorkspace:
                         raise StageError("invalid_repository", "The Git tree tracks a cache or build directory")
 
     def remote_identity(self, ctx):
+        identity, _ = self.remote_binding(ctx)
+        return identity
+
+    def remote_binding(self, ctx):
         remote = self.cfg.git_remote
         urls = [self.text(ctx, "remote", "get-url", *options, "--all", "--", remote).splitlines()
                 for options in ((), ("--push",))]
@@ -285,7 +289,8 @@ class GitWorkspace:
                     raise StageError("credentials", "Use a Git credential helper instead of credentials in the remote URL")
             if "::" in url and "://" not in url:
                 raise StageError("unsupported", "Custom Git remote helpers are unsupported")
-        return sha256("\0".join(items[0] for items in urls).encode()).hexdigest()
+        identity = sha256("\0".join(items[0] for items in urls).encode()).hexdigest()
+        return identity, urls[1][0]
 
     def uses_lfs(self, ctx, revision):
         code, _ = self.git(ctx, "grep", "-I", "-l", "-F", "filter=lfs", revision,

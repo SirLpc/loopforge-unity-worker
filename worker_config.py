@@ -104,6 +104,8 @@ class Settings:
     ignored_cache_paths: tuple[str, ...] = ()
     test_assemblies: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
+    workflow_approval_key: str = field(default="", repr=False)
+
     @property
     def checkout(self):
         return self.git_root or self.project
@@ -111,7 +113,7 @@ class Settings:
     @property
     def secrets(self):
         return tuple(value for value in (
-            self.token, self.approval_token, os.environ.get("UNITY_PR_TOKEN", ""),
+            self.token, self.approval_token, self.workflow_approval_key, os.environ.get("UNITY_PR_TOKEN", ""),
             os.environ.get("OPENAI_API_KEY", ""), os.environ.get("CODEX_API_KEY", ""),
         ) if value)
 
@@ -135,6 +137,11 @@ class Settings:
             raise ValueError("Worker and approval tokens must be distinct and at least 32 characters")
         if any(not value.isascii() or any(c.isspace() for c in value) for value in (token, approval) if value):
             raise ValueError("Bearer tokens must use ASCII without whitespace")
+        workflow_key = environ.get("UNITY_WORKER_WORKFLOW_APPROVAL_KEY", "")
+        if workflow_key and (len(workflow_key) < 32 or not workflow_key.isascii() or not workflow_key.isprintable()
+                             or " " in workflow_key or workflow_key in (token, approval, environ.get("UNITY_PR_TOKEN"),
+                             environ.get("OPENAI_API_KEY"), environ.get("CODEX_API_KEY"))):
+            raise ValueError("Configure an independent protected workflow approval key of at least 32 ASCII characters")
         project = Path(get("project", "UNITY_PROJECT")).resolve(strict=not defer_paths)
         checkout = Path(get("git_root", "UNITY_GIT_ROOT", project)).resolve(strict=not defer_paths)
         if not project.is_relative_to(checkout) or (not defer_paths and not checkout.is_dir()):
@@ -201,7 +208,7 @@ class Settings:
         logs.mkdir(parents=True, exist_ok=True)
         return cls(
             project=project, logs=logs, unity_exe=unity_exe, unity_version=version, token=token,
-            approval_token=approval, worker_id=worker_id,
+            approval_token=approval, workflow_approval_key=workflow_key, worker_id=worker_id,
             unity_timeout=positive("unity_timeout", "UNITY_TIMEOUT_SECONDS", 1800),
             git_exe=executable(configured_git) if shutil.which(str(configured_git)) or configured_git != "git" else "git",
             git_remote=remote, base_branch=branch, git_timeout=positive("git_timeout", "UNITY_GIT_TIMEOUT", 600),

@@ -20,15 +20,15 @@ if ($CredentialDirectory) {
 
 $previous = @{}
 $restartEvent = $null
-foreach ($name in @('UNITY_WORKER_TOKEN', 'UNITY_WORKER_APPROVAL_TOKEN', 'UNITY_WORKER_CONFIG')) {
+foreach ($name in @('UNITY_WORKER_TOKEN', 'UNITY_WORKER_APPROVAL_TOKEN', 'UNITY_WORKER_WORKFLOW_APPROVAL_KEY', 'UNITY_WORKER_CONFIG')) {
     $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 Push-Location -LiteralPath $PSScriptRoot
 try {
     if ($CredentialDirectory) {
-        foreach ($name in @('UNITY_WORKER_TOKEN', 'UNITY_WORKER_APPROVAL_TOKEN')) {
+        foreach ($name in @('UNITY_WORKER_TOKEN', 'UNITY_WORKER_APPROVAL_TOKEN', 'UNITY_WORKER_WORKFLOW_APPROVAL_KEY')) {
             $credential = Join-Path $CredentialDirectory "$name.dpapi"
-            if ($name -eq 'UNITY_WORKER_APPROVAL_TOKEN' -and -not (Test-Path -LiteralPath $credential)) {
+            if ($name -ne 'UNITY_WORKER_TOKEN' -and -not (Test-Path -LiteralPath $credential)) {
                 continue
             }
             $secure = Get-Content -LiteralPath $credential | ConvertTo-SecureString

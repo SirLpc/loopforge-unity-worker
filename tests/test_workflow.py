@@ -120,7 +120,7 @@ class FixtureRunner:
         return self.real.run(argv, cwd, prefix, **kwargs)
 
 
-class WorkflowTests(unittest.TestCase):
+class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.root = self.enterContext(test_directory())
         self.remote, self.project, self.logs = repository(self.root)
@@ -174,13 +174,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(client.post(path, json=payload).status_code, 403)
         self.assertEqual(client.post(path, json=payload, headers={"Authorization": f"Bearer {APPROVER}"}).status_code, 202)
 
-    def staged_client(self):
+    def staged_client(self, pr_adapter=None):
         from test_planning import PlanningAgent
         from worker_config import Settings
 
         self.agent = PlanningAgent(self.project)
         cfg = replace(Settings.load(), test_assemblies={"editmode": ("Tests",), "playmode": ("PlayTests",)})
-        return TestClient(create_app(cfg, runner=self.runner, agent=self.agent),
+        return TestClient(create_app(cfg, runner=self.runner, agent=self.agent, pr_adapter=pr_adapter),
                           headers={"Authorization": f"Bearer {TOKEN}"})
 
     def accepted_staged_plan(self, client):
@@ -206,6 +206,8 @@ class WorkflowTests(unittest.TestCase):
         job = self.wait(client, response.json()["job_id"])
         self.assertEqual(job["status"], "succeeded", job)
 
+
+class WorkflowTests(WorkflowFixture):
     def test_staged_recovery_resumes_reserved_rework_without_spending_another_correction(self):
         with self.staged_client() as client:
             task = self.accepted_staged_plan(client)
@@ -396,8 +398,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(tested["verification"], {"revision": tested["revision"], "test_job_id": tested_job["job_id"],
                                                       "implementation_attempt": 0})
             self.assertEqual(tested["test_report"]["editmode"]["revision"], reviewed["review_result"]["revision"])
-            self.approve(client, task)
-            self.assertEqual(self.task(client, task)["approved_revision"], tested["revision"])
+            self.assertIsNone(tested["approved_revision"])
             for wrong in ({"workflow_run_id": "run-other-41"}, {"implementation_attempt": 2}):
                 self.assertEqual(action("rework", **{**rework, **wrong}).status_code, 409)
 
