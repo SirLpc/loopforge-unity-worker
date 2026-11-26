@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from git_workspace import GitWorkspace
 from support import test_directory
 from test_workspace_storage import cache_checkout
 from worker import create_app
@@ -286,6 +287,7 @@ class CleanStorageApiTests(unittest.TestCase):
             self.assertEqual(client.get(STORAGE).json()["pools"][0]["slots"][0]["status"], "unavailable")
 
     def hold_deletion(self):
+        self.enterContext(patch.object(GitWorkspace, "assert_disposable_cache", return_value=None))
         entered, resume = threading.Event(), threading.Event()
         rmtree = shutil.rmtree
 

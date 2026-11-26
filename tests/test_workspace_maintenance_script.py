@@ -60,7 +60,7 @@ class ScriptRequest(BaseHTTPRequestHandler):
         if status is None:
             self.close_connection = True
             return
-        payload = json.dumps(response).encode()
+        payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -83,9 +83,13 @@ class WorkspaceMaintenanceScriptTests(unittest.TestCase):
                     "UNITY_WORKER_URL": f"http://127.0.0.1:{self.api.server_port}"}
 
     def invoke(self, *args, reply=""):
+        operands = [arg if arg.startswith("-") else "'" + arg.replace("'", "''") + "'" for arg in args]
+        command = "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+        command += "& $env:WORKSPACE_MAINTENANCE_TEST_SCRIPT " + " ".join(operands) + "; exit $LASTEXITCODE"
         result = subprocess.run(
-            [POWERSHELL, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT), *args],
-            env=self.env, input=reply, capture_output=True, text=True, timeout=25,
+            [POWERSHELL, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            env={**self.env, "WORKSPACE_MAINTENANCE_TEST_SCRIPT": str(SCRIPT)},
+            input=reply, capture_output=True, encoding="utf-8", timeout=25,
         )
         output = result.stdout + result.stderr
         self.assertNotIn(TOKEN, output)
@@ -101,6 +105,14 @@ class WorkspaceMaintenanceScriptTests(unittest.TestCase):
         self.assert_requests(("GET", STORAGE, None))
         for value in ("game-01", TASK_ID, "review", "987654321", "1234567890", REMNANT, "restart"):
             self.assertIn(value, output)
+
+    def test_status_prints_utf8_path_from_json_without_charset(self):
+        path = r"D:\缓存\状态"
+        self.api.responses.append((200, {**OVERVIEW, "state": {"path": path, "volume": VOLUME}}))
+        code, output = self.invoke()
+        self.assertEqual(code, 0, output)
+        self.assertIn(path, output)
+        self.assert_requests(("GET", STORAGE, None))
 
     def test_measure_slot_escapes_id_and_shows_buckets_and_partial_scan(self):
         self.api.responses.append((200, {**PREVIEW, "complete": False, "skipped_links": 2, "read_errors": 1}))
@@ -178,33 +190,41 @@ class WorkspaceMaintenanceScriptTests(unittest.TestCase):
         self.assertNotIn("Type YES", output)
         self.assert_requests(("GET", SLOT + "?cache=Library", None))
 
-    def test_lost_clean_response_reports_unknown_outcome_without_retry(self):
-        self.api.responses.extend([(200, PREVIEW), (None, None)])
-        code, output = self.invoke("Clean", "-SlotId", "game-01", "-Cache", "Library", reply="YES\n")
-        self.assertNotEqual(code, 0, output)
-        self.assertIn("Status", output)
-        self.assertIn("preview", output.lower())
-        self.assert_requests(("GET", SLOT + "?cache=Library", None),
-                             ("POST", SLOT + "/clean", {"cache": "Library", "confirmed": True}))
+    def test_ambiguous_clean_response_reports_unknown_outcome_without_retry(self):
+        for status in (None, 408, 499):
+            with self.subTest(status=status):
+                self.api.requests.clear()
+                self.api.responses.extend([(200, PREVIEW), (status, {})])
+                code, output = self.invoke("Clean", "-SlotId", "game-01", "-Cache", "Library", reply="YES\n")
+                self.assertNotEqual(code, 0, output)
+                self.assert_requests(("GET", SLOT + "?cache=Library", None),
+                                     ("POST", SLOT + "/clean", {"cache": "Library", "confirmed": True}))
+                self.assertIn("Run Status, then preview", output)
 
     def test_clean_conflict_prints_failure_and_remnant_without_token(self):
+        remnant = r"D:\缓存\.unity-worker-cleanup-example"
         self.api.responses.extend([(200, PREVIEW),
                                    (409, {"detail": f"Inspect remaining cleanup directory ({TOKEN})",
-                                          "remnant": REMNANT})])
+                                          "remnant": remnant})])
         code, output = self.invoke("Clean", "-SlotId", "game-01", "-Cache", "Library", reply="YES\n")
         self.assertNotEqual(code, 0, output)
         self.assertIn("Inspect remaining cleanup directory", output)
-        self.assertIn(REMNANT, output)
+        self.assertIn(remnant, output)
         self.assertIn("restart", output)
         self.assert_requests(("GET", SLOT + "?cache=Library", None),
                              ("POST", SLOT + "/clean", {"cache": "Library", "confirmed": True}))
 
     def test_validation_rejects_ambiguous_target_before_http(self):
-        code, output = self.invoke("Measure", "-State", "-SlotId", "game-01")
-        self.assertNotEqual(code, 0, output)
-        self.assertIn("-State", output)
-        self.assertIn("-SlotId", output)
-        self.assert_requests()
+        for slot_id in ("game-01", " ", ""):
+            with self.subTest(slot_id=slot_id):
+                self.api.requests.clear()
+                self.api.responses.clear()
+                self.api.responses.append((200, PREVIEW))
+                code, output = self.invoke("Measure", "-State", "-SlotId", slot_id)
+                self.assert_requests()
+                self.assertNotEqual(code, 0, output)
+                self.assertIn("-State", output)
+                self.assertIn("-SlotId", output)
 
     def test_clean_rejects_unsupported_whatif_before_http(self):
         self.api.responses.extend([(200, PREVIEW), (200, CLEANED)])

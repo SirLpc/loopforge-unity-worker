@@ -63,7 +63,9 @@ function Invoke-Worker([string] $Method, [string] $Path, [int] $Timeout = 15, [h
         $request.Body = ConvertTo-Json -InputObject $Body -Compress
     }
     try {
-        Invoke-RestMethod @request
+        $response = Invoke-WebRequest @request
+        $json = [Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())
+        ConvertFrom-Json -InputObject $json
     } catch {
         $status = [int] $_.Exception.Response.StatusCode
         $errorBody = if ($_.ErrorDetails.Message) {
@@ -82,23 +84,24 @@ $jobPath = $null
 $cleanupSubmitted = $false
 try {
     $hasSlot = -not [string]::IsNullOrWhiteSpace($SlotId)
+    $slotBound = $PSBoundParameters.ContainsKey('SlotId')
     $hasTask = $PSBoundParameters.ContainsKey('TaskId')
     $hasCache = $PSBoundParameters.ContainsKey('Cache')
     switch ($Operation) {
         Status {
-            if ($State -or $PSBoundParameters.ContainsKey('SlotId') -or $hasTask -or $hasCache) {
+            if ($State -or $slotBound -or $hasTask -or $hasCache) {
                 throw 'Status takes no target arguments.'
             }
         }
         Measure {
-            if (($State -eq $hasSlot) -or $hasTask -or $hasCache) {
+            $validTarget = if ($State) { -not $slotBound } else { $hasSlot }
+            if (-not $validTarget -or $hasTask -or $hasCache) {
                 throw 'Measure requires exactly one of -SlotId or -State.'
             }
         }
         Release {
             $taskUuid = [guid]::Empty
-            if (-not [guid]::TryParse($TaskId, [ref] $taskUuid) -or $State -or
-                $PSBoundParameters.ContainsKey('SlotId') -or $hasCache) {
+            if (-not [guid]::TryParse($TaskId, [ref] $taskUuid) -or $State -or $slotBound -or $hasCache) {
                 throw 'Release requires a UUID in -TaskId.'
             }
         }
@@ -213,7 +216,7 @@ try {
     Write-Error -ErrorAction Continue (Protect-Text $_.Exception.Message)
     if ($jobPath) { Show-Line "The release may still be running. Check GET $jobPath." }
     $status = $_.Exception.Data['StatusCode']
-    if ($cleanupSubmitted -and ($status -lt 400 -or $status -ge 500)) {
+    if ($cleanupSubmitted -and ($status -lt 400 -or $status -ge 500 -or $status -in @(408, 499))) {
         Show-Line 'Cleanup outcome is unknown. Run Status, then preview the slot and cache again before confirming any new cleanup.'
     }
     exit 1

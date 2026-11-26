@@ -71,7 +71,7 @@ Read-Host 'Operator Token' -AsSecureString | ConvertFrom-SecureString |
 - `Measure` 按需递归扫描。槽位统计分为 `.git`、工程的 `Library`、`Temp`、`Obj` 和其余文件。状态目录包含日志、SQLite 和任务产物。统计的是文件的逻辑字节数，实际磁盘空间以卷容量为准。目录在扫描期间可能变化，脚本会报告跳过的符号链接、重解析点和读取错误。
 - `Release` 归还任务持有的槽位。Worker 会检查任务状态、Git 工作区以及是否还有 Unity 进程需要恢复。记下输出的 Job ID。如果用 Ctrl+C 停止等待，或轮询超时，可继续通过 `GET /api/v1/jobs/{job_id}` 查询，Worker 仍会处理已受理的 Job。归还成功后，排队任务可能立即获得该槽位。
 - `Clean` 只处理配置槽位的 Unity 工程直属 `Library`、`Temp` 或 `Obj`，每次只选一个。脚本先预览路径与预计回收的逻辑字节数，扫描完整且缓存存在时才能输入 `YES` 确认。清理 `Library` 后，下次打开工程或运行 Unity 会重新导入。Worker 会再次核对租约、工程路径、Editor 锁及 Git 状态。若预览后槽位已被其他任务占用，清理会被拒绝。维护期间请勿从外部运行 Unity 或修改该 checkout。
-- 清理响应中断时，先用 `Status` 检查槽位，再重新预览目标缓存。若清理失败并报告 `.unity-worker-cleanup-*` 遗留目录，槽位会暂停接单。根据 `Clean` 返回或 `Status` 列出的路径检查遗留目录，核对它只包含原缓存数据并确认没有进程占用，再移出该目录或处理其中的数据。随后从原 Windows 登录会话运行 `scripts\restart-worker.ps1`，再用 `Status` 确认槽位通过复检。
+- 清理响应中断时，先用 `Status` 检查槽位，再重新预览目标缓存。若清理失败并报告 `.unity-worker-cleanup-*` 遗留目录，槽位会暂停接单。根据 `Clean` 返回或 `Status` 列出的路径检查遗留目录，核对它只包含原缓存数据并确认没有进程占用，再移出该目录或处理其中的数据。随后从原 Windows 登录会话运行 `scripts\restart-worker.ps1`。如果启动时指定了 `-Port`，重启时传相同的端口。最后用 `Status` 确认槽位通过复检。
 
 ### 迁移本机旧部署
 
