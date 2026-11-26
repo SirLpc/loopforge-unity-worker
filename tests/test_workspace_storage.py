@@ -1,11 +1,21 @@
 import os
 import subprocess
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 from support import test_directory
 from workspace_storage import measure_directory, volume_usage
+
+
+def directory_link(link, target):
+    if os.name == "nt":
+        subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                       check=True, capture_output=True)
+        return link.rmdir
+    link.symlink_to(target, target_is_directory=True)
+    return link.unlink
 
 
 class WorkspaceStorageTests(unittest.TestCase):
@@ -64,13 +74,7 @@ class WorkspaceStorageTests(unittest.TestCase):
             checkout.mkdir()
             (checkout / "visible").write_bytes(b"abc")
             link = checkout / "Library"
-            if os.name == "nt":
-                subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(external)],
-                               check=True, capture_output=True)
-                remove_link = link.rmdir
-            else:
-                link.symlink_to(external, target_is_directory=True)
-                remove_link = link.unlink
+            remove_link = directory_link(link, external)
             try:
                 for path, total in ((checkout, 3), (link, 0), (link / "subdir", 0)):
                     with self.subTest(path=path):
@@ -81,6 +85,46 @@ class WorkspaceStorageTests(unittest.TestCase):
                         self.assertEqual(result["read_errors"], 0)
             finally:
                 remove_link()
+
+    def test_replaced_directory_contributes_no_bytes(self):
+        for phase in ("queued directory", "queued ancestor", "opening directory", "opening replacement"):
+            with self.subTest(phase=phase), test_directory() as root, ExitStack() as cleanup:
+                checkout = root / "checkout"
+                library = checkout / "Library"
+                (library / "subdir").mkdir(parents=True)
+                (checkout / "visible").write_bytes(b"abc")
+                external = root / "external"
+                (external / "subdir").mkdir(parents=True)
+                (external / "external").write_bytes(b"x" * 200)
+                (external / "subdir/external").write_bytes(b"x" * 231)
+                replacement_is_link = phase != "opening replacement"
+                scandir = os.scandir
+
+                def replace_library():
+                    library.rename(root / "original")
+                    if replacement_is_link:
+                        cleanup.callback(directory_link(library, external))
+                    else:
+                        external.rename(library)
+
+                @contextmanager
+                def concurrent_scan(path):
+                    path = Path(path)
+                    if path == library and phase.startswith("opening"):
+                        replace_library()
+                    with scandir(path) as entries:
+                        yield entries
+                    if (path == checkout and phase == "queued directory") or (
+                            path == library and phase == "queued ancestor"):
+                        replace_library()
+
+                with patch("os.scandir", side_effect=concurrent_scan):
+                    result = measure_directory(checkout, {})
+
+                self.assertEqual(result["logical_bytes"], 3)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["skipped_links"], int(replacement_is_link))
+                self.assertEqual(result["read_errors"], int(not replacement_is_link))
 
     def test_unavailable_volume_uses_null_capacity(self):
         with test_directory() as root, patch("shutil.disk_usage", side_effect=OSError):
