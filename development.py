@@ -84,6 +84,11 @@ class DevelopmentWorker:
     def start(self):
         self.scheduler.start()
 
+    def shutdown_when_idle(self):
+        with self.guard:
+            self.stopping = True
+            return not self.active
+
     def close(self):
         with self.guard:
             self.stopping = True

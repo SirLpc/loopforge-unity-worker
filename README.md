@@ -21,6 +21,8 @@ $env:UNITY_WORKER_APPROVAL_TOKEN = [System.Net.NetworkCredential]::new('', (Read
 
 启动脚本直接运行当前 Git 检出的 Worker 代码。配置和状态留在本机。实际 Token、DPAPI 文件、Codex 登录目录、SQLite、任务产物和游戏检出应放在源码提交之外。
 
+修改 Worker 代码后，在同一 Windows 登录会话的另一个 PowerShell 中执行 `.\scripts\restart-worker.ps1`。如果启动时指定了 `-Port`，重启时传相同的端口。Worker 暂停接收新的 Job，等正在运行的 Job 完成后以原配置和凭据重启，排队中的 Job 由新进程继续调度。已有实例需要先用新版 `start_worker.ps1` 启动一次。
+
 两个 Token 各使用至少 32 个 ASCII 字符的独立随机值。Worker Token 交给受信任的 LoopForge SOP。Operator Token 留在授权审批者和 Windows 服务端。只部署旧 smoke 时可省略 Operator Token 和 Codex 配置。服务支持原有变量 UNITY_EXE、UNITY_PROJECT、UNITY_WORKER_LOGS、UNITY_WORKER_TOKEN、UNITY_TIMEOUT_SECONDS，环境变量覆盖 TOML。
 
 Codex 配置使用 Windows 原生 codex.exe。npm 安装的 PowerShell 和 CMD 包装器可以用来查询版本，Worker 进程使用 vendor 目录内的可执行文件。将 UNITY_CODEX_HOME 或 codex_home 指到专用且已初始化的目录。用专用账号在该 CODEX_HOME 登录一次，或为服务注入专用 OPENAI_API_KEY / CODEX_API_KEY。该 Worker 的所有池和槽位共用这份登录，每个任务仍启动独立 Codex 会话。每次服务首次用到 Codex 时检测 --version、exec --help 和 sandbox --help。0.172.0 的 MXC 实现及审查权限探针已实测。默认使用 mxc，允许在管理员已预配的机器上选择 elevated。权限探针失败时任务会停止。

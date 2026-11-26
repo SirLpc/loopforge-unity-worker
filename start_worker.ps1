@@ -19,6 +19,7 @@ if ($CredentialDirectory) {
 }
 
 $previous = @{}
+$restartEvent = $null
 foreach ($name in @('UNITY_WORKER_TOKEN', 'UNITY_WORKER_APPROVAL_TOKEN', 'UNITY_WORKER_CONFIG')) {
     $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
@@ -41,10 +42,20 @@ try {
     if ($ConfigPath) {
         $env:UNITY_WORKER_CONFIG = $resolvedConfig
     }
-    & $workerPython -m uvicorn worker:create_app --factory --host $BindAddress --port $Port --workers 1 --no-proxy-headers
+    $eventName = 'Local\UnityWorker-{0}-{1}' -f ($PSScriptRoot.ToUpperInvariant() -replace '\\', '/'), $Port
+    $created = $false
+    $restartEvent = [System.Threading.EventWaitHandle]::new($false, 'AutoReset', $eventName, [ref] $created)
+    if (-not $created) {
+        throw "A restartable Worker is already running in this checkout on port $Port."
+    }
+    $PSNativeCommandUseErrorActionPreference = $false
+    do {
+        & $workerPython -m scripts.run_worker $BindAddress $Port $eventName
+    } while ($LASTEXITCODE -eq 75) # The server requested a fresh process.
     exit $LASTEXITCODE
 }
 finally {
+    if ($restartEvent) { $restartEvent.Dispose() }
     Pop-Location
     foreach ($name in $previous.Keys) {
         [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
