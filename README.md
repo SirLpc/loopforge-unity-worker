@@ -43,6 +43,36 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 
 命名池准备可选 `[pools.<id>.pr]`，填写 `provider`、`api_url`、`repository`、`token_env`。`token_env` 仅指服务进程的凭据环境变量名。没有池专用适配器时只有默认池继承现有宿主 PR/MR 配置。
 
+### 查看磁盘用量、归还槽位和清理缓存
+
+在 Windows PowerShell 5.1 中运行 `scripts/workspace-maintenance.ps1`。指定 `-WorkerUrl` 或设置 `UNITY_WORKER_URL`，并使用 Operator Token。单工程和命名池用法相同，先从 `Status` 查实际槽位 ID。
+
+~~~~powershell
+$env:UNITY_WORKER_URL = 'http://127.0.0.1:8765'
+$env:UNITY_WORKER_APPROVAL_TOKEN = [System.Net.NetworkCredential]::new('', (Read-Host 'Operator Token' -AsSecureString)).Password
+.\scripts\workspace-maintenance.ps1 Status
+.\scripts\workspace-maintenance.ps1 Measure -SlotId worker-01
+.\scripts\workspace-maintenance.ps1 Measure -State
+.\scripts\workspace-maintenance.ps1 Release -TaskId '<task UUID>'
+.\scripts\workspace-maintenance.ps1 Clean -SlotId worker-01 -Cache Library
+~~~~
+
+也可以在工作区之外保存 DPAPI 凭据文件。用运行脚本的同一 Windows 账号在同一台机器上创建文件。传 `-CredentialDirectory` 时，脚本优先读取该目录下的 DPAPI 文件。
+
+~~~~powershell
+$workerCredentials = Join-Path $env:LOCALAPPDATA 'UnityWorker\credentials'
+New-Item -ItemType Directory -Path $workerCredentials -Force | Out-Null
+Read-Host 'Operator Token' -AsSecureString | ConvertFrom-SecureString |
+    Set-Content -LiteralPath (Join-Path $workerCredentials 'UNITY_WORKER_APPROVAL_TOKEN.dpapi')
+.\scripts\workspace-maintenance.ps1 Status -CredentialDirectory $workerCredentials
+~~~~
+
+- 默认的 `Status` 列出池、槽位、任务与阶段，以及各槽位和 Worker 状态目录所在卷的可用空间与总容量。总览无需递归扫描。相同卷可能出现在多行，容量不能相加。
+- `Measure` 按需递归扫描。槽位统计分为 `.git`、工程的 `Library`、`Temp`、`Obj` 和其余文件。状态目录包含日志、SQLite 和任务产物。统计的是文件的逻辑字节数，实际磁盘空间以卷容量为准。目录在扫描期间可能变化，脚本会报告跳过的符号链接、重解析点和读取错误。
+- `Release` 归还任务持有的槽位。Worker 会检查任务状态、Git 工作区以及是否还有 Unity 进程需要恢复。记下输出的 Job ID。如果用 Ctrl+C 停止等待，或轮询超时，可继续通过 `GET /api/v1/jobs/{job_id}` 查询，Worker 仍会处理已受理的 Job。归还成功后，排队任务可能立即获得该槽位。
+- `Clean` 只处理配置槽位的 Unity 工程直属 `Library`、`Temp` 或 `Obj`，每次只选一个。脚本先预览路径与预计回收的逻辑字节数，扫描完整且缓存存在时才能输入 `YES` 确认。清理 `Library` 后，下次打开工程或运行 Unity 会重新导入。Worker 会再次核对租约、工程路径、Editor 锁及 Git 状态。若预览后槽位已被其他任务占用，清理会被拒绝。维护期间请勿从外部运行 Unity 或修改该 checkout。
+- 清理响应中断时，先用 `Status` 检查槽位，再重新预览目标缓存。若清理失败并报告 `.unity-worker-cleanup-*` 遗留目录，槽位会暂停接单。根据 `Clean` 返回或 `Status` 列出的路径检查遗留目录，核对它只包含原缓存数据并确认没有进程占用，再移出该目录或处理其中的数据。随后从原 Windows 登录会话运行 `scripts\restart-worker.ps1`，再用 `Status` 确认槽位通过复检。
+
 ### 迁移本机旧部署
 
 先运行 `scripts/initialize-worker.ps1` 安装新仓库的依赖。停止旧 Worker 接单，等队列和执行中的 Job 排空，再停服并备份旧配置和完整状态目录。用原账号从新仓库执行 `start_worker.ps1`，将 `-ConfigPath` 指向原配置，保留配置里的 `logs`、槽位 ID、游戏检出路径和 Codex home。已有 DPAPI 文件时传 `-CredentialDirectory` 指向它们所在的目录。保持原监听地址和端口即可沿用现有 SOP 地址。用[预检命令](integrations/loopforge/README.md)核对服务，再确认旧任务、审批和产物仍可查询。需要回退时先停掉新 Worker，再用原启动入口恢复。
@@ -63,6 +93,10 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 | --- | --- |
 | GET /api/v1/workers | 查询 Worker ID 和默认池的状态 |
 | GET /api/v1/pools | 查询各池排队数、目录状态及当前任务 |
+| GET /api/v1/storage | Operator Token。查询各池、槽位和状态目录的卷容量，以及清理遗留路径 |
+| GET /api/v1/storage/state | Operator Token。按需扫描 Worker 状态目录 |
+| GET /api/v1/storage/slots/{slot_id} | Operator Token。按需扫描指定槽位。传 `?cache=Library`、`Temp` 或 `Obj` 只预览指定缓存 |
+| POST /api/v1/storage/slots/{slot_id}/clean | Operator Token。请求体需包含 `cache`（`Library`、`Temp` 或 `Obj`）和 `confirmed=true`。同步返回结果 |
 | POST /api/v1/tasks | 需要 request_id、requirement、plan、acceptance_criteria 字符串数组。可传 workflow_run_id、project_rules、pool_id |
 | GET /api/v1/tasks/{task_id} | 任务状态、阶段、失败类型、审查、审批和交付 |
 | POST /api/v1/tasks/{task_id}/{action} | 固定操作 run、prepare、implement、compile、test、review、fix、pr、cancel、release |
@@ -74,7 +108,7 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 | GET /api/v1/tasks/{task_id}/artifacts/{name} | 下载指定 Job 完成后留存的产物 |
 | GET /api/v1/tasks/{task_id}/logs?name=...&offset=0&limit=8192 | 按明确的日志名查询。将 next_offset 带入下一个请求 |
 
-每个操作传唯一 UUID request_id。原样重试会返回同一 Job，变更目标或有效负载会返回 409。失败后明确重新执行安全阶段时，使用新的 request_id。并发冲突、非法阶段和缺少当前版本批准也返回 409。cancel 返回受理结果，随后轮询原 Job，直到确认终态。创建任务只入库，在 prepare 或 run 时分配目录。提供 `queue_wait_seconds`（1 至 86400）时等候同池目录。Job 过期记录 `queue_timeout`，需明确用新请求 ID 重试。省略此字段时仍使用立即接单或 `409`。一经分配，任务、日志、审批及后续操作始终使用原 `slot_id`。
+每个任务操作传唯一 UUID request_id。原样重试会返回同一 Job，变更目标或有效负载会返回 409。失败后明确重新执行安全阶段时，使用新的 request_id。并发冲突、非法阶段和缺少当前版本批准也返回 409。cancel 返回受理结果，随后轮询原 Job，直到确认终态。创建任务只入库，在 prepare 或 run 时分配目录。提供 `queue_wait_seconds`（1 至 86400）时等候同池目录。Job 过期记录 `queue_timeout`，需明确用新请求 ID 重试。省略此字段时仍使用立即接单或 `409`。一经分配，任务、日志、审批及后续操作始终使用原 `slot_id`。
 
 ### 工作区与恢复
 
@@ -94,5 +128,11 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 ~~~~
 
 Git for Windows 本地传输集成测试需要 Windows 沙箱外的普通权限执行。完整测试使用本地临时 bare Git 远端及模拟 CLI。真实 Unity 验收和故障恢复步骤见 [端到端验收清单](docs/ACCEPTANCE.md)。
+
+维护脚本可单独验证。测试使用本机回环 HTTP 模拟服务、测试 Token 和临时 DPAPI 文件。手工验收时，给测试 Worker 配置独立回环端口、临时状态目录和可丢弃的 Git 检出，再用 `-WorkerUrl` 指向该端口。可以放置已被 Git 忽略的测试缓存目录，验证预览、拒绝确认及确认后只清理选中的目录。
+
+~~~~powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_workspace_maintenance_script.py' -v
+~~~~
 
 LoopForge 的凭据绑定、方案产物、脚本节点和双审批配置见 [SOP 接入](integrations/loopforge/README.md)。实施步骤和测试覆盖记录见 [实施计划](IMPLEMENTATION_PLAN.md)。
