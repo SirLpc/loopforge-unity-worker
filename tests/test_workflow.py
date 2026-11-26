@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from process_runner import StageError
 from support import test_directory
 from test_mvp import TOKEN
 from test_workspace import git, repository
@@ -197,6 +198,107 @@ class WorkflowTests(unittest.TestCase):
                          plan_digest=planned["planning"]["plan_digest"])
         self.assertEqual(job["status"], "succeeded", job)
         return task
+
+    def recover(self, client, task):
+        response = client.post(f"/api/v1/tasks/{task}/recover", headers={"Authorization": f"Bearer {APPROVER}"},
+                               json={"request_id": str(uuid4()), "confirmed_stopped": True, "note": "Process exited"})
+        self.assertEqual(response.status_code, 202, response.text)
+        job = self.wait(client, response.json()["job_id"])
+        self.assertEqual(job["status"], "succeeded", job)
+
+    def test_staged_recovery_resumes_reserved_rework_without_spending_another_correction(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            self.assertEqual(self.stage(client, task, "run")["status"], "succeeded")
+            rework = {"workflow_run_id": "run-feature-41", "implementation_attempt": 1,
+                      "feedback": " Keep the welcome message. "}
+            request_id = str(uuid4())
+            with patch.object(self.agent, "execute", side_effect=StageError("timeout", "Codex timed out")):
+                first = self.stage(client, task, "rework", request_id=request_id, **rework)
+            self.assertEqual(first["failure_kind"], "timeout", first)
+            self.assertEqual(self.start(client, task, "rework", request_id=request_id, **rework), first["job_id"])
+            for change in ({"feedback": "Replace the feedback"}, {"implementation_attempt": 2}, {"workflow_run_id": "run-other"}):
+                response = client.post(f"/api/v1/tasks/{task}/rework",
+                                       json={"request_id": str(uuid4()), **rework, **change})
+                self.assertEqual(response.status_code, 409, response.text)
+
+            with patch.object(self.agent, "execute", side_effect=StageError("recovery_required", "Unknown process exit")):
+                interrupted = self.stage(client, task, "rework", **rework)
+            self.assertEqual(interrupted["status"], "recovery_required", interrupted)
+            self.assertNotEqual(interrupted["job_id"], first["job_id"])
+            response = client.post(f"/api/v1/tasks/{task}/rework", json={"request_id": str(uuid4()), **rework})
+            self.assertEqual(response.status_code, 409, response.text)
+            self.recover(client, task)
+
+            resumed = self.stage(client, task, "rework", **rework)
+            self.assertEqual(resumed["status"], "succeeded", resumed)
+            self.assertNotEqual(resumed["job_id"], interrupted["job_id"])
+            current = self.task(client, task)
+            self.assertEqual(current["current_stage"], "implemented")
+            self.assertEqual(current["implementation_attempt"], 1)
+            self.assertEqual(current["retry_count"], 1)
+            self.assertIsNone(current["verification"])
+            self.assertEqual(self.agent.implementation_briefs[-1]["previous_failure"]["feedback"], rework["feedback"])
+
+    def test_staged_recovery_retries_test_interrupted_before_finalization(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for stage in ("implement", "compile", "review"):
+                job = self.stage(client, task, stage)
+                self.assertEqual(job["status"], "succeeded", job)
+            finalizing = threading.Event()
+            worker = client.app.state.worker
+            with patch.object(worker, "finish", side_effect=lambda *_: finalizing.set()):
+                interrupted = self.start(client, task, "test")
+                self.assertTrue(finalizing.wait(45), "Test did not reach finalization")
+                self.assertIsNone(self.task(client, task)["verification"])
+
+        with self.staged_client() as client:
+            abandoned = client.get(f"/api/v1/jobs/{interrupted}").json()
+            self.assertEqual(abandoned["status"], "recovery_required", abandoned)
+            self.recover(client, task)
+            retried = self.stage(client, task, "test")
+            self.assertEqual(retried["status"], "succeeded", retried)
+            self.assertEqual(self.task(client, task)["verification"]["test_job_id"], retried["job_id"])
+
+    def assert_cancelled_staged_report(self, client, task, action, **payload):
+        reporting, allow_report = threading.Event(), threading.Event()
+        worker = client.app.state.worker
+        report = worker.report
+
+        def pause_report(ctx, error):
+            reporting.set()
+            if not allow_report.wait(15):
+                raise AssertionError("Report test did not release the Worker")
+            return report(ctx, error)
+
+        with patch.object(worker, "report", side_effect=pause_report):
+            try:
+                job_id = self.start(client, task, action, **payload)
+                self.assertTrue(reporting.wait(55), "Job did not reach report creation")
+                self.assertEqual(self.stage(client, task, "cancel")["status"], "succeeded")
+            finally:
+                allow_report.set()
+            finished = self.wait(client, job_id)
+        self.assertEqual(finished["status"], "cancelled", finished)
+        current = self.task(client, task)
+        self.assertEqual(current["status"], "cancelled")
+        self.assertIsNone(current["verification"])
+        return current
+
+    def test_staged_cancel_during_test_report_does_not_publish_verification(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            current = self.assert_cancelled_staged_report(client, task, "run")
+            self.assertEqual(current["current_stage"], "test")
+
+    def test_staged_cancel_during_rework_report_does_not_advance_checkpoint(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            self.assertEqual(self.stage(client, task, "run")["status"], "succeeded")
+            current = self.assert_cancelled_staged_report(client, task, "rework", workflow_run_id="run-feature-41",
+                                                          implementation_attempt=1, feedback="Keep it brief")
+            self.assertEqual(current["current_stage"], "fix")
 
     def test_staged_review_precedes_tests_and_rework_invalidates_evidence(self):
         with self.staged_client() as client:

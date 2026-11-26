@@ -40,6 +40,8 @@ FIXABLE = {"compile_failed", "tests_failed", "review_changes", "asset_metadata"}
 TERMINAL = {"completed", "cancelled", "failed"}
 RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "license_failed", "package_failed",
              "startup_failed", "test_execution_failed", "not_run", "unsupported", "review_blocked", "dirty_workspace"}
+REWORK_RETRYABLE = {"git_failed", "timeout", "workspace_in_use", "dirty_workspace", "workspace_changed",
+                    "unsupported", "recovered"}
 
 
 class TaskNotFound(Exception):
@@ -72,6 +74,13 @@ def validation_reset(task):
     if task.get("workflow_mode") == "staged-feature":
         fields["verification"] = None
     return fields
+
+
+def stage_finalizes_with_job(task, action):
+    stage = task["current_stage"]
+    return task.get("workflow_mode") == "staged-feature" and (
+        (action == "rework" and stage == "fix") or (action in {"run", "test"} and stage == "test")
+    )
 
 
 class DevelopmentWorker:
@@ -335,6 +344,10 @@ class DevelopmentWorker:
         if task["status"] == "failed":
             if failure == "queue_timeout" and stage == "created":
                 return "prepare"
+            if stage == "fix" and task.get("rework_pending"):
+                return None
+            if staged_feature and failure == "recovered" and stage in {"reviewed", "tested"} and not task.get("verification"):
+                return "test"
             if failure in FIXABLE and task["retry_count"] < self.cfg.pools[task["pool_id"]].policy.max_fixes:
                 return "fix"
             if failure == "unity_changed" and stage in {"compile", "test"}:
@@ -383,12 +396,18 @@ class DevelopmentWorker:
             if self.store.has_task_permit(db, task["task_id"]):
                 raise RequestConflict("Confirm the previous Unity process stopped before releasing the workspace")
             return
-        elif action == "rework" and staged_feature:
-            if (status == "awaiting_approval" and stage in {"tested", "approved"} and task["lease"]
-                    and task.get("verification") and not task["commit_sha"]):
-                if (payload["workflow_run_id"] != task["workflow_run_id"]
-                        or payload["implementation_attempt"] != task.get("implementation_attempt", 0) + 1):
-                    raise RequestConflict("Rework does not match the current workflow run and next implementation attempt")
+        elif action == "rework" and staged_feature and task["lease"] and not task["commit_sha"]:
+            if payload["workflow_run_id"] != task["workflow_run_id"]:
+                raise RequestConflict("Rework does not match the current workflow run")
+            attempt = task.get("implementation_attempt", 0)
+            if (status == "failed" and stage == "fix" and task.get("rework_pending")
+                    and task["failure_kind"] in REWORK_RETRYABLE):
+                if (payload["implementation_attempt"] != attempt or payload["feedback"] != task["rework_feedback"]):
+                    raise RequestConflict("Use the same implementation attempt and feedback to resume rework")
+                return
+            if status == "awaiting_approval" and stage in {"tested", "approved"} and task.get("verification"):
+                if payload["implementation_attempt"] != attempt + 1:
+                    raise RequestConflict("Rework does not match the next implementation attempt")
                 if task["retry_count"] >= self.cfg.pools[task["pool_id"]].policy.max_fixes:
                     raise RequestConflict("The task has reached its correction limit")
                 return
@@ -459,10 +478,10 @@ class DevelopmentWorker:
                     task.update(planning_feedback=payload["feedback"], planning=None,
                                 plan_version=task.get("plan_version", 0) + 1)
                 if action == "rework":
-                    running, _ = STAGES["fix"]
-                    task.update(**validation_reset(task), status=running, current_stage="fix",
-                                implementation_attempt=payload["implementation_attempt"], rework_feedback=payload["feedback"],
-                                retry_count=task["retry_count"] + 1, revision=None, changed_files=[],
+                    if not task.get("rework_pending"):
+                        task.update(rework_pending=True, implementation_attempt=payload["implementation_attempt"],
+                                    rework_feedback=payload["feedback"], retry_count=task["retry_count"] + 1)
+                    task.update(**validation_reset(task), status="fixing", current_stage="fix", revision=None, changed_files=[],
                                 implementation_result=None, agent_session_id=None, stage_result={}, failure_kind=None,
                                 error_message=None, exit_code=None)
                 self.store.save_task(db, task)
@@ -557,7 +576,8 @@ class DevelopmentWorker:
                     error = StageError("worker_error", "Cannot save the development report")
         with self.guard:
             try:
-                if action == "accept-plan" and cancel.is_set() and (error is None or error.kind != "recovery_required"):
+                cancellable = action == "accept-plan" or (ctx and stage_finalizes_with_job(ctx.task, action))
+                if cancellable and cancel.is_set() and (error is None or error.kind != "recovery_required"):
                     error = StageError("cancelled", "Cancellation requested")
                 self.finish(job, self.clean_output(result), error, time.monotonic() - started)
             finally:
@@ -602,10 +622,16 @@ class DevelopmentWorker:
                             failure_kind=None, error_message=None, exit_code=0)
             if action == "accept-plan" and not error:
                 freeze_plan(task)
-            if (not error and action in {"test", "run"} and task["current_stage"] == "tested"
-                    and task.get("workflow_mode") == "staged-feature"):
-                task["verification"] = {"revision": task["revision"], "test_job_id": job["job_id"],
-                                        "implementation_attempt": task.get("implementation_attempt", 0)}
+            if not error and stage_finalizes_with_job(task, action):
+                running, finished = STAGES[task["current_stage"]]
+                status = "awaiting_approval" if finished == "tested" else running
+                task.update(status=status, current_stage=finished, stage_result=result,
+                            failure_kind=None, error_message=None, exit_code=0)
+                if finished == "tested":
+                    task["verification"] = {"revision": task["revision"], "test_job_id": job["job_id"],
+                                            "implementation_attempt": task.get("implementation_attempt", 0)}
+                else:
+                    task.pop("rework_pending", None)
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
@@ -634,6 +660,8 @@ class DevelopmentWorker:
         running, finished = STAGES[stage]
         ctx.save(status=running, current_stage=stage, finished_at=None)
         result = getattr(self, f"stage_{stage}")(ctx)
+        if stage_finalizes_with_job(ctx.task, ctx.job["action"]):
+            return result
         approval_stage = "test" if ctx.task.get("workflow_mode") == "staged-feature" else "review"
         status = "awaiting_approval" if stage == approval_stage else "completed" if stage == "commit" else running
         ctx.save(status=status, current_stage=finished, stage_result=result, failure_kind=None, error_message=None,
