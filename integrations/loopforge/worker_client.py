@@ -1,9 +1,13 @@
 """Unity Worker SOP commands. Uses Python's standard library in the Linux sandbox."""
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
+import re
 import signal
+import socket
 import sys
 import time
 from pathlib import Path
@@ -65,11 +69,15 @@ def read_json(path):
     return result
 
 
-def input_json(name, *, plan_request_id=None):
+def artifact_paths(name):
     path = Path(name)
-    files = [path]
     if not path.is_file() and not path.is_absolute() and ("*" in name or "?" in name):
-        files = [item for item in Path.cwd().glob(name) if item.is_file()]
+        return [item for item in Path.cwd().glob(name) if item.is_file()]
+    return [path]
+
+
+def input_json(name, *, plan_request_id=None):
+    files = artifact_paths(name)
     if plan_request_id is None:
         if len(files) != 1:
             raise ClientError(f"Expected one artifact matching {name}. Found {len(files)}.")
@@ -115,6 +123,131 @@ def handoff(task, job, plan_request_id=None):
 def check_assignment(task, previous):
     if any(previous.get(key) is not None and previous[key] != task.get(key) for key in ("pool_id", "slot_id")):
         raise ClientError("The upstream artifact references a different Worker pool or directory")
+
+
+def planning_artifact(task):
+    result = task.get("planning") or {}
+    assignment = {key: task.get(key) for key in ("task_id", "pool_id", "slot_id", "base_commit", "workflow_run_id")}
+    digest = result.get("plan_digest", "")
+    if (not all(isinstance(value, str) and value for value in assignment.values())
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", assignment["base_commit"])
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+        raise ClientError("The Worker has no complete source-grounded plan for this assignment")
+    return {
+        **assignment, **{key: result[key] for key in ("plan_digest", "plan", "requirement_summary",
+                                                      "acceptance_criteria", "test_selection", "source_evidence", "baseline")},
+        "request_id": operation_id(assignment["task_id"], "plan-revision", digest),
+        "artifact_reference": handoff(task, {})["artifact_reference"],
+    }
+
+
+def check_planning_assignment(task, plan):
+    current = planning_artifact(task)
+    if any(plan.get(key) != current[key] for key in current if key != "artifact_reference"):
+        raise ClientError("The approved plan differs from this Worker's task, slot, Git baseline or plan revision")
+
+
+def read_planning_context(path, operation, secret, sandbox, started):
+    if path.is_symlink() or path.stat().st_size > 1_048_576:
+        raise ClientError("Invalid local Unity planning context")
+    envelope = read_json(path)
+    payload = envelope["payload"]
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    expected = hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(envelope["signature"], expected):
+        raise ClientError("Invalid local Unity planning context signature")
+    context = payload["sandboxes"][sandbox]
+    issued, expires = payload["issued_at"], payload["expires_at"]
+    if not started <= issued <= time.time() <= expires <= issued + 10 or context["operation"] != operation:
+        raise ClientError("Waiting for the current local Unity planning stage")
+    return context
+
+
+def planning_context(operation):
+    secret = os.environ.get("UNITY_PLANNING_CONTEXT_TOKEN", "")
+    sandbox = socket.gethostname()
+    if len(secret) < 32 or not re.fullmatch(r"[a-f0-9]{12}", sandbox):
+        raise ClientError("Set the local planning signing credential and run the script in its Runner container")
+    path = Path(".unity-worker-context.json")
+    started = time.time()
+    until = time.monotonic() + 45
+    while time.monotonic() < until:
+        try:
+            return read_planning_context(path, operation, secret, sandbox, started)
+        except (OSError, KeyError, TypeError, ValueError, ClientError):
+            time.sleep(1)
+    raise ClientError("Timed out waiting for a signed local Unity planning context for this stage")
+
+
+def run_planning(client, args):
+    context = planning_context("plan")
+    run_id = context["workflow_run_id"]
+    if context["planning_profile"] != args.planning_profile:
+        raise ClientError("The LoopForge run does not use the configured planning profile")
+    created = client.request("/api/v1/planning-tasks", {
+        "request_id": operation_id(run_id, "planning-task", 0), "pool_id": args.pool, "workflow_run_id": run_id,
+        "requirement": context["requirement"], "planning_profile": args.planning_profile,
+    })
+    task_id = str(UUID(created["task_id"]))
+    path = f"/api/v1/tasks/{task_id}"
+    planning_id = operation_id(task_id, "plan", f"{context['rework']}:{context['attempt']}")
+    payload = {"request_id": planning_id, "feedback": context["feedback"]}
+    if args.queue_wait_seconds is not None:
+        payload["queue_wait_seconds"] = args.queue_wait_seconds
+    task = client.request(path)
+    job = None
+    if task.get("job_id") and task.get("planning_feedback") == payload["feedback"]:
+        previous = client.request(f"/api/v1/jobs/{UUID(task['job_id'])}")
+        if previous.get("action") == "plan" and previous.get("status") in {"queued", "running"}:
+            job = previous
+    print(f"Unity Worker 规划任务 {task_id}。", flush=True)
+    try:
+        if job is None:
+            job = client.request(path + "/plan", payload)
+        task, job = wait_job(client, path, job["job_id"], args.wait_seconds, args.follow,
+                             queue_wait_seconds=args.queue_wait_seconds)
+    except (Interrupted, KeyboardInterrupt):
+        try:
+            client.request(path + "/cancel", {"request_id": operation_id(task_id, "cancel", planning_id)})
+        except ClientError as error:
+            print(str(error), file=sys.stderr, flush=True)
+        print(f"规划节点已停止，请核对任务 {task_id} 的 Windows 进程状态后释放。", file=sys.stderr, flush=True)
+        raise
+    if job["status"] != "succeeded":
+        raise ClientError(f"Unity 规划任务 {task_id} 未完成 ({job.get('failure_kind') or job['status']})")
+    result = planning_artifact(task)
+    if (result["workflow_run_id"], result["pool_id"]) != (run_id, args.pool):
+        raise ClientError("The planning result does not belong to the current run and pool")
+    save_json(args.output, result)
+    print(f"Unity 方案 {result['plan_digest']}，任务 {task_id}，等待审批。", flush=True)
+    return 0
+
+
+def accept_planning(client, args):
+    decision = planning_context("approve")
+    plan = None
+    for path in artifact_paths(args.input):
+        if path.is_symlink() or path.stat().st_size > 1_048_576:
+            continue
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() == decision["plan_sha256"]:
+            plan = json.loads(raw)
+            break
+    if not isinstance(plan, dict):
+        raise ClientError("The mounted plan is not the artifact approved in LoopForge")
+    if plan.get("workflow_run_id") != decision["workflow_run_id"]:
+        raise ClientError("The approved artifact belongs to another LoopForge run")
+    task_path = f"/api/v1/tasks/{UUID(plan['task_id'])}"
+    check_planning_assignment(client.request(task_path), plan)
+    result = client.request(task_path + "/accept-plan", {
+        "request_id": operation_id(plan["request_id"], "accept-plan", 0),
+        **{key: plan[key] for key in ("slot_id", "base_commit", "plan_digest")},
+    })
+    if result["status"] != "succeeded":
+        raise ClientError("The Worker has not accepted the approved plan")
+    save_json(args.output, plan)
+    print(f"Worker 任务 {plan['task_id']} 已接收经审批的方案 {plan['plan_digest']}。", flush=True)
+    return 0
 
 
 def check_delivery(task, previous):
@@ -165,6 +298,10 @@ def run_action(client, args):
     if action == "health":
         print(json.dumps(client.request("/health")), flush=True)
         return 0
+    if action == "plan":
+        return run_planning(client, args)
+    if action == "accept-planning":
+        return accept_planning(client, args)
     if args.from_artifact and args.task_id:
         raise ClientError("Select either --from-artifact or --task-id")
     plan_request_id = None
@@ -172,6 +309,7 @@ def run_action(client, args):
         plan_request_id = str(UUID(input_json(args.approved_plan)["request_id"]))
     previous = input_json(args.from_artifact, plan_request_id=plan_request_id) if args.from_artifact else {}
     task_id = args.task_id or previous.get("task_id")
+    planned = None
     if action in ("create", "develop"):
         if task_id:
             raise ClientError("Task creation takes an approved plan, with no existing task ID")
@@ -180,15 +318,18 @@ def run_action(client, args):
         creation_id = plan.get("request_id")
         if not creation_id and not run_id:
             raise ClientError("Approved plan must supply request_id or workflow_run_id")
-        payload = {key: plan[key] for key in ("requirement", "plan", "acceptance_criteria")}
         plan_request_id = str(UUID(creation_id)) if creation_id else operation_id(run_id, "create", 0)
-        payload.update(workflow_run_id=run_id, project_rules=plan.get("project_rules", ""), request_id=plan_request_id)
-        if args.pool:
-            payload["pool_id"] = args.pool
-        if "test_selection" in plan:
-            payload["test_selection"] = plan["test_selection"]
-        created = client.request("/api/v1/tasks", payload)
-        task_id = created["task_id"]
+        if action == "develop" and "task_id" in plan:
+            task_id, planned = plan["task_id"], plan
+        else:
+            payload = {key: plan[key] for key in ("requirement", "plan", "acceptance_criteria")}
+            payload.update(workflow_run_id=run_id, project_rules=plan.get("project_rules", ""), request_id=plan_request_id)
+            if args.pool:
+                payload["pool_id"] = args.pool
+            if "test_selection" in plan:
+                payload["test_selection"] = plan["test_selection"]
+            created = client.request("/api/v1/tasks", payload)
+            task_id = created["task_id"]
         operation = None if action == "create" else "run"
     else:
         operation = "commit" if action == "deliver" else action
@@ -196,6 +337,12 @@ def run_action(client, args):
         raise ClientError("Supply --task-id or --from-artifact")
     task_path = f"/api/v1/tasks/{UUID(task_id)}"
     task = client.request(task_path)
+    if planned is not None:
+        check_planning_assignment(task, planned)
+        if task.get("approved_plan_digest") != planned["plan_digest"]:
+            raise ClientError("The Worker has not accepted the frozen LoopForge plan revision")
+        if args.pool and planned["pool_id"] != args.pool:
+            raise ClientError("The approved plan belongs to a different configured pool")
     if operation in (None, "status", "failure"):
         result = handoff(task, {}, plan_request_id)
         save_json(args.output, result)
@@ -255,11 +402,11 @@ def main(argv=None):
     if argv and argv[0] == "render":
         if len(argv) < 2 or argv[1] == "render":
             raise SystemExit("Usage: worker_client.py render ACTION [arguments]")
-        print("SOP_ARGS = " + repr(argv[1:]))
-        print(Path(__file__).read_text(encoding="utf-8"), end="")
+        header = "SOP_ARGS = " + repr(argv[1:]) + "\n"
+        sys.stdout.buffer.write(header.encode("utf-8") + Path(__file__).read_bytes())
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("health", "create", "develop", "prepare", "implement", "compile", "test",
+    parser.add_argument("action", choices=("health", "plan", "accept-planning", "create", "develop", "prepare", "implement", "compile", "test",
                                           "review", "fix", "run", "status", "failure", "approve", "deliver",
                                           "cancel", "release", "recover", "pr"))
     parser.add_argument("--input", default="unity-plan.json")
@@ -268,7 +415,8 @@ def main(argv=None):
     parser.add_argument("--output", default="unity-task.json")
     parser.add_argument("--task-id")
     parser.add_argument("--run-id")
-    parser.add_argument("--pool", help="Configured pool ID for create or develop")
+    parser.add_argument("--pool", help="Configured pool ID for plan, create or develop")
+    parser.add_argument("--planning-profile", choices=("feature", "ui", "issue-fix"))
     parser.add_argument("--queue-wait-seconds", type=int, help="Time allowed to wait for a workspace")
     parser.add_argument("--attempt", type=int, default=0)
     parser.add_argument("--wait-seconds", type=int, default=int(os.environ.get("UNITY_WORKER_WAIT_SECONDS", "14400")))
@@ -282,11 +430,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.attempt < 0 or args.wait_seconds <= 0:
         parser.error("Select a non-negative attempt and positive wait time")
-    if args.pool is not None and args.action not in {"create", "develop"}:
-        parser.error("--pool is only available for create or develop")
-    if args.queue_wait_seconds is not None and (args.action not in {"develop", "run", "prepare"}
+    if args.pool is not None and args.action not in {"plan", "create", "develop"}:
+        parser.error("--pool is only available for plan, create or develop")
+    if args.action == "plan" and (not args.pool or not args.planning_profile):
+        parser.error("plan requires --pool and --planning-profile")
+    if args.queue_wait_seconds is not None and (args.action not in {"plan", "develop", "run", "prepare"}
                                                 or not 1 <= args.queue_wait_seconds <= 86400):
-        parser.error("--queue-wait-seconds requires develop, run or prepare and a value from 1 to 86400")
+        parser.error("--queue-wait-seconds requires plan, develop, run or prepare and a value from 1 to 86400")
     if args.approved_plan and (args.action not in ("deliver", "release") or not args.from_artifact):
         parser.error("--approved-plan requires a delivery or release operation with --from-artifact")
 

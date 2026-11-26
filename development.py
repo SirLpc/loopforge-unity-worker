@@ -13,6 +13,7 @@ from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, AgentExecutor, CodexEx
 from git_workspace import GitWorkspace
 from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
+from planning import investigate
 from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
@@ -42,6 +43,11 @@ class TaskNotFound(Exception):
 
 def publishable(job):
     return {key: value for key, value in job.items() if key not in {"signature", "request_id"}}
+
+
+def plan_binding(task):
+    return {"slot_id": task["slot_id"], "base_commit": task["base_commit"],
+            "plan_digest": task["planning"]["plan_digest"]}
 
 
 class DevelopmentWorker:
@@ -171,7 +177,8 @@ class DevelopmentWorker:
             pool = self.cfg.pools.get(payload.get("pool_id", self.cfg.default_pool))
             if pool is None:
                 raise ValueError("Unknown Unity workspace pool")
-            validate_test_selection(payload.get("test_selection"), pool.policy.test_assemblies)
+            if not payload.get("planning_profile"):
+                validate_test_selection(payload.get("test_selection"), pool.policy.test_assemblies)
             task_id = str(uuid4())
             task = self.new_task(task_id, payload, "development")
             job = self.new_job(task_id, request_id, "create", payload)
@@ -204,6 +211,10 @@ class DevelopmentWorker:
 
     def next_stage(self, task):
         stage, failure = task["current_stage"], task["failure_kind"]
+        if task.get("planning_profile") and not task.get("approved_plan_digest"):
+            return None
+        if stage == "plan_accepted":
+            return "implement"
         if task["status"] == "failed":
             if failure == "queue_timeout" and stage == "created":
                 return "prepare"
@@ -234,6 +245,15 @@ class DevelopmentWorker:
                 return
         elif active_job:
             raise RequestConflict("The task already has an active job")
+        elif action == "plan" and task.get("planning_profile") and not task.get("approved_plan_digest"):
+            if (status in {"pending", "failed", "awaiting_plan_approval"}
+                    and (task["lease"] or task["slot_id"] is None)):
+                return
+        elif action == "accept-plan" and status == "awaiting_plan_approval" and task["lease"]:
+            expected = plan_binding(task)
+            if expected != payload:
+                raise RequestConflict("The plan, leased workspace or Git baseline has changed")
+            return
         elif action == "release" and status in TERMINAL and task["lease"]:
             if self.store.has_task_permit(db, task["task_id"]):
                 raise RequestConflict("Confirm the previous Unity process stopped before releasing the workspace")
@@ -271,10 +291,17 @@ class DevelopmentWorker:
                 task = self.require_task(db, task_id)
                 self.check_action(db, task, action, payload)
                 job = self.new_job(task_id, request_id, action, payload)
-                if action in {"approve", "cancel"}:
+                if action in {"accept-plan", "approve", "cancel"}:
                     active = self.store.active_job(db, task_id)
                     running = active and active["status"] == "running"
-                    if action == "approve":
+                    if action == "accept-plan":
+                        plan = task["planning"]
+                        task.update(status="pending", current_stage="plan_accepted", plan=plan["plan"],
+                                    acceptance_criteria=plan["acceptance_criteria"],
+                                    approved_plan_digest=plan["plan_digest"])
+                        if plan["test_selection"]:
+                            task["test_selection"] = plan["test_selection"]
+                    elif action == "approve":
                         task.update(current_stage="approved", approved_revision=payload["revision"],
                                     approval={**payload, "approved_at": now()})
                     elif running:
@@ -297,6 +324,9 @@ class DevelopmentWorker:
                     task["started_at"] = task["started_at"] or now()
                     if action not in {"release", "recover", "pr"}:
                         task["finished_at"] = None
+                if action == "plan":
+                    task.update(planning_feedback=payload["feedback"], planning=None,
+                                plan_version=task.get("plan_version", 0) + 1)
                 self.store.save_task(db, task)
                 self.store.save_job(db, job)
             if action == "cancel" and task_id in self.active:
@@ -347,6 +377,8 @@ class DevelopmentWorker:
             ctx.workspace = workspace
             if action == "run":
                 result = self.run(ctx)
+            elif action == "plan":
+                result = self.build_plan(ctx)
             elif action == "smoke":
                 result = ctx.workspace.unity.run(ctx, "startup_smoke", safe_child(self.cfg.logs, f"{task['task_id']}.log"))
             elif action == "release":
@@ -410,6 +442,9 @@ class DevelopmentWorker:
                             exit_code=error.exit_code if error else 0)
             if action == "release" and not error:
                 task.update(lease=False, released_at=timestamp)
+            if action == "plan" and not error:
+                task.update(status="awaiting_plan_approval", current_stage="plan_ready", planning=result,
+                            failure_kind=None, error_message=None, exit_code=0)
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
@@ -450,6 +485,18 @@ class DevelopmentWorker:
         ctx.save(**prepared)
         return {"base_commit": prepared["base_commit"], "task_branch": branch}
 
+    def build_plan(self, ctx):
+        ctx.save(status="planning", current_stage="plan", finished_at=None)
+        if not ctx.task["base_commit"]:
+            self.stage_prepare(ctx)
+        plan = self.clean_output(investigate(ctx))
+        plan["plan_digest"] = signature({**plan, "task_id": ctx.task["task_id"],
+                                         "slot_id": ctx.task["slot_id"], "base_commit": ctx.task["base_commit"],
+                                         "plan_version": ctx.task["plan_version"]})
+        path = ctx.artifact("unity-plan", ".json", "planning")
+        path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return plan
+
     @staticmethod
     def brief(task):
         return {key: task[key] for key in ("requirement", "plan", "acceptance_criteria", "project_rules")}
@@ -478,6 +525,8 @@ class DevelopmentWorker:
         return ctx.task["implementation_result"]
 
     def stage_implement(self, ctx):
+        if ctx.task.get("planning_profile"):
+            ctx.workspace.git.clean(ctx)
         return self.agent_implementation(ctx)
 
     def stage_fix(self, ctx):

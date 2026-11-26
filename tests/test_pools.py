@@ -242,6 +242,87 @@ class PoolTests(unittest.TestCase):
     def test_editor_limit_two_allows_two_project_paths(self):
         self.concurrent_compile(2)
 
+    def test_third_checkout_waits_for_editor_and_active_cancellation_admits_it(self):
+        from process_runner import StageError
+        from task_store import Store
+
+        third = self.root / "extra-checkout"
+        git(self.root, "clone", str(self.root / "remote"), str(third))
+        pool = self.config.pools["game"]
+        ids = ("map-north", "shader-lab", "nightly-x7")
+        paths = tuple(map(str, (self.first, self.second, third)))
+        slots = (
+            replace(pool.slots[0], id=ids[0]),
+            replace(pool.slots[1], id=ids[1]),
+            replace(pool.slots[1], id=ids[2], settings=replace(pool.slots[1].settings, project=third, git_root=third)),
+        )
+        self.config = replace(self.config, legacy_slot=ids[0], max_parallel_unity=2,
+                              pools={**self.config.pools, "game": replace(pool, slots=slots)})
+        started = {path: threading.Event() for path in paths}
+        finish = threading.Event()
+        waiting = threading.Event()
+        active = set()
+        lock = threading.Lock()
+        delegate = FixtureRunner(self.root)
+        original_run = delegate.run
+        original_take = Store.take_unity_permit
+
+        def run(argv, cwd, prefix, **kwargs):
+            if "-projectPath" not in argv:
+                return original_run(argv, cwd, prefix, **kwargs)
+            path = argv[argv.index("-projectPath") + 1]
+            with lock:
+                active.add(path)
+                started[path].set()
+            try:
+                while not finish.wait(0.05):
+                    if kwargs["cancel"].is_set():
+                        raise StageError("cancelled", "Fixture Unity invocation cancelled")
+                return original_run(argv, cwd, prefix, **kwargs)
+            finally:
+                with lock:
+                    active.remove(path)
+
+        def take(db, job_id, limit):
+            acquired = original_take(db, job_id, limit)
+            if not acquired:
+                waiting.set()
+            return acquired
+
+        delegate.run = run
+        with patch.object(DevelopmentWorker, "stage_prepare", return_value={}), \
+                patch.object(DevelopmentWorker, "stage_implement", return_value={}), \
+                patch.object(DevelopmentWorker, "stage_compile", lambda _, ctx: ctx.workspace.unity.run(ctx, "compile")), \
+                patch.object(Store, "take_unity_permit", staticmethod(take)), self.client(runner=delegate) as client:
+            try:
+                first, second = self.prepared_tasks(client)
+                first_job = self.action(client, first, "compile")
+                second_job = self.action(client, second, "compile")
+                self.assertTrue(started[paths[0]].wait(10))
+                self.assertTrue(started[paths[1]].wait(10))
+
+                extra = self.create(client)
+                for stage in ("prepare", "implement"):
+                    self.assertEqual(self.wait(client, self.action(client, extra, stage))["status"], "succeeded")
+                self.assertEqual([self.task(client, task)["slot_id"] for task in (first, second, extra)], list(ids))
+                extra_job = self.action(client, extra, "compile")
+                self.assertTrue(waiting.wait(10))
+                with lock:
+                    self.assertEqual(active, set(paths[:2]))
+                self.assertEqual(self.job(client, extra_job["job_id"])["status"], "running")
+
+                self.action(client, first, "cancel")
+                self.assertEqual(self.wait(client, first_job)["status"], "cancelled")
+                self.assertTrue(started[paths[2]].wait(10))
+                with lock:
+                    self.assertEqual(active, set(paths[1:]))
+                self.assertEqual(self.job(client, second_job["job_id"])["status"], "running")
+                self.assertTrue(self.task(client, first)["lease"])
+            finally:
+                finish.set()
+            for job in (second_job, extra_job):
+                self.assertEqual(self.wait(client, job)["status"], "succeeded")
+
     def test_editor_permit_survives_unverified_exit_and_restart(self):
         from process_runner import StageError
 

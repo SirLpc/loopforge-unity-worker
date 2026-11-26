@@ -26,6 +26,16 @@ python3 integrations/loopforge/worker_client.py render release \
 
 ## 节点顺序及审批
 
+### Windows Worker 提前接手
+
+开发类 SOP 调用 `POST /api/v1/planning-tasks`，传 `request_id`、`workflow_run_id`、`requirement`、`planning_profile` 和可选 `pool_id`。`planning_profile` 支持 `feature`、`ui` 和 `issue-fix`。节点调用 `POST /api/v1/tasks/{task_id}/plan`，提供阶段请求 ID、可选 `queue_wait_seconds` 和返工意见 `feedback`。Worker 分配目录，在固定基础提交上只读调查，并按需直接运行 Unity BatchMode。成功的任务进入 `awaiting_plan_approval`，报告保存在 `planning` 和任务产物中。
+
+LoopForge 人工审批后，可信脚本调用 `POST /api/v1/tasks/{task_id}/accept-plan`，提供阶段请求 ID 及获批报告的 `slot_id`、`base_commit` 和 `plan_digest`。`run` 接续同一任务。方案返工保留目录并生成新的摘要。取消时等待进程终止，再用 `release` 检查并释放目录。交付版本使用独立的操作员签批流程。
+
+池内槽位 ID 和路径均由 Worker 配置提供。`max_parallel_unity` 控制全机 Editor 并发，独立于池可接任务的数量。审批等待期间只保留目录租约。正式启用更高上限前，在两份独立的验收工程上用 `tests/windows_batch_overlap.py` 核对真实进程重叠、每份测试 XML 和内存。
+
+### 既有方案交接
+
 | 顺序 | 节点 | 输入和输出 |
 | --- | --- | --- |
 | 1 | 需求分析和技术方案 | 生成 unity-plan.json，见示例。每个新需求运行生成独立 request_id，重试原计划时保持相同 ID。能获取实际 LoopForge 运行 ID 时填写 workflow_run_id |

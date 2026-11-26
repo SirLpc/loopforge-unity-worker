@@ -54,6 +54,23 @@ class TaskRequest(OperationRequest):
     test_selection: dict[str, list[TestScope]] | None = None
 
 
+class PlanningTaskRequest(OperationRequest):
+    pool_id: str | None = Field(default=None, pattern=rf"^{REMOTE_PATTERN}$")
+    workflow_run_id: str = Field(pattern=r"^run-[A-Za-z0-9_-]{1,120}$")
+    requirement: Text
+    planning_profile: Literal["feature", "ui", "issue-fix"]
+
+
+class PlanRequest(StageRequest):
+    feedback: str = Field(default="", max_length=4000)
+
+
+class AcceptPlanRequest(OperationRequest):
+    slot_id: str = Field(pattern=rf"^{REMOTE_PATTERN}$")
+    base_commit: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RevisionRequest(OperationRequest):
     revision: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
@@ -193,6 +210,16 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
 
+    @app.post("/api/v1/planning-tasks", status_code=202)
+    def create_planning_task(request: PlanningTaskRequest):
+        payload = payload_for(request)
+        if payload["pool_id"] in (None, cfg.default_pool):
+            del payload["pool_id"]
+        try:
+            return worker().create(str(request.request_id), payload)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: UUID):
         task = worker().task(str(task_id))
@@ -247,6 +274,14 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     @app.post("/api/v1/tasks/{task_id}/commit", status_code=202)
     def commit(task_id: UUID, request: RevisionRequest):
         return worker().action(str(task_id), "commit", str(request.request_id), payload_for(request))
+
+    @app.post("/api/v1/tasks/{task_id}/plan", status_code=202)
+    def plan(task_id: UUID, request: PlanRequest):
+        return worker().action(str(task_id), "plan", str(request.request_id), payload_for(request))
+
+    @app.post("/api/v1/tasks/{task_id}/accept-plan", status_code=202)
+    def accept_plan(task_id: UUID, request: AcceptPlanRequest):
+        return worker().action(str(task_id), "accept-plan", str(request.request_id), payload_for(request))
 
     @app.post("/api/v1/tasks/{task_id}/{action}", status_code=202)
     def operation(task_id: UUID, action: Action, request: StageRequest):

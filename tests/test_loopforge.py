@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import unittest
@@ -6,6 +7,88 @@ from uuid import uuid4
 
 
 class ScriptTests(unittest.TestCase):
+    def test_signed_local_context_rejects_stale_or_foreign_container_records(self):
+        import hashlib
+        import hmac
+        import json
+        from unittest.mock import patch
+        from support import test_directory
+        from integrations.loopforge import worker_client
+
+        key = "test-signing-key" * 3
+        sandbox = "012345abcdef"
+        stage = {"operation": "plan", "workflow_run_id": "run-123"}
+        payload = {"issued_at": 101.5, "expires_at": 111.5, "sandboxes": {sandbox: stage}}
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        signature = hmac.new(key.encode(), canonical, hashlib.sha256).hexdigest()
+        with test_directory() as root, patch.object(worker_client.time, "time", return_value=103):
+            file = root / ".unity-worker-context.json"
+            worker_client.save_json(file, {"payload": payload, "signature": signature})
+            self.assertEqual(worker_client.read_planning_context(file, "plan", key, sandbox, 101), stage)
+            for operation, secret, container, start in (("approve", key, sandbox, 101), ("plan", key, sandbox, 102),
+                                                         ("plan", "another-secret", sandbox, 101)):
+                with self.assertRaises(worker_client.ClientError):
+                    worker_client.read_planning_context(file, operation, secret, container, start)
+            with self.assertRaises(KeyError):
+                worker_client.read_planning_context(file, "plan", key, "012345accdef", 101)
+        with test_directory() as root, patch.object(worker_client.time, "time", return_value=113):
+            file = root / ".unity-worker-context.json"
+            worker_client.save_json(file, {"payload": payload, "signature": signature})
+            with self.assertRaises(worker_client.ClientError):
+                worker_client.read_planning_context(file, "plan", key, sandbox, 101)
+
+    def test_planning_artifact_binds_persistent_worker_assignment_and_digest(self):
+        from integrations.loopforge.worker_client import ClientError, planning_artifact, check_planning_assignment
+
+        task = {"task_id": str(uuid4()), "pool_id": "project-pool", "slot_id": "slot-many",
+                "workflow_run_id": "run-12345", "base_commit": "a" * 40,
+                "planning": {"plan_digest": "b" * 64, "plan": "Document the baseline",
+                             "requirement_summary": "Write a guide", "acceptance_criteria": ["Guide exists"],
+                             "test_selection": {"editmode": []}, "source_evidence": [], "baseline": []}}
+        plan = planning_artifact(task)
+        self.assertEqual(plan["request_id"], planning_artifact(task)["request_id"])
+        self.assertEqual(plan["slot_id"], "slot-many")
+        self.assertEqual(plan["plan_digest"], "b" * 64)
+        self.assertEqual(plan["workflow_run_id"], "run-12345")
+        check_planning_assignment(task, plan)
+        for key in ("task_id", "pool_id", "slot_id", "base_commit", "workflow_run_id", "plan_digest", "plan"):
+            with self.subTest(key=key), self.assertRaises(ClientError):
+                check_planning_assignment(task, {**plan, key: "wrong"})
+
+    def test_accept_planning_requires_the_exact_approved_artifact(self):
+        import hashlib
+        from types import SimpleNamespace
+        from unittest.mock import patch, Mock
+        from support import test_directory
+        from integrations.loopforge import worker_client
+
+        task_id = str(uuid4())
+        task = {"task_id": task_id, "pool_id": "arbitrary-pool", "slot_id": "available-sandbox",
+                "workflow_run_id": "run-890", "base_commit": "a" * 40,
+                "planning": {"plan_digest": "b" * 64, "plan": "Use repository evidence",
+                             "requirement_summary": "Plan a task", "acceptance_criteria": ["Done"],
+                             "test_selection": {"playmode": []}, "source_evidence": [], "baseline": []}}
+        plan = worker_client.planning_artifact(task)
+        with test_directory() as root:
+            args = SimpleNamespace(input=root / "plan.json", output=root / "accepted.json")
+            worker_client.save_json(args.input, plan)
+            approved = {"workflow_run_id": "run-890", "plan_sha256": hashlib.sha256(args.input.read_bytes()).hexdigest()}
+            with patch.object(worker_client, "planning_context", return_value=approved):
+                client = Mock()
+                client.request.side_effect = [task, {"status": "succeeded"}]
+                self.assertEqual(worker_client.accept_planning(client, args), 0)
+                self.assertEqual(worker_client.read_json(args.output), plan)
+                call = client.request.call_args.args
+                self.assertEqual(call[0], f"/api/v1/tasks/{task_id}/accept-plan")
+                self.assertEqual(call[1]["slot_id"], task["slot_id"])
+                self.assertEqual(call[1]["base_commit"], task["base_commit"])
+                self.assertEqual(call[1]["plan_digest"], "b" * 64)
+                client.reset_mock()
+                worker_client.save_json(args.input, {**plan, "plan": "Replaced after approval"})
+                with self.assertRaises(worker_client.ClientError):
+                    worker_client.accept_planning(client, args)
+                client.request.assert_not_called()
+
     def test_handoff_selects_the_artifact_for_the_approved_plan(self):
         from unittest.mock import patch
         from support import test_directory
@@ -39,7 +122,8 @@ class ScriptTests(unittest.TestCase):
 
     def test_rendered_inline_script_starts_without_file_globals(self):
         script = Path("integrations/loopforge/worker_client.py").resolve()
-        rendered = subprocess.check_output([sys.executable, str(script), "render", "develop", "--help"])
+        environment = {**os.environ, "PYTHONIOENCODING": "cp936"}
+        rendered = subprocess.check_output([sys.executable, str(script), "render", "develop", "--help"], env=environment)
         result = subprocess.run([sys.executable, "-"], input=rendered, capture_output=True, check=True)
         self.assertIn(b"--input", result.stdout)
 

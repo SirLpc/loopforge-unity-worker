@@ -11,6 +11,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from git_workspace import CACHES, OUTPUTS, SENSITIVE_DIRS, SECRET_SUFFIXES
+from planning import PLANNING_RULES, PlanResult
 from process_runner import StageError
 from worker_config import system_env
 
@@ -49,6 +50,8 @@ class ReviewResult(StructuredOutput):
 
 class AgentExecutor(Protocol):
     def execute(self, ctx, prompt: str, *, review: bool = False) -> dict: ...
+
+    def plan(self, ctx, briefing: dict) -> dict: ...
 
 
 IMPLEMENT_RULES = """Implement the approved Unity change in the current workspace. Follow AGENTS.md.
@@ -121,14 +124,14 @@ def nested_denials(settings, cwd):
     return restricted
 
 
-def permission_args(settings, cwd, *, review):
+def permission_args(settings, cwd, *, review, planning=False):
     access = {
         ":minimal": "read", str(Path(settings.codex_exe).parent): "read",
-        str(cwd): "read" if review else "write", str(settings.codex_home): "deny",
+        str(cwd): "read" if review or planning else "write", str(settings.codex_home): "deny",
     }
     access.update({str(path): "deny" for path in getattr(settings, "sibling_checkouts", ())})
     if not review:
-        access[str(cwd / ".git")] = "read"
+        access[str(cwd / ".git")] = "deny" if planning else "read"
         for path in (*getattr(settings, "ignored_cache_paths", ()), *getattr(settings, "allowed_tracked_outputs", ())):
             access[str(cwd / path)] = "deny"
         if cwd != settings.project:
@@ -229,18 +232,22 @@ class CodexExecutor:
                 (nested / ".env").unlink(missing_ok=True)
                 nested.rmdir()
 
-    def execute(self, ctx, prompt, *, review=False):
+    def plan(self, ctx, briefing):
+        prompt = PLANNING_RULES + "\n\nTask and baseline data:\n" + json.dumps(briefing, ensure_ascii=False)
+        return self.execute(ctx, prompt, planning=True)
+
+    def execute(self, ctx, prompt, *, review=False, planning=False):
         env = self.environment()
         help_text = self.capabilities(ctx, env)
-        model = ReviewResult if review else ImplementationResult
+        model = PlanResult if planning else ReviewResult if review else ImplementationResult
         cwd = ctx.prefix("review-workspace") if review else getattr(self.cfg, "checkout", self.cfg.project)
         if review:
             cwd.mkdir()
-        options = permission_args(self.cfg, cwd, review=review)
-        self.verify_sandbox(ctx, cwd, options, env, review)
+        options = permission_args(self.cfg, cwd, review=review, planning=planning)
+        self.verify_sandbox(ctx, cwd, options, env, review or planning)
         output = ctx.prefix("agent-response").with_suffix(".json")
         switches = ["--strict-config", "--ignore-user-config", "--ignore-rules", "--output-last-message", str(output)]
-        if review:
+        if review or planning:
             if "--skip-git-repo-check" not in help_text:
                 raise StageError("unsupported", "Codex cannot review outside the Unity checkout")
             switches.append("--skip-git-repo-check")
@@ -252,7 +259,8 @@ class CodexExecutor:
             schema.write_text(json.dumps(model.model_json_schema()), encoding="utf-8")
             switches.extend(("--output-schema", str(schema)))
         process = ctx.run(
-            [self.cfg.codex_exe, *options, "exec", *switches, "-"], "codex-review" if review else "codex",
+            [self.cfg.codex_exe, *options, "exec", *switches, "-"],
+            "codex-plan" if planning else "codex-review" if review else "codex",
             cwd=cwd, timeout=self.cfg.codex_timeout, env=env, publish=True, data=prompt.encode("utf-8"),
         )
         identifier = session_id(process.stdout) if json_events else None
@@ -267,7 +275,9 @@ class CodexExecutor:
         except (OSError, ValidationError, ValueError) as error:
             raise StageError("review_blocked" if review else "agent_failed", "Codex returned invalid structured output",
                              process.exit_code, metadata) from error
-        if not review and not result["success"]:
+        if not review and not planning and not result["success"]:
             raise StageError("agent_failed", "Codex reported an incomplete implementation",
                              process.exit_code, {**result, **metadata})
+        if planning:
+            return result
         return {**result, **metadata}
