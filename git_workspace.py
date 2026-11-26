@@ -37,6 +37,25 @@ def has_hidden_index_entries(path):
     return False
 
 
+def outside_cache(path: Path, target: Path) -> Path:
+    """Resolve existing ancestors strictly, including for stores that Git has not created yet."""
+    path = Path(os.path.normpath(path))
+    if not path.is_absolute():
+        raise StageError("unsafe_cache", "Could not determine the Git storage location")
+    for ancestor in (path, *path.parents):
+        try:
+            ancestor.lstat()
+        except FileNotFoundError:
+            continue
+        existing = ancestor.resolve(strict=True)
+        # Windows drive, UNC and extended-length aliases can spell the same directory differently.
+        if any(parent.samefile(target) for parent in (existing, *existing.parents)) or (
+                ancestor == path and any(parent.samefile(existing) for parent in target.parents)):
+            raise StageError("unsafe_cache", "The cache overlaps Git or Git LFS storage")
+        return existing / path.relative_to(ancestor)
+    raise StageError("unsafe_cache", "Could not determine the Git storage location")
+
+
 @dataclass(frozen=True)
 class Snapshot:
     tree: str
@@ -97,6 +116,18 @@ class GitWorkspace:
 
     def assert_disposable_cache(self, ctx, target: Path) -> None:
         self.validate(ctx)
+        for parent in target.parents:
+            if parent == self.root:
+                break
+            try:
+                (parent / ".git").lstat()
+            except FileNotFoundError:
+                continue
+            raise StageError("unsafe_cache", "A repository inside the checkout owns this cache")
+        owner = self.text(ctx, "-C", str(target), "rev-parse", "--show-toplevel")
+        if Path(owner).resolve(strict=True) != self.root:
+            raise StageError("unsafe_cache", "The cache is outside the configured Git worktree")
+        self.assert_storage_outside_cache(ctx, target)
         relative = target.relative_to(self.root).as_posix()
         cache = Path(relative)
 
@@ -121,6 +152,38 @@ class GitWorkspace:
         if ignored or self.git(ctx, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z",
                                "--", relative)[1]:
             raise StageError("unsafe_cache", "The cache contains a path that Git does not ignore")
+
+    def assert_storage_outside_cache(self, ctx, target):
+        git_dir = self.root / ".git"
+        common = self.text(ctx, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if Path(common).resolve(strict=True) != git_dir:
+            raise StageError("unsafe_cache", "Cache cleanup requires a standalone Git directory")
+        _, raw = self.git(ctx, "config", "--null", "--get", "lfs.storage", allowed=(0, 1))
+        configured = Path(os.fsdecode(raw.removesuffix(b"\0") or b"lfs"))
+        if configured.anchor and not configured.is_absolute():
+            raise StageError("unsafe_cache", "Could not determine the Git LFS storage location")
+        lfs = outside_cache(git_dir / configured, target)
+        outside_cache(lfs / "objects", target)
+
+        pending = [git_dir / "objects"]
+        seen = set()
+        while pending:
+            objects = outside_cache(pending.pop(), target)
+            if objects in seen:
+                continue
+            seen.add(objects)
+            alternate_file = outside_cache(objects / "info/alternates", target)
+            try:
+                with alternate_file.open("rb") as stream:
+                    for raw_path in stream:
+                        value = raw_path.removesuffix(b"\n")
+                        if not value or value.startswith(b"#"):
+                            continue
+                        if value.startswith(b'"'):
+                            raise StageError("unsafe_cache", "Could not verify a quoted Git alternate object path")
+                        pending.append(objects / os.fsdecode(value))
+            except FileNotFoundError:
+                continue
 
     def validate(self, ctx):
         assert_unity_closed(self.project)

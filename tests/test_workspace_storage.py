@@ -243,3 +243,76 @@ class CacheCleanupTests(unittest.TestCase):
     def test_invalid_git_root_survives(self):
         (self.checkout / ".git").rename(self.root / "saved-git")
         self.rejected()
+
+    def test_repo_inside_outer_checkout_owns_tracked_cache(self):
+        git(self.project, "init")
+        tracked = self.cache / "local-edit"
+        tracked.write_text("baseline")
+        git(self.project, "add", "-f", "Library/local-edit")
+        git(self.project, "commit", "-m", "nested repository owns cache file")
+        tracked.write_text("uncommitted edit")
+        self.rejected()
+        self.assertEqual(tracked.read_text(), "uncommitted edit")
+
+    def test_repo_gitfile_in_intervening_ancestor_blocks_cleanup(self):
+        parent = self.checkout / "group"
+        parent.mkdir()
+        self.project = self.project.rename(parent / "Unity")
+        self.cache = self.project / "Library"
+        self.workspace.cfg.project = self.project
+        self.workspace = GitWorkspace(self.workspace.cfg)
+        (self.checkout / ".gitignore").write_text("/group/\n")
+        (parent / ".git").write_text("gitdir: missing-gitdir\n")
+        self.rejected()
+
+    def test_repo_lfs_object_from_real_clean_filter_survives(self):
+        if subprocess.run(["git", "lfs", "version"], capture_output=True).returncode:
+            self.skipTest("Git LFS clean filter unavailable")
+        git(self.checkout, "config", "lfs.storage", "../Unity/Library/lfs")
+        blob = b"this LFS object has no remote copy"
+        result = subprocess.run(["git", "lfs", "clean", "--", "asset.bin"], input=blob,
+                                cwd=self.checkout, check=True, capture_output=True)
+        oid = result.stdout.split(b"oid sha256:")[1].splitlines()[0].decode("ascii")
+        path = self.cache / "lfs/objects" / oid[:2] / oid[2:4] / oid
+        self.assertEqual(path.read_bytes(), blob)
+        self.rejected()
+        self.assertEqual(path.read_bytes(), blob)
+
+    def test_repo_configured_absolute_and_linked_lfs_stores_survive(self):
+        media = self.cache / "media"
+        media.mkdir()
+        alias = self.root / "configured"
+        self.addCleanup(directory_link(alias, media))
+        absolute = str(media).swapcase() if os.name == "nt" else str(media)
+        for location in (absolute, str(alias)):
+            with self.subTest(location=location):
+                git(self.checkout, "config", "lfs.storage", location)
+                self.rejected()
+
+    def test_repo_primary_git_objects_redirected_into_cache_survive(self):
+        objects = self.checkout / ".git/objects"
+        relocated = objects.rename(self.cache / "sole-objects")
+        self.addCleanup(directory_link(objects, relocated))
+        head = git(self.checkout, "rev-parse", "HEAD")
+        self.rejected()
+        self.assertEqual(git(self.checkout, "cat-file", "-t", head), "commit")
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended-length path")
+    def test_repo_windows_extended_length_lfs_store_survives(self):
+        media = self.cache / "media"
+        media.mkdir()
+        git(self.checkout, "config", "lfs.storage", "\\\\?\\" + str(media))
+        self.rejected()
+
+    def test_repo_alternate_git_objects_inside_cache_survive(self):
+        objects = self.checkout / ".git/objects"
+        alternate = self.cache / "borrowed"
+        oid = git(self.checkout, "hash-object", "-w", str(self.cache / "data"))
+        (alternate / oid[:2]).mkdir(parents=True)
+        loose = Path(oid[:2]) / oid[2:]
+        (objects / loose).rename(alternate / loose)
+        relative = os.path.relpath(alternate, objects).replace(os.sep, "/")
+        (objects / "info/alternates").write_bytes(os.fsencode(relative) + b"\n")
+        self.assertEqual(git(self.checkout, "cat-file", "blob", oid), "cache")
+        self.rejected()
+        self.assertEqual(git(self.checkout, "cat-file", "blob", oid), "cache")

@@ -179,5 +179,5 @@ def clean_cache(workspace: GitWorkspace, ctx, cache: CacheName) -> dict:
                              result={"remnant": str(staging)}) from error
         return {**result, "status": "cleaned", "logical_bytes": measured["logical_bytes"],
                 "volume": volume_usage(project)}
-    except (OSError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise StageError("unsafe_cache", "Could not safely access the configured checkout or cache") from error
