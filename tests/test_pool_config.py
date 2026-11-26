@@ -64,12 +64,10 @@ class PoolConfigTests(unittest.TestCase):
             self.assertEqual(legacy.legacy_slot, "worker-01")
             self.assertEqual(legacy.slots["worker-01"].settings.project, first)
 
-    def test_rejects_aliases_overlaps_and_shared_codex_home(self):
+    def test_rejects_overlapping_checkouts_and_codex_home_inside_a_checkout(self):
         load = self.config_loader()
         with test_directory() as root:
             config, first, _ = self.pool_fixture(root)
-            home = root / "codex"
-            home.mkdir()
             for override in ({"id": "worker-01"},
                              {"git_root": str(first), "project": str(first)},
                              {"git_root": str(first / "nested"), "project": str(first / "nested")}):
@@ -77,11 +75,27 @@ class PoolConfigTests(unittest.TestCase):
                     edited = deepcopy(config)
                     edited["pools"]["game"]["slots"][1].update(override)
                     load(config=edited)
-            for slot in config["pools"]["game"]["slots"]:
-                slot["codex_home"] = str(home)
-            config["codex_exe"] = sys.executable
+            config.update(codex_exe=sys.executable, codex_home=str(first / "codex"))
             with self.assertRaisesRegex(ValueError, "Codex home"):
                 load(config=config)
+
+    def test_all_slots_and_pools_share_one_worker_codex_home(self):
+        with test_directory() as root:
+            config, _, _ = self.pool_fixture(root)
+            tools = root / "tools"
+            git(root, "clone", str(root / "remote"), str(tools))
+            config["pools"]["tools"] = {**config["pools"]["game"], "slots": [
+                {"id": "tools-01", "git_root": str(tools), "project": str(tools)},
+            ]}
+            login = root / "worker-codex-home"
+            login.mkdir()
+            config.update(codex_exe=sys.executable, codex_home=str(login))
+            service = self.config_loader()(config=config)
+            self.assertEqual(set(service.slots), {"worker-01", "worker-02", "tools-01"})
+            self.assertEqual({slot.settings.codex_home for slot in service.slots.values()}, {login})
+            config.pop("codex_home")
+            with patch.dict(os.environ, {"UNITY_CODEX_HOME": str(login)}):
+                self.assertEqual({slot.settings.codex_home for slot in self.config_loader()(config=config).slots.values()}, {login})
 
     def test_marks_only_bad_slot_unavailable(self):
         load = self.config_loader()

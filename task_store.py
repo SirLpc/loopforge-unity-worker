@@ -34,7 +34,7 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
         with self.connect(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise RuntimeError(f"Unsupported Worker database version {version}")
             if version == 0:
                 self._migrate(db)
@@ -59,7 +59,10 @@ class Store:
                     queue_deadline = json_extract(data, '$.queue_deadline_at') WHERE status = 'queued'""")
                 db.execute("CREATE INDEX queue_pool_fifo ON jobs(queue_pool) WHERE status = 'queued'")
                 db.execute("CREATE INDEX queue_deadlines ON jobs(queue_deadline) WHERE status = 'queued'")
-                db.execute("PRAGMA user_version=3")
+            if version < 4:
+                # Codex authentication belongs to the service. Keep the original checkout binding.
+                db.execute("UPDATE slot_bindings SET value = json_remove(value, '$[3]') WHERE json_array_length(value) = 4")
+                db.execute("PRAGMA user_version=4")
             self._bind(db, "identity", 1, [worker_id, path_key(project)])
             self._bind(db, "service_binding", 1, [self.default_pool, self.legacy_slot])
             if config:
@@ -139,7 +142,7 @@ class Store:
             for slot in pool.slots:
                 cfg = slot.settings
                 self._bind(db, "slot_bindings", slot.id,
-                           [pool.id, path_key(cfg.checkout), path_key(cfg.project), path_key(cfg.codex_home)])
+                           [pool.id, path_key(cfg.checkout), path_key(cfg.project)])
 
     @contextmanager
     def connect(self, *, write=False):

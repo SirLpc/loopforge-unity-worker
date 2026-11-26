@@ -19,7 +19,8 @@ init_submodules = false
 # Use the native executable, e.g. the vendor codex.exe from the npm installation.
 # Leave the two entries commented out to deploy startup smoke without Codex.
 # codex_exe = 'D:\UnityWorkers\tools\codex\codex.exe'
-# codex_home = 'D:\UnityWorkers\worker-01\codex-home'
+# All pools and slots of this Worker reuse this one login.
+# codex_home = 'D:\UnityWorkers\codex-home'
 codex_sandbox = 'mxc'
 codex_timeout = 1800
 max_fixes = 3
@@ -39,7 +40,7 @@ max_diff_bytes = 2000000
 # editmode = ['Game.Tests.EditMode']
 # playmode = ['Game.Tests.PlayMode']
 
-# To use named pools, move project, git_root and codex_home into each slot.
+# To use named pools, move project and git_root into each slot. Keep Codex settings at the service level.
 # The simple single-project configuration above remains valid on its own.
 # [pools.game]
 # unity_exe = 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe'
@@ -52,10 +53,8 @@ max_diff_bytes = 2000000
 # id = "worker-01"
 # git_root = 'D:\UnityWorkers\worker-01'
 # project = 'D:\UnityWorkers\worker-01\client'
-# codex_home = 'D:\UnityWorkers\homes\worker-01'
 #
 # [[pools.game.slots]]
 # id = "worker-02"
 # git_root = 'D:\UnityWorkers\worker-02'
 # project = 'D:\UnityWorkers\worker-02\client'
-# codex_home = 'D:\UnityWorkers\homes\worker-02'

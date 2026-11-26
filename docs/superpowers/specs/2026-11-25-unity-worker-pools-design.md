@@ -17,7 +17,7 @@
 
 ## 配置、隔离与容量
 
-- `worker_id`、`logs` 和服务凭据属于服务。池模式配置 `default_pool`、`legacy_slot` 和 `[pools.<pool_id>]`，池项定义 `git_remote`、预期 `remote_identity`（沿用现有 fetch/push 远端元组的 SHA-256）、`base_branch`、`unity_exe`、`unity_version`、测试范围和 Git 缓存规则。`[[pools.<pool_id>.slots]]` 每项定义全局唯一 `id`、`git_root`、`project`、`codex_home` 及默认开启的 `enabled`。Codex 启用时每个目录有独立 Codex home。可选 PR/MR 用该池的适配器和凭据，历史默认池继承原配置。所有池使用同一个受信任的操作范围。`default_pool` 和供旧入口使用的 `legacy_slot` 随状态库固定。持久化池的仓库、分支、相对工程路径和版本，以及槽位的池和真实路径。需替换目录或仓库时排空原槽位并使用新 ID。每池新配置的交付适配器或其他执行配置变更在该池全部未结束任务处理完后生效。
+- `worker_id`、`logs`、`codex_exe`、`codex_home` 和服务凭据属于服务。池模式配置 `default_pool`、`legacy_slot` 和 `[pools.<pool_id>]`，池项定义 `git_remote`、预期 `remote_identity`（沿用现有 fetch/push 远端元组的 SHA-256）、`base_branch`、`unity_exe`、`unity_version`、测试范围和 Git 缓存规则。`[[pools.<pool_id>.slots]]` 每项定义全局唯一 `id`、`git_root`、`project` 及默认开启的 `enabled`。所有槽位复用服务顶层 `codex_home` 中的一份登录。每个任务或审查调用启动独立 Codex 会话，按所属 checkout 限制写权限。可选 PR/MR 用该池的适配器和凭据，历史默认池继承原配置。所有池使用同一个受信任的操作范围。`default_pool` 和供旧入口使用的 `legacy_slot` 随状态库固定。持久化池的仓库、分支、相对工程路径和版本，以及槽位的池和真实路径。需替换目录或仓库时排空原槽位并使用新 ID。每池新配置的交付适配器或其他执行配置变更在该池全部未结束任务处理完后生效。
 - 复用现有 Windows 项目保留锁，每个 checkout 保留一把，并加一把状态目录保留锁。规范化大小写和路径别名，拒绝重复或祖先重叠的检出、跨目录的 junction 或共享可变项目缓存。每个目录具备自身 `.git`、Unity `Library`、`Temp`、日志和依赖状态。池内仓库身份、Unity 工程相对路径、版本及基础分支配置一致。只接受配置中的命名池和目录，HTTP 请求传 `pool_id`，目录、远端和可执行文件都由 Worker 配置决定。
 - 配置结构错误会阻止启动。启动预检发现单个目录缺失、版本、远端、Git 状态或 Editor 锁异常时，只把该目录设为 `unavailable`，已绑定任务仍可查询。操作员修正后在服务重启时复检。真正切分支前再次核对清洁状态和远端身份。分配后若发现工作区异常，保留任务和现场，操作员在原目录处理并释放。其余目录继续接单。
 - 每个可用目录可持有一单。服务另设 `max_parallel_unity` 控制全机同时运行的 Unity 工具进程，首发从 1 开始，两个目录可同时跑 Git、Codex 和独立审查。通过双 Editor 实测后可设 2。Unity 启动前记录 Job 的 Editor 使用权，确认进程树退出才释放。进程状态不明或服务重启时保留该记录，按现有人工恢复流程确认停止后释放。使用权占满时，其它目录仍可启动非 Unity 阶段，进入 Unity 阶段后可取消地等待。

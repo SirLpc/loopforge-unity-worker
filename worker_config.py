@@ -309,17 +309,16 @@ def load_service_settings(*, config=None) -> ServiceSettings:
     configured_pools = config["pools"]
     if not isinstance(configured_pools, dict) or not configured_pools:
         raise ValueError("Configure at least one named pool")
-    path_fields = {"git_root", "project", "codex_home"}
+    path_fields = {"git_root", "project"}
     legacy_overrides = {"UNITY_GIT_ROOT", "UNITY_PROJECT"}
     if path_fields & config.keys() or legacy_overrides & os.environ.keys():
-        raise ValueError("Configure project, git_root and codex_home per slot in pool mode")
-    pool_overrides = {"UNITY_VERSION", "UNITY_GIT_REMOTE", "UNITY_BASE_BRANCH", "UNITY_CODEX_HOME", "UNITY_TEST_MODES"}
+        raise ValueError("Configure project and git_root per slot in pool mode")
+    pool_overrides = {"UNITY_VERSION", "UNITY_GIT_REMOTE", "UNITY_BASE_BRANCH", "UNITY_TEST_MODES"}
     environ = {key: value for key, value in os.environ.items() if key not in pool_overrides}
     common = {key: value for key, value in config.items() if key != "pools"}
     pools = {}
     slots = {}
     checkouts = []
-    codex_homes = []
     for pool_id, definition in configured_pools.items():
         if not re.fullmatch(REMOTE_PATTERN, pool_id) or not isinstance(definition, dict):
             raise ValueError("Invalid pool ID or definition")
@@ -330,13 +329,13 @@ def load_service_settings(*, config=None) -> ServiceSettings:
         if not isinstance(entries, list) or not entries:
             raise ValueError("Configure at least one slot for each pool")
         policy = {key: value for key, value in definition.items() if key not in ("slots", "pr")}
-        if path_fields & policy.keys() or {"logs", "worker_id"} & policy.keys():
-            raise ValueError("Pool options must use service state and per-slot paths")
+        if (path_fields | {"logs", "worker_id", "codex_exe", "codex_home"}) & policy.keys():
+            raise ValueError("Configure Codex and state at service level, and checkout paths per slot")
         pool_slots = []
         for entry in entries:
             if (not isinstance(entry, dict) or not {"id", "git_root", "project"} <= entry.keys()
                     or entry.keys() - (path_fields | {"id", "enabled"})):
-                raise ValueError("Each slot requires id, git_root and project")
+                raise ValueError("Each slot accepts id, git_root, project and enabled. Configure Codex home at service level.")
             slot_id, enabled = entry["id"], entry.get("enabled", True)
             if (not isinstance(slot_id, str) or not re.fullmatch(REMOTE_PATTERN, slot_id)
                     or slot_id.casefold() in slots or type(enabled) is not bool):
@@ -347,11 +346,9 @@ def load_service_settings(*, config=None) -> ServiceSettings:
             if any(overlaps(settings.checkout, target) for target in (*checkouts, settings.logs)):
                 raise ValueError("Slot checkouts, service and state must not overlap")
             if settings.codex_exe and not settings.codex_home:
-                raise ValueError("Configure a dedicated Codex home for each slot")
-            if settings.codex_home:
-                if any(overlaps(settings.codex_home, target) for target in (*codex_homes, settings.logs)):
-                    raise ValueError("Each slot requires a separate Codex home outside service state")
-                codex_homes.append(settings.codex_home)
+                raise ValueError("Configure one Codex home for the Worker service")
+            if settings.codex_home and any(overlaps(settings.codex_home, target) for target in (settings.checkout, settings.logs)):
+                raise ValueError("The shared Codex home must stay outside all slot checkouts and service state")
             checkouts.append(settings.checkout)
             slot = SlotSettings(slot_id, pool_id, enabled, settings)
             slots[slot_id.casefold()] = slot
@@ -360,8 +357,6 @@ def load_service_settings(*, config=None) -> ServiceSettings:
         if len(templates) != 1:
             raise ValueError("Slots in a pool must use the same relative Unity project path")
         pools[pool_id] = PoolSettings(pool_id, remote, tuple(pool_slots), pool_pr(definition.get("pr")))
-    if any(overlaps(home, checkout) for home in codex_homes for checkout in checkouts):
-        raise ValueError("Codex homes must stay outside all slot checkouts")
     default_pool, default_slot = config.get("default_pool"), config.get("legacy_slot")
     if not isinstance(default_pool, str) or default_pool not in pools or not any(
             slot.id == default_slot for slot in pools[default_pool].slots):

@@ -20,7 +20,7 @@ $env:UNITY_WORKER_APPROVAL_TOKEN = [System.Net.NetworkCredential]::new('', (Read
 
 两个 Token 各使用至少 32 个 ASCII 字符的独立随机值。Worker Token 交给受信任的 LoopForge SOP。Operator Token 留在授权审批者和 Windows 服务端。只部署旧 smoke 时可省略 Operator Token 和 Codex 配置。服务支持原有变量 UNITY_EXE、UNITY_PROJECT、UNITY_WORKER_LOGS、UNITY_WORKER_TOKEN、UNITY_TIMEOUT_SECONDS，环境变量覆盖 TOML。
 
-Codex 配置使用 Windows 原生 codex.exe。npm 安装的 PowerShell 和 CMD 包装器可以用来查询版本，Worker 进程使用 vendor 目录内的可执行文件。将 UNITY_CODEX_HOME 或 codex_home 指到专用且已初始化的目录。用专用账号和该 CODEX_HOME 完成 CLI 登录，或为服务注入专用 OPENAI_API_KEY / CODEX_API_KEY。每次服务首次用到 Codex 时检测 --version、exec --help 和 sandbox --help。0.172.0 的 MXC 实现及审查权限探针已实测。默认使用 mxc，允许在管理员已预配的机器上选择 elevated。权限探针失败时任务会停止。
+Codex 配置使用 Windows 原生 codex.exe。npm 安装的 PowerShell 和 CMD 包装器可以用来查询版本，Worker 进程使用 vendor 目录内的可执行文件。将 UNITY_CODEX_HOME 或 codex_home 指到专用且已初始化的目录。用专用账号在该 CODEX_HOME 登录一次，或为服务注入专用 OPENAI_API_KEY / CODEX_API_KEY。该 Worker 的所有池和槽位共用这份登录，每个任务仍启动独立 Codex 会话。每次服务首次用到 Codex 时检测 --version、exec --help 和 sandbox --help。0.172.0 的 MXC 实现及审查权限探针已实测。默认使用 mxc，允许在管理员已预配的机器上选择 elevated。权限探针失败时任务会停止。
 
 Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指向独立 Git 检出根。为项目在首次启动前恢复其固定版本依赖。`ignored_cache_paths` 可登记 Git 已忽略的具体依赖缓存路径。`allowed_tracked_outputs` 可登记基础树中的具体历史产物，任务修改这些文件时会被阻断。
 
@@ -30,7 +30,7 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 
 ## 目录池
 
-1. 为同一个受信任仓库预备至少一份独立 Git 检出。每份使用私有的 `.git`、Unity `Library`/`Temp` 和 Codex home。通过预热确认 Unity 版本、依赖、Git LFS 和选定测试均可用。两个目录的真实路径和 Codex home 必须不同。
+1. 为同一个受信任仓库预备至少一份独立 Git 检出。每份使用私有的 `.git` 和 Unity `Library`/`Temp`。通过预热确认 Unity 版本、依赖、Git LFS 和选定测试均可用。顶层 `codex_home` 或 `UNITY_CODEX_HOME` 指向所有槽位共用的登录目录，位置在所有检出和 Worker 状态目录之外。
 2. 按 [配置示例](config.example.toml) 设置 `default_pool`、`legacy_slot`、`[pools.<id>]` 与各 `slots`。显式池启用每个目录的预检。若 `GET /api/v1/pools` 显示 `unavailable`，检查该 checkout 的远端、Unity 版本、路径、Editor 锁和 Git 清洁度，修复后重启复检。
 3. `remote_identity` 是 UTF-8 `git remote get-url origin`、一个 NUL 字节、`git remote get-url --push origin` 的 SHA-256 小写十六进制。仅比较摘要。命名池需固定仓库、基础分支、Unity 版本和相对工程路径。第二个仓库用独立的池 ID。工作流用可信 `--pool` 参数选池。
 4. `max_parallel_unity` 默认 1，限制该 Worker 管理的 Editor 进程。多个任务的 Git、Codex 和审查可以重叠。确认宿主授权和容量后可调高。退出状态不明时保留 Editor 名额，核验进程后用 `recover` 释放。

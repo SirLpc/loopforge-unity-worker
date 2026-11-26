@@ -39,9 +39,9 @@
 
 **文件** `worker_config.py`、`worker.py`、`git_workspace.py`、`pull_requests.py`、`config.example.toml`、`tests/test_pool_config.py`。
 
-**接口** 保留 `Settings` 作为执行参数。增加 `load_service_settings() -> ServiceSettings`，产出 `worker_id`、`logs`、`default_pool`、`legacy_slot`、`max_parallel_unity`、`secrets` 和映射 `pools: dict[str, PoolSettings]`。`PoolSettings` 包含 `id`、`remote_identity`、`settings` 的公共执行参数、选配 `pr` 以及 `slots: tuple[SlotSettings, ...]`。`SlotSettings` 包含 `id`、`pool_id`、`enabled`、`settings: Settings`。每个 `SlotSettings.settings` 持有完整执行参数和该目录自己的 Git 根、Unity 根与 Codex home。
+**接口** 保留 `Settings` 作为执行参数。增加 `load_service_settings() -> ServiceSettings`，产出 `worker_id`、`logs`、`default_pool`、`legacy_slot`、`max_parallel_unity`、`secrets` 和映射 `pools: dict[str, PoolSettings]`。`PoolSettings` 包含 `id`、`remote_identity`、`settings` 的公共执行参数、选配 `pr` 以及 `slots: tuple[SlotSettings, ...]`。`SlotSettings` 包含 `id`、`pool_id`、`enabled`、`settings: Settings`。每个 `SlotSettings.settings` 持有完整执行参数和该目录自己的 Git 根、Unity 根，以及在 Worker 服务层统一配置的 Codex home。
 
-- [ ] 在 `PoolConfigTests` 写红测 `test_loads_two_named_pools_and_legacy_defaults`，断言显式配置的 `game` 池包含 `worker-01`、`worker-02`，`tools` 池独立，隐式配置的默认池为 `worker_id`，旧入口槽位为 `worker-01`。写 `test_rejects_aliases_overlaps_and_shared_codex_home`，逐项拒绝重复 ID、嵌套 checkout、解析后同一路径和同一 Codex home。写 `test_marks_only_bad_slot_unavailable`，断言锁住的 checkout 或不匹配的远端只影响其所在目录。
+- [ ] 在 `PoolConfigTests` 写红测 `test_loads_two_named_pools_and_legacy_defaults`，断言显式配置的 `game` 池包含 `worker-01`、`worker-02`，`tools` 池独立，隐式配置的默认池为 `worker_id`，旧入口槽位为 `worker-01`。写 `test_rejects_overlapping_checkouts_and_codex_home_inside_a_checkout`，逐项拒绝重复 ID、嵌套 checkout、解析后同一路径和位于检出内的 Codex home。用 `test_all_slots_and_pools_share_one_worker_codex_home` 核对新增目录和新增池都继承同一登录。写 `test_marks_only_bad_slot_unavailable`，断言锁住的 checkout 或不匹配的远端只影响其所在目录。
 - [ ] 运行 `python -m unittest discover -s tests -p test_pool_config.py -v`，预期先因缺少配置接口或预检失败。
 - [ ] 提取并复用现有字段校验。显式 TOML 使用 `[pools.<id>]` 与 `[[pools.<id>.slots]]`，保留顶层服务、工具默认值和凭据环境变量。显式模式拒绝含糊的顶层单目录路径或 `UNITY_PROJECT`、`UNITY_GIT_ROOT` 覆盖。验证默认池、legacy 槽位和每池至少有一个配置目录。`max_parallel_unity` 为正整数，默认 1。池内的 `project` 相对 `git_root` 一致。
 - [ ] Windows 本地目录用解析路径、大小写规范化和 OS 文件身份检查别名。拒绝跨槽的路径重解析和共享可变项目缓存。用现有 `reserve_project` 给状态目录和可打开的每个 checkout 加进程级锁。增加 `check_slot(slot: SlotSettings, pool: PoolSettings, *, leased: bool) -> str | None`，结构校验在加载时完成，运行预检返回可公开的失败类别。空闲槽预检复用 Git 清洁检查和 Unity 关闭检查，已绑定槽只验证身份及路径以便恢复。旧单目录的 smoke 配置维持对最小 Unity 项目的支持。给每个执行 `Settings` 增加 `expected_remote_identity: str | None`。`GitWorkspace.prepare` 在切分支前用原有 fetch/push 摘要核对这个值。
@@ -103,7 +103,7 @@
 **证据** 每路记录 `run_id`、`task_id`、`job_id`、`pool_id`、`slot_id`、基础提交、终态、revision、日志与测试 XML。确认并行时间窗和空闲接续时间，证据留本机 Worker 运维目录。
 
 - [ ] 在模拟工具及两份临时检出上完成全流程，先开 `game` 池两个槽，再用临时第二池验证独立排队。用审查批准、实际 commit、向临时远端 push、release 验证两个任务完整走通。用 `git diff --check` 和 Windows 全量测试验证准备部署的同一提交。
-- [ ] 计算 D 盘实际可用容量和克隆、LFS、首次导入峰值。将现有受信任仓库独立检出到 `D:\UnityWorkers\worker-02`，按项目规则初始化依赖、Git LFS 与 Codex home。用 `D:\UnityWorkers\worker-02\client` 的 `-projectPath` 做基线编译和已批准 EditMode/PlayMode 定向测试。`worker-01` 也通过当前基线核验。Unity 测试经沙箱外执行授权。
+- [ ] 计算 D 盘实际可用容量和克隆、LFS、首次导入峰值。将现有受信任仓库独立检出到 `D:\UnityWorkers\worker-02`，按项目规则初始化依赖与 Git LFS，继承 Worker 服务已有的 Codex 登录。用 `D:\UnityWorkers\worker-02\client` 的 `-projectPath` 做基线编译和已批准 EditMode/PlayMode 定向测试。`worker-01` 也通过当前基线核验。Unity 测试经沙箱外执行授权。
 - [ ] 用离线状态库备份演练迁移和 Worker 重启。等待正式 Worker 的运行中 Job 到达安全检查点，保存当前服务程序、配置、可恢复的 SQLite 备份和已发布子 SOP 定义，保留任务产物。把原目录配置为 `unity-ai-development/worker-01` 与 `legacy_slot`。加入 `worker-02` 并先设 `max_parallel_unity = 1`。启动新版，核对既有任务、批准 revision、旧 `/health` 以及两目录状态。
 - [ ] 先验证新 Worker 服务，再发布已准备的执行子 SOP。启动两条对现有项目无冲突的可回滚验收需求，第三条排队。观察两路 `-projectPath`、Git 分支、Codex 执行时间、日志归属、单个 Editor 使用权。用临时远端验收审批与交付。在正式项目选择已获批准的实际需求验证交付，或取消并安全释放验收任务。释放第一个槽位后观察第三条原 Job 启动。用清理后的独立临时池额外演练目录故障、恢复、重启和排队取消。
 - [ ] 两个正式目录用受控输入实测同时开 Editor，验证授权、进程树和报告。只有双开稳定且本机资源充足时把 `max_parallel_unity` 调到 2。否则维持 1，记录为什么编译和测试串行以及两条 SOP 并行时的实际验收结果。

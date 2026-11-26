@@ -153,3 +153,27 @@ class StoreTests(unittest.TestCase):
             upgraded = Store.open_service(config)
             with upgraded.connect() as db:
                 self.assertFalse(upgraded.has_task_permit(db, "recovered"))
+
+    def test_reusing_one_codex_home_preserves_slot_identity_and_lease(self):
+        from dataclasses import replace
+        from task_store import Store, encode, path_key
+
+        with test_directory() as root:
+            config = self.pooled_config(root)
+            store = Store.open_service(config)
+            pool = config.pools["game"]
+            with store.connect(write=True) as db:
+                for slot in pool.slots:
+                    binding = ["game", path_key(slot.settings.checkout), path_key(slot.settings.project),
+                               path_key(root / f"previous-codex-home-{slot.id}")]
+                    db.execute("UPDATE slot_bindings SET value = ? WHERE id = ?", (encode(binding), slot.id))
+                db.execute("PRAGMA user_version=3")
+                store.save_task(db, {"task_id": "retained", "worker_id": "service", "pool_id": "game",
+                                     "lease": True, "slot_id": "worker-02", "status": "awaiting_approval"})
+            shared = root / "shared-codex-home"
+            shared_slots = tuple(replace(slot, settings=replace(slot.settings, codex_home=shared)) for slot in pool.slots)
+            reopened = Store.open_service(replace(config, pools={"game": replace(pool, slots=shared_slots)}))
+            with reopened.connect() as db:
+                self.assertEqual(reopened.slot_lease(db, "worker-02")["task_id"], "retained")
+                self.assertIsNone(reopened.slot_lease(db, "worker-01"))
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
