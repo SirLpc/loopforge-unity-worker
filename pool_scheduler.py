@@ -42,7 +42,7 @@ class PoolScheduler:
                 logging.getLogger(__name__).exception("Unity workspace dispatch failed")
 
     def slot_blocked(self, slot_id):
-        return slot_id in self.unavailable or (
+        return slot_id in self.unavailable or slot_id in self.worker.maintenance or (
             slot_id == self.config.legacy_slot and self.worker.marker.exists())
 
     def _available(self, db, pool):
@@ -149,7 +149,7 @@ class PoolScheduler:
             if (task and task["status"] == "recovery_required") or (
                     slot.id == self.config.legacy_slot and self.worker.marker.exists()):
                 status = "recovery_required"
-            elif slot.id in self.unavailable:
+            elif slot.id in self.unavailable or slot.id in self.worker.maintenance:
                 status = "unavailable"
             elif task:
                 status = "leased"

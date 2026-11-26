@@ -1,5 +1,6 @@
 """Operate on a single resident Git checkout. Preserve unknown work and caches."""
 
+import os
 import re
 from dataclasses import dataclass
 from hashlib import sha256
@@ -93,6 +94,34 @@ class GitWorkspace:
         git_dir = self.text(ctx, "rev-parse", "--absolute-git-dir")
         if type(self.root)(git_dir).resolve() != self.root / ".git":
             raise StageError("invalid_repository", "Use a standalone Git checkout with its own .git directory")
+
+    def assert_disposable_cache(self, ctx, target: Path) -> None:
+        self.validate(ctx)
+        relative = target.relative_to(self.root).as_posix()
+        cache = Path(relative)
+
+        def contains_tracked_path(output):
+            with output.open("rb") as stream:
+                pending = b""
+                while chunk := stream.read(1024 * 1024):
+                    rows = (pending + chunk).split(b"\0")
+                    pending = rows.pop()
+                    for row in rows:
+                        path = Path(os.fsdecode(row))
+                        if path.is_relative_to(cache) or cache.is_relative_to(path):
+                            return True
+                if pending:
+                    raise StageError("unsafe_cache", "Incomplete Git path listing")
+            return False
+
+        for command in (("ls-files", "--cached", "-z"), ("ls-tree", "-r", "--name-only", "-z", "HEAD")):
+            if self.git(ctx, *command, limit=None, read=contains_tracked_path)[1]:
+                raise StageError("unsafe_cache", "The Git index or HEAD tracks a path overlapping this cache")
+        ignored, _ = self.git(ctx, "check-ignore", "--quiet", "--no-index", "--", relative, allowed=(0, 1))
+        if ignored or self.git(ctx, "--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z",
+                               "--", relative)[1]:
+            raise StageError("unsafe_cache", "The cache contains a path that Git does not ignore")
+
     def validate(self, ctx):
         assert_unity_closed(self.project)
         self.validate_checkout_identity(ctx)

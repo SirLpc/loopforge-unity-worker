@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from artifacts import artifact_bytes, log_page, safe_child, task_directory
 from development import DevelopmentWorker, RequestConflict, SlotNotFound, TaskNotFound
-from process_runner import reserve_project
+from process_runner import StageError, reserve_project
 from pull_requests import HostedPullRequests
 from worker_config import REMOTE_PATTERN, Settings, legacy_service, load_service_settings
 from workspace_storage import CacheName
@@ -30,6 +30,11 @@ class Body(BaseModel):
 
 class SmokeRequest(Body):
     job_id: UUID
+
+
+class CleanRequest(Body):
+    cache: CacheName
+    confirmed: Annotated[bool, Field(strict=True)]
 
 
 class OperationRequest(Body):
@@ -214,6 +219,17 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     @app.get("/api/v1/storage/slots/{slot_id}", dependencies=[Depends(operator)])
     def storage_slot(slot_id: str, cache: CacheName | None = None):
         return worker().storage_measure(slot_id, cache)
+
+    @app.post("/api/v1/storage/slots/{slot_id}/clean", dependencies=[Depends(operator)])
+    def clean_storage(slot_id: str, body: CleanRequest, request: Request):
+        if request.query_params:
+            raise HTTPException(422, "Cache cleanup accepts only the confirmed request body")
+        if not body.confirmed:
+            raise HTTPException(422, "Confirm the cache cleanup")
+        try:
+            return worker().clean_storage(slot_id, body.cache)
+        except StageError as error:
+            return JSONResponse(status_code=409, content=worker().clean_output({"detail": str(error), **error.result}))
 
     @app.post("/api/v1/tasks", status_code=202)
     def create_task(request: TaskRequest):

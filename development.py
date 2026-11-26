@@ -5,6 +5,8 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import get_args
 from uuid import uuid4
@@ -19,7 +21,7 @@ from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
 from worker_config import Settings, check_slot, legacy_service, validate_test_selection
-from workspace_storage import CacheName, measure_directory, volume_usage
+from workspace_storage import CacheName, clean_cache, cleanup_remnants, measure_directory, volume_usage
 
 
 STAGES = {
@@ -69,6 +71,8 @@ class DevelopmentWorker:
         self.marker = safe_child(self.cfg.logs, "active.lock")
         self.guard = threading.RLock()
         self.active = {}
+        self.maintenance = set()
+        self.cleanup_remnants = {}
         self.stopping = False
         self.store.recover_interrupted()
         self.workspaces = {}
@@ -81,6 +85,8 @@ class DevelopmentWorker:
             self.workspaces[slot.id] = SimpleNamespace(git=GitWorkspace(cfg),
                                                         unity=UnityExecutor(cfg, permit=self.scheduler.unity_permit),
                                                         agent=agent or CodexExecutor(cfg), settings=cfg)
+            if slot.id not in rejected:
+                self.check_cleanup_remnants(slot.id, cfg.project)
             if not self.cfg.implicit and slot.id not in rejected:
                 with self.store.connect() as db:
                     leased = self.store.slot_lease(db, slot.id) is not None
@@ -90,10 +96,24 @@ class DevelopmentWorker:
     def start(self):
         self.scheduler.start()
 
+    def check_cleanup_remnants(self, slot_id, project):
+        try:
+            remnants = cleanup_remnants(project)
+            if not remnants:
+                return
+            reason = "cleanup_remnant"
+        except (OSError, StageError):
+            remnants = ()
+            reason = "workspace_unavailable"
+        with self.guard:
+            self.scheduler.unavailable[slot_id] = reason
+            if remnants:
+                self.cleanup_remnants[slot_id] = [str(path) for path in remnants]
+
     def shutdown_when_idle(self):
         with self.guard:
             self.stopping = True
-            return not self.active
+            return not self.active and not self.maintenance
 
     def close(self):
         with self.guard:
@@ -131,10 +151,17 @@ class DevelopmentWorker:
             return [self.scheduler.pool_status(db, pool) for pool in self.cfg.pools.values()]
 
     def storage_overview(self) -> dict:
-        pools = self.pools()
+        with self.guard:
+            pools = self.pools()
+            maintenance = self.maintenance.copy()
+            remnants = self.cleanup_remnants.copy()
         slots = self.cfg.slots
         for pool in pools:
             for slot in pool["slots"]:
+                if slot["id"] in maintenance:
+                    slot["status"] = "maintenance"
+                if slot["id"] in remnants:
+                    slot["cleanup_remnants"] = remnants[slot["id"]]
                 path = slots[slot["id"]].settings.checkout
                 slot.update(path=str(path), volume=volume_usage(path))
         state = {"path": str(self.cfg.logs), "volume": volume_usage(self.cfg.logs)}
@@ -155,6 +182,39 @@ class DevelopmentWorker:
                 root = slot.settings.project / cache
                 groups = {cache: root}
         return self.clean_output({**measure_directory(root, groups), "volume": volume_usage(root)})
+
+    def clean_storage(self, slot_id: str, cache: CacheName) -> dict:
+        logger = logging.getLogger("uvicorn.error")
+        with self.guard:
+            workspace = self.workspaces.get(slot_id)
+            if workspace is None:
+                raise SlotNotFound
+            label = self.clean_output(f"{slot_id}/{cache}")
+            logger.info("Cache cleanup requested for %s", label)
+            with self.store.connect() as db:
+                if self.stopping or self.scheduler.slot_blocked(slot_id) or self.store.slot_lease(db, slot_id):
+                    logger.info("Cache cleanup blocked for %s", label)
+                    raise RequestConflict("Worker busy or blocked")
+            self.maintenance.add(slot_id)
+        try:
+            with TemporaryDirectory(prefix="cache-probe-", dir=self.cfg.logs) as temporary:
+                directory = Path(temporary)
+                def run(argv, label, **kwargs):
+                    return self.runner.run(argv, prefix=directory / label, **kwargs)
+                result = clean_cache(workspace.git, SimpleNamespace(directory=directory, run=run), cache)
+            logger.info("Cache cleanup %s for %s", result["status"], label)
+            return self.clean_output(result)
+        except StageError as error:
+            logger.info("Cache cleanup failed for %s (%s)", label, error.kind)
+            raise
+        except OSError as error:
+            logger.info("Cache cleanup failed for %s (filesystem error)", label)
+            raise StageError("cleanup_failed", "Could not complete cache maintenance") from error
+        finally:
+            self.check_cleanup_remnants(slot_id, workspace.settings.project)
+            with self.guard:
+                self.maintenance.remove(slot_id)
+                self.scheduler.wake.set()
 
     def worker(self, *, legacy=False):
         with self.store.connect() as db:

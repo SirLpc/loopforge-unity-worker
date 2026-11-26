@@ -5,10 +5,15 @@ import shutil
 import stat
 from collections import Counter
 from pathlib import Path
-from typing import Literal
+from tempfile import mkdtemp
+from typing import Literal, get_args
+
+from git_workspace import GitWorkspace
+from process_runner import StageError
 
 
 CacheName = Literal["Library", "Temp", "Obj"]
+STAGING_PREFIX = ".unity-worker-cleanup-"
 
 
 def is_link(metadata: os.stat_result) -> bool:
@@ -36,7 +41,7 @@ def _directory_identity(path: Path) -> tuple[tuple[int, int], ...] | None:
     return tuple(identity)
 
 
-def measure_directory(root: Path, groups: dict[str, Path]) -> dict:
+def measure_directory(root: Path, groups: dict[str, Path], *, for_cleanup=False) -> dict:
     root = root.absolute()
     buckets = dict.fromkeys((*groups, "other"), 0)
     group_paths = {root / path: name for name, path in groups.items()}
@@ -64,6 +69,7 @@ def measure_directory(root: Path, groups: dict[str, Path]) -> dict:
 
         sizes = Counter()
         children = []
+        git_markers = set()
         read_errors = skipped_links = 0
         try:
             with os.scandir(directory) as entries:
@@ -73,6 +79,13 @@ def measure_directory(root: Path, groups: dict[str, Path]) -> dict:
                     except OSError:
                         read_errors += 1
                         continue
+                    if for_cleanup:
+                        name = entry.name.casefold()
+                        if name == ".git":
+                            raise StageError("unsafe_cache", "The cache contains an embedded Git repository")
+                        if (name == "head" and stat.S_ISREG(metadata.st_mode)) or (
+                                name in {"objects", "refs", "reftable"} and stat.S_ISDIR(metadata.st_mode)):
+                            git_markers.add(name)
                     if is_link(metadata):
                         skipped_links += 1
                         continue
@@ -82,8 +95,12 @@ def measure_directory(root: Path, groups: dict[str, Path]) -> dict:
                         children.append((path, entry_bucket, identity))
                     elif stat.S_ISREG(metadata.st_mode):
                         sizes[entry_bucket] += metadata.st_size
+                    elif for_cleanup:
+                        raise StageError("unsafe_cache", "The cache contains a special filesystem entry")
         except OSError:
             read_errors += 1
+        if {"head", "objects"} <= git_markers and git_markers & {"refs", "reftable"}:
+            raise StageError("unsafe_cache", "The cache contains an embedded bare Git repository")
 
         # shortcut: path checks are best effort, use handle-relative traversal for hostile changes.
         try:
@@ -105,3 +122,62 @@ def measure_directory(root: Path, groups: dict[str, Path]) -> dict:
     result["logical_bytes"] = sum(buckets.values())
     result["complete"] = not (result["skipped_links"] or result["read_errors"])
     return result
+
+
+def cleanup_remnants(project: Path) -> tuple[Path, ...]:
+    if _directory_identity(project) is None:
+        raise StageError("unsafe_cache", "The project path contains a link or reparse point")
+    with os.scandir(project) as entries:
+        return tuple(project / entry.name for entry in entries if os.path.normcase(entry.name).startswith(STAGING_PREFIX))
+
+
+def clean_cache(workspace: GitWorkspace, ctx, cache: CacheName) -> dict:
+    project = workspace.project
+    if cache not in get_args(CacheName) or not project.is_relative_to(workspace.root):
+        raise StageError("unsafe_cache", "Invalid project or cache path")
+    target = project / cache
+    result = {"cache": cache, "path": str(target)}
+    try:
+        if cleanup_remnants(project):
+            raise StageError("unsafe_cache", "A previous cleanup needs attention")
+        if _directory_identity(workspace.root / ".git") is None:
+            raise StageError("unsafe_cache", "The Git directory contains a link or reparse point")
+        # A missing lock is safe. Inaccessible locks and dangling links are indeterminate.
+        for directory in (project / "Temp", project / "Library"):
+            try:
+                if _directory_identity(directory) is None:
+                    raise StageError("unsafe_cache", "Cannot verify Unity locks through a filesystem link")
+                (directory / "UnityLockfile").lstat()
+            except FileNotFoundError:
+                continue
+            raise StageError("workspace_in_use", "Unity project lock exists. Close the Editor or verify the stale lock.")
+        try:
+            identity = _directory_identity(target)
+        except FileNotFoundError:
+            workspace.validate_checkout_identity(ctx)
+            return {**result, "status": "missing", "logical_bytes": 0, "volume": volume_usage(project)}
+        if identity is None:
+            raise StageError("unsafe_cache", "The cache path contains a link or reparse point")
+        workspace.assert_disposable_cache(ctx, target)
+        measured = measure_directory(target, {}, for_cleanup=True)
+        if not measured["complete"] or not measured["exists"] or _directory_identity(target) != identity:
+            raise StageError("unsafe_cache", "Could not verify every entry in the cache")
+        staging = Path(mkdtemp(prefix=STAGING_PREFIX, dir=project))
+        try:
+            target.rename(staging / cache)
+        except OSError:
+            try:
+                staging.rmdir()
+            except OSError as error:
+                raise StageError("cleanup_failed", "Inspect the remaining cleanup directory",
+                                 result={"remnant": str(staging)}) from error
+            raise
+        try:
+            shutil.rmtree(staging)
+        except OSError as error:
+            raise StageError("cleanup_failed", "Inspect the remaining cleanup directory",
+                             result={"remnant": str(staging)}) from error
+        return {**result, "status": "cleaned", "logical_bytes": measured["logical_bytes"],
+                "volume": volume_usage(project)}
+    except (OSError, ValueError) as error:
+        raise StageError("unsafe_cache", "Could not safely access the configured checkout or cache") from error

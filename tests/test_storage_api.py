@@ -1,12 +1,17 @@
 import os
+import shutil
 import sys
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from support import test_directory
+from test_workspace_storage import cache_checkout
 from worker import create_app
 from worker_config import Settings, load_service_settings
 
@@ -149,3 +154,195 @@ class StorageApiTests(unittest.TestCase):
             self.assertEqual(client.get(f"{STORAGE}/slots/unknown", headers=OPERATOR).status_code, 404)
             response = client.get(LEGACY_SLOT, headers=OPERATOR, params={"cache": "../Library"})
             self.assertEqual(response.status_code, 422, response.text)
+
+
+class CleanStorageApiTests(unittest.TestCase):
+    def setUp(self):
+        self.root = self.enterContext(test_directory())
+        self.checkout, self.project = cache_checkout(self.root)
+        self.logs = self.root / "logs"
+        self.settings = Settings.load(config={"project": str(self.project), "git_root": str(self.checkout),
+                                              "logs": str(self.logs), "unity_exe": sys.executable}, environ=ENV)
+        self.body = {"cache": "Library", "confirmed": True}
+        self.url = LEGACY_SLOT + "/clean"
+
+    def client(self):
+        return TestClient(create_app(self.settings), headers=OPERATOR)
+
+    def use_named_pool(self, *, enabled=True):
+        sibling = self.root / "sibling"
+        (sibling / "Unity").mkdir(parents=True)
+        with patch.dict(os.environ, ENV):
+            self.settings = load_service_settings(config={
+                "logs": str(self.logs), "unity_exe": sys.executable, "unity_version": "2022.3.62f3",
+                "default_pool": "game", "legacy_slot": "worker-01",
+                "pools": {"game": {"remote_identity": "a" * 64, "slots": [
+                    {"id": "worker-01", "git_root": str(self.checkout), "project": str(self.project),
+                     "enabled": enabled},
+                    {"id": "worker-02", "git_root": str(sibling), "project": str(sibling / "Unity")},
+                ]}},
+            })
+        self.enterContext(patch("development.check_slot", return_value=None))
+
+    def test_operator_confirmation_and_fixed_cache_are_required(self):
+        with TestClient(create_app(self.settings)) as client:
+            for headers, code in (({}, 401), ({"Authorization": f"Bearer {TOKEN}"}, 403)):
+                self.assertEqual(client.post(self.url, json=self.body, headers=headers).status_code, code)
+            for body in ({"cache": "Library"}, {**self.body, "confirmed": False}, {**self.body, "confirmed": 1},
+                         {**self.body, "confirmed": "true"}, {**self.body, "cache": "../Assets"},
+                         {**self.body, "path": str(self.checkout)}):
+                with self.subTest(body=body):
+                    self.assertEqual(client.post(self.url, json=body, headers=OPERATOR).status_code, 422)
+            self.assertEqual(client.post(STORAGE + "/slots/unknown/clean", json=self.body,
+                                         headers=OPERATOR).status_code, 404)
+            self.assertEqual(client.post(self.url, params={"path": str(self.checkout)},
+                                         json=self.body, headers=OPERATOR).status_code, 422)
+            self.assertEqual((self.project / "Library/data").read_bytes(), b"cache")
+
+    def test_confirmed_cleanup_removes_only_selected_cache_and_reports_missing_on_retry(self):
+        (self.project / "Temp").mkdir()
+        (self.project / "Temp/keep").write_text("another cache")
+        with self.client() as client:
+            sentinel = self.logs / "evidence"
+            sentinel.write_text("state")
+            head = self.checkout / ".git/HEAD"
+            original_head = head.read_bytes()
+            result = client.post(self.url, json=self.body)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["status"], "cleaned")
+            self.assertEqual(result.json()["cache"], "Library")
+            self.assertEqual(result.json()["logical_bytes"], 5)
+            self.assertEqual(result.json()["path"], str(self.project / "Library"))
+            self.assertGreater(result.json()["volume"]["total_bytes"], 0)
+            self.assertFalse((self.project / "Library").exists())
+            self.assertEqual(client.post(self.url, json=self.body).json()["status"], "missing")
+            self.assertEqual((self.project / "Temp/keep").read_text(), "another cache")
+            self.assertEqual(sentinel.read_text(), "state")
+            self.assertEqual(head.read_bytes(), original_head)
+
+    def test_marker_and_stopping_prevent_cleanup(self):
+        with self.client() as client:
+            marker = self.logs / "active.lock"
+            marker.touch()
+            self.assertEqual(client.post(self.url, json=self.body).status_code, 409)
+            marker.unlink()
+            self.assertTrue(client.app.state.worker.shutdown_when_idle())
+            self.assertEqual(client.post(self.url, json=self.body).status_code, 409)
+            self.assertTrue((self.project / "Library/data").exists())
+
+    def test_disabled_drained_slot_accepts_cleanup(self):
+        self.use_named_pool(enabled=False)
+        with self.client() as client:
+            self.assertEqual(client.post(self.url, json=self.body).status_code, 200)
+
+    def test_failed_deletion_blocks_slot_until_operator_removes_remnant_and_restarts(self):
+        rmtree = shutil.rmtree
+        def fail_staging(path, *args, **kwargs):
+            if Path(path).name.startswith(".unity-worker-cleanup-"):
+                raise PermissionError("fixture")
+            return rmtree(path, *args, **kwargs)
+
+        with self.client() as client, patch("shutil.rmtree", side_effect=fail_staging):
+            result = client.post(self.url, json=self.body)
+            self.assertEqual(result.status_code, 409, result.text)
+            remnant = Path(result.json()["remnant"])
+            self.assertEqual(remnant.parent, self.project)
+            self.assertEqual((remnant / "Library/data").read_bytes(), b"cache")
+            self.assertFalse((self.project / "Library").exists())
+            slot = client.get(STORAGE).json()["pools"][0]["slots"][0]
+            self.assertEqual(slot["status"], "unavailable")
+            self.assertEqual(slot.get("cleanup_remnants"), [str(remnant)])
+        with self.client() as client:
+            self.assertEqual(client.post(self.url, json=self.body).status_code, 409)
+            self.assertEqual(client.get(STORAGE).json()["pools"][0]["slots"][0]["cleanup_remnants"], [str(remnant)])
+            self.assertNotIn("cleanup_remnants", client.get("/api/v1/pools").json()["pools"][0]["slots"][0])
+        rmtree(remnant)
+        with self.client() as client:
+            self.assertEqual(client.get(STORAGE).json()["pools"][0]["slots"][0]["status"], "idle")
+
+    def test_named_pool_restart_blocks_only_slot_with_remnant(self):
+        self.use_named_pool()
+        remnant = self.project / ".unity-worker-cleanup-leftover"
+        remnant.mkdir()
+        with self.client() as client:
+            slots = client.get(STORAGE).json()["pools"][0]["slots"]
+            self.assertEqual([slot["status"] for slot in slots], ["unavailable", "idle"])
+            self.assertEqual(slots[0].get("cleanup_remnants"), [str(remnant)])
+
+    def test_failed_move_with_empty_staging_remnant_blocks_slot(self):
+        rmdir = Path.rmdir
+        def fail_staging(path):
+            if path.name.startswith(".unity-worker-cleanup-"):
+                raise PermissionError("fixture")
+            return rmdir(path)
+        with self.client() as client, patch.object(Path, "rename", side_effect=PermissionError("fixture")), \
+                patch.object(Path, "rmdir", fail_staging):
+            response = client.post(self.url, json=self.body)
+            self.assertEqual(response.status_code, 409, response.text)
+            remnant = Path(response.json()["remnant"])
+            self.assertEqual(remnant.parent, self.project)
+            self.assertEqual(list(remnant.iterdir()), [])
+            self.assertEqual((self.project / "Library/data").read_bytes(), b"cache")
+            self.assertEqual(client.get(STORAGE).json()["pools"][0]["slots"][0]["status"], "unavailable")
+
+    def hold_deletion(self):
+        entered, resume = threading.Event(), threading.Event()
+        rmtree = shutil.rmtree
+
+        def hold_staging(path, *args, **kwargs):
+            if Path(path).name.startswith(".unity-worker-cleanup-"):
+                entered.set()
+                if not resume.wait(15):
+                    raise TimeoutError("cleanup was not resumed")
+            return rmtree(path, *args, **kwargs)
+
+        return entered, resume, patch("shutil.rmtree", side_effect=hold_staging)
+
+    def test_maintenance_excludes_smoke_and_dispatches_queue_after_cleanup(self):
+        self.use_named_pool()
+        entered, resume, paused_deletion = self.hold_deletion()
+        assigned = threading.Event()
+
+        def prepare(ctx):
+            if ctx.task["slot_id"] == "worker-01":
+                assigned.set()
+            return {}
+
+        with self.client() as client, paused_deletion, \
+                patch("development.DevelopmentWorker.stage_prepare", side_effect=prepare), ThreadPoolExecutor(1) as pool:
+            cleanup = pool.submit(client.post, self.url, json=self.body)
+            try:
+                self.assertTrue(entered.wait(5), "cleanup failed to reach staged deletion")
+                self.assertEqual(client.post(self.url, json=self.body).status_code, 409)
+                self.assertEqual(client.post("/jobs", json={"job_id": str(uuid4())}).status_code, 409)
+                for path, status in ((STORAGE, "maintenance"), ("/api/v1/pools", "unavailable")):
+                    self.assertEqual(client.get(path).json()["pools"][0]["slots"][0]["status"], status)
+                for index in range(2):
+                    created = client.post("/api/v1/tasks", json={"request_id": str(uuid4()), "requirement": "task",
+                                          "plan": "plan", "acceptance_criteria": ["done"]}).json()
+                    task = f"/api/v1/tasks/{created['task_id']}"
+                    job = client.post(task + "/prepare", json={"request_id": str(uuid4()), "queue_wait_seconds": 30})
+                    self.assertEqual(job.status_code, 202, job.text)
+                    if index == 0:
+                        self.assertEqual(client.get(task).json()["slot_id"], "worker-02")
+                        sibling = f"{STORAGE}/slots/worker-02/clean"
+                        self.assertEqual(client.post(sibling, json=self.body).status_code, 409)
+                    else:
+                        self.assertEqual(job.json()["status"], "queued")
+            finally:
+                resume.set()
+            self.assertEqual(cleanup.result().status_code, 200)
+            self.assertTrue(assigned.wait(5))
+            self.assertEqual(client.get(task).json()["slot_id"], "worker-01")
+
+    def test_shutdown_waits_for_maintenance(self):
+        entered, resume, paused_deletion = self.hold_deletion()
+        with self.client() as client, paused_deletion, ThreadPoolExecutor(1) as pool:
+            cleanup = pool.submit(client.post, self.url, json=self.body)
+            try:
+                self.assertTrue(entered.wait(5), "cleanup failed to reach staged deletion")
+                self.assertFalse(client.app.state.worker.shutdown_when_idle())
+            finally:
+                resume.set()
+            self.assertEqual(cleanup.result().status_code, 200)
+            self.assertTrue(client.app.state.worker.shutdown_when_idle())

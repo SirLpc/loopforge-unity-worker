@@ -1,11 +1,17 @@
 import os
+import shutil
 import subprocess
 import unittest
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from support import test_directory
+from git_workspace import GitWorkspace
+from process_runner import ProcessRunner, StageError
+from test_workspace import git
+import workspace_storage
 from workspace_storage import measure_directory, volume_usage
 
 
@@ -129,3 +135,111 @@ class WorkspaceStorageTests(unittest.TestCase):
     def test_unavailable_volume_uses_null_capacity(self):
         with test_directory() as root, patch("shutil.disk_usage", side_effect=OSError):
             self.assertEqual(volume_usage(root), {"total_bytes": None, "free_bytes": None})
+
+
+def cache_checkout(root):
+    checkout = root / "checkout"
+    project = checkout / "Unity"
+    (project / "Library").mkdir(parents=True)
+    (project / "Library/data").write_bytes(b"cache")
+    (project / "ProjectSettings").mkdir()
+    (project / "ProjectSettings/ProjectVersion.txt").write_text("m_EditorVersion: 2022.3.62f3\n")
+    (checkout / ".gitignore").write_text("/Unity/Library/\n/Unity/Temp/\n/Unity/Obj/\n")
+    git(checkout, "init")
+    git(checkout, "add", ".gitignore", "Unity/ProjectSettings")
+    git(checkout, "commit", "-m", "baseline")
+    return checkout, project
+
+
+class CacheCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.root = self.enterContext(test_directory())
+        self.checkout, self.project = cache_checkout(self.root)
+        self.cache = self.project / "Library"
+        cfg = SimpleNamespace(project=self.project, git_root=self.checkout, git_exe=shutil.which("git"),
+                              git_timeout=10, secrets=())
+        self.workspace = GitWorkspace(cfg)
+        runner = ProcessRunner()
+        self.ctx = SimpleNamespace(directory=self.root, run=lambda argv, label, **kw:
+                                   runner.run(argv, prefix=self.root / label, **kw))
+
+    def rejected(self):
+        with self.assertRaises(StageError):
+            workspace_storage.clean_cache(self.workspace, self.ctx, "Library")
+        self.assertEqual((self.cache / "data").read_bytes(), b"cache")
+
+    def test_index_and_head_only_files_survive(self):
+        git(self.checkout, "add", "-f", "--", "Unity/Library/data")
+        self.rejected()
+        git(self.checkout, "commit", "-m", "cache file")
+        git(self.checkout, "rm", "--cached", "Unity/Library/data")
+        self.rejected()
+
+    @unittest.skipUnless(os.name == "nt", "Windows path case")
+    def test_different_case_tracked_path_survives(self):
+        git(self.checkout, "update-index", "--add", "--cacheinfo",
+            f"100644,{git(self.checkout, 'rev-parse', 'HEAD:.gitignore')},unity/library/data")
+        self.rejected()
+
+    def test_gitlink_covering_project_survives(self):
+        git(self.checkout, "rm", "-r", "--cached", "Unity")
+        git(self.checkout, "update-index", "--add", "--cacheinfo",
+            f"160000,{git(self.checkout, 'rev-parse', 'HEAD')},Unity")
+        self.rejected()
+
+    def test_unignored_cache_and_embedded_repository_survive(self):
+        ignore = self.checkout / ".gitignore"
+        rules = ignore.read_text()
+        ignore.write_text("/Unity/Library/*.tmp\n")
+        self.rejected()
+        ignore.write_text(rules)
+        git(self.cache, "init", "nested")
+        self.rejected()
+
+    def test_embedded_bare_repository_survives(self):
+        git(self.cache, "init", "--bare", "repo")
+        self.rejected()
+
+    def test_unity_lock_and_uncertain_directory_are_protected(self):
+        (self.project / "Temp").mkdir()
+        lock = self.project / "Temp/UnityLockfile"
+        lock.touch()
+        self.rejected()
+        lock.unlink()
+        scandir = os.scandir
+        def fail_cache_scan(path):
+            if Path(path) == self.cache:
+                raise PermissionError("fixture")
+            return scandir(path)
+        with patch("os.scandir", side_effect=fail_cache_scan):
+            self.rejected()
+
+    def test_uncertain_unity_lock_check_preserves_cache(self):
+        (self.project / "Temp").mkdir()
+        lock = self.project / "Temp/UnityLockfile"
+        lstat = os.lstat
+        def denied(path, *args, **kwargs):
+            if Path(path) == lock:
+                raise PermissionError("fixture")
+            return lstat(path, *args, **kwargs)
+        with patch("os.lstat", side_effect=denied):
+            self.rejected()
+
+    def test_directory_links_at_and_below_cache_or_in_project_path_survive(self):
+        external = self.root / "external"
+        external.mkdir()
+        (external / "data").write_bytes(b"cache")
+        for path in (self.cache / "nested", self.cache, self.project):
+            with self.subTest(path=path), ExitStack() as cleanup:
+                if path.exists():
+                    original = self.root / "original"
+                    path.rename(original)
+                    cleanup.callback(original.rename, path)
+                else:
+                    original = external
+                cleanup.callback(directory_link(path, original))
+                self.rejected()
+
+    def test_invalid_git_root_survives(self):
+        (self.checkout / ".git").rename(self.root / "saved-git")
+        self.rejected()
