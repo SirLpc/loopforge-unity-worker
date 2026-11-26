@@ -10,6 +10,7 @@ import secrets
 import subprocess
 import time
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -123,22 +124,58 @@ def public_feedback(value):
     return re.sub(r"[\udc80-\udcff]", "\ufffd", clipped) + "…"
 
 
-def full_rejection_feedback(run, feedback, reader):
-    gate = run["nodes"]["accept"]
-    source = {}
-    retry = None
-    for event in reversed(run.get("events", [])):
-        if event.get("runId") != run["id"]:
-            continue
-        if event.get("nodeId") == "accept" and event.get("type") in {"gate.rejected", "node.started"}:
-            source = event
-            break
-        if retry is None and event.get("nodeId") == "implement" and event.get("type") == "node.retry_requested":
-            retry = event["message"]
+def latest_control(run, node, names, reader, *, after=0):
+    # The detail and telemetry reads are separate requests. Only inspect the
+    # immutable sequence range visible when we read the current node attempts.
+    limit = 50
+    before = run.get("telemetrySequence", 0) + 1
+    if not reader or before <= 1:
+        raise ContextError("No telemetry snapshot for the current rejection")
+    for _ in range(20):
+        path = f"/api/runs/{run['id']}/telemetry?expanded=true&nodeId={node}&limit={limit}&before={before}"
+        page = reader(path)
+        events = page["events"]
+        if (page.get("runId") != run["id"] or page["sequence"] < run["telemetrySequence"]
+                or not isinstance(events, list) or len(events) > limit):
+            raise ContextError("Invalid scoped telemetry page")
+        for event in reversed(events):
+            seq = event["sequence"]
+            if event.get("runId") != run["id"] or event.get("nodeId") != node or not 0 < seq < before:
+                raise ContextError("Telemetry event falls outside the requested run or cursor")
+            if seq <= after:
+                return None
+            before = seq
+            if (event.get("category") == "verification" and event.get("name") in names
+                    and event.get("phase") == "finish" and not (event.get("source") or {}).get("adapter")):
+                return event
+        if not page["hasMore"]:
+            return None
+        if not events or page["nextBefore"] != before:
+            raise ContextError("Invalid backward telemetry cursor")
+    raise ContextError("Rejection control exceeded the telemetry search window")
+
+
+def control_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def full_rejection_feedback(run, feedback, reader, telemetry_reader):
+    gate, implementation = run["nodes"]["accept"], run["nodes"]["implement"]
+    source = latest_control(run, "accept", {"gate.rejected", "gate.approved", "node.passed"}, telemetry_reader)
     prefix = "打回到 implement："
-    if (source.get("runId") != run["id"] or source.get("type") != "gate.rejected"
-            or not source.get("message", "").startswith(prefix)):
+    if not source or source["name"] != "gate.rejected" or not source["message"].startswith(prefix):
         raise ContextError("Full rejection feedback is unavailable for this implementation round")
+    # Engine control telemetry has no context.attempt. Node start times bind
+    # this decision to the current acceptance attempt and implementation attempt.
+    rejected = control_time(source["timestamp"])
+    started = control_time(implementation["startedAt"])
+    if (gate["status"] != "pending" or gate["attempt"] < 1
+            or not control_time(gate["startedAt"]) <= rejected <= started):
+        raise ContextError("Rejection does not belong to the current gate attempt")
+    retry = latest_control(run, "implement", {"node.retry_requested"}, telemetry_reader, after=source["sequence"])
+    if retry and not rejected <= control_time(retry["timestamp"]) <= started:
+        raise ContextError("Retry does not belong to the current implementation attempt")
+
     reason = source["message"][len(prefix):].strip()
     notes = [a for a in run.get("artifacts", []) if a.get("nodeId") == "accept" and a.get("name") == "human-context"
              and a.get("attempt") == gate["attempt"]]
@@ -152,7 +189,7 @@ def full_rejection_feedback(run, feedback, reader):
         reason = (reason + "\n\n" if reason else "") + "人工补充上下文：\n" + context
     displayed = reason
     if retry is not None:
-        label, separator, note = retry.partition("：")
+        label, separator, note = retry["message"].partition("：")
         if not separator or label not in {"从指定节点重跑", "从中断处继续"}:
             raise ContextError("Unknown implementation retry feedback")
         displayed = note
@@ -162,7 +199,7 @@ def full_rejection_feedback(run, feedback, reader):
 
 
 
-def feature_context(run, run_id, project_id, artifact_reader, approval_key, now):
+def feature_context(run, run_id, project_id, artifact_reader, approval_key, now, *, telemetry_reader=None):
     from workflow_approval import sign_approval
 
     workflow_id = project_id + "-feature"
@@ -193,8 +230,8 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now)
                "operation": "feature-" + ("delivery" if node == "deliver" else node)}
     if node == "implement" and rework:
         try:
-            context["feedback"] = full_rejection_feedback(run, feedback, artifact_reader)
-        except (ContextError, UnicodeError) as error:
+            context["feedback"] = full_rejection_feedback(run, feedback, artifact_reader, telemetry_reader)
+        except (ContextError, KeyError, OSError, TypeError, ValueError) as error:
             context.update(feedback="", feedback_error=str(error))
     if node == "clarify":
         requirement = run.get("input", "").strip()
@@ -323,7 +360,8 @@ def publish_workspace_contexts(workspace_root, context_secret, platform_call, pr
                     continue
                 def artifact_reader(identifier):
                     return platform_call("/api/runs/" + run_id + "/artifacts/" + identifier)
-                record = feature_context(run, run_id, project_id, artifact_reader, approval_key, issued)
+                record = feature_context(run, run_id, project_id, artifact_reader, approval_key, issued,
+                                         telemetry_reader=platform_call)
                 operation = record["operation"]
             else:
                 operation = "plan" if run.get("nodes", {}).get("worker-plan", {}).get("status") == "running" else "approve"

@@ -161,7 +161,7 @@ class FeatureContextTests(unittest.TestCase):
                   patch.dict(meta, sha256=hashlib.sha256(body).hexdigest()), self.assertRaises(ContextError)):
                 self.context()
 
-    def test_reconstruct_clipped_rejection_from_event_and_current_gate_context(self):
+    def test_reconstruct_clipped_rejection_from_scoped_telemetry_and_current_gate_context(self):
         import hashlib
         nodes = self.run["nodes"]
         nodes["mr"]["status"] = "pending"
@@ -173,21 +173,56 @@ class FeatureContextTests(unittest.TestCase):
         # Go JSON encoding replaces each byte of the trailing incomplete rune.
         clipped = "修改树木" * 66 + "修改" + "\ufffd\ufffd…"
         nodes["implement"]["feedback"] = clipped
-        self.run["events"] = [{"runId": self.run_id, "nodeId": "accept", "type": "gate.rejected",
-                              "message": "打回到 implement：" + reason}]
+        from urllib.parse import parse_qs, urlsplit
+        nodes["accept"]["startedAt"] = "2026-11-26T13:00:00Z"
+        nodes["implement"]["startedAt"] = "2026-11-26T13:10:00Z"
+        self.run["telemetrySequence"] = 150
+        self.run["events"] = []
+        reject = {"runId": self.run_id, "nodeId": "accept", "name": "gate.rejected", "sequence": 65,
+                  "category": "verification", "phase": "finish", "level": "info", "source": {}, "context": {},
+                  "timestamp": "2026-11-26T13:05:00Z", "message": "打回到 implement：" + reason}
+        retry = {**reject, "nodeId": "implement", "name": "node.retry_requested", "sequence": 68,
+                 "timestamp": "2026-11-26T13:06:00Z", "message": "从指定节点重跑：Retry transport"}
+        records = {"accept": [reject] + [{**reject, "name": "runner.log", "sequence": i} for i in range(80, 130)],
+                   "implement": [{**retry, "sequence": 60}]}
+
+        def read(path):
+            url = urlsplit(path)
+            if "/artifacts/" in url.path:
+                return self.bodies[url.path.rsplit("/", 1)[1]]
+            if url.path == "/api/runs/" + self.run_id:
+                return self.run
+            self.assertEqual(url.path, "/api/runs/" + self.run_id + "/telemetry")
+            query = parse_qs(url.query)
+            self.assertEqual(query["expanded"], ["true"])
+            node, = query["nodeId"]
+            before = int(query.get("before", ["151"])[0])
+            limit = int(query["limit"][0])
+            events = [e for e in records[node] if e["sequence"] < before]
+            page = events[-limit:]
+            return {"runId": self.run_id, "sequence": 150, "events": page, "hasMore": len(events) > limit,
+                    "nextBefore": page[0]["sequence"] if page else 0, "nextAfter": page[-1]["sequence"] if page else 0}
+
+        def published():
+            with (patch.object(self.relay, "list_sandboxes", return_value=["012345abcdef"]),
+                  patch.object(self.relay, "sandbox_identity", return_value=(self.run_id, self.run_id)),
+                  patch.object(self.relay, "write_context") as write):
+                self.relay.publish_workspace_contexts(Path("/local"), "s" * 32, read, PROJECT, self.key)
+            return write.call_args.args[2]["payload"]["sandboxes"]["012345abcdef"]
         raw = ("# 人工补充上下文\n\n" + note + "\n").encode()
         self.bodies["extra-context"] = raw
         self.run["artifacts"].append({"id": "extra-context", "runId": self.run_id, "nodeId": "accept", "attempt": 3,
                                       "name": "human-context", "sha256": hashlib.sha256(raw).hexdigest()})
-        self.assertEqual(self.context()["feedback"], full)
-        self.run["events"].append({"runId": self.run_id, "nodeId": "implement", "type": "node.retry_requested",
-                                   "message": "从指定节点重跑：Retry transport"})
+        self.assertEqual(published()["feedback"], full)
+        records["implement"].append(retry)
         nodes["implement"]["feedback"] = "Retry transport"
-        self.assertEqual(self.context()["feedback"], full)
-        self.run["events"].pop()
+        self.assertEqual(published()["feedback"], full)
+        records["implement"].pop()
         nodes["implement"]["feedback"] = clipped
-        self.run["events"][0]["message"] = "打回到 implement：different"
-        result = self.context()
+        with patch.dict(reject, timestamp="2026-11-26T12:55:00Z"):
+            self.assertTrue(published()["feedback_error"])
+        reject["message"] = "打回到 implement：different"
+        result = published()
         self.assertTrue(result["feedback_error"])
         self.assertFalse(result["feedback"])
 

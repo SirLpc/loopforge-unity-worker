@@ -177,3 +177,22 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(reopened.slot_lease(db, "worker-02")["task_id"], "retained")
                 self.assertIsNone(reopened.slot_lease(db, "worker-01"))
                 self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+
+    def test_intervening_job_prevents_attributing_later_recovery(self):
+        from task_store import Store
+
+        with test_directory() as root:
+            store = Store(root / "worker.sqlite3", "worker", root / "project")
+            with store.connect(write=True) as conn:
+                for action, result in (("test", {}), ("cancel", {"cancel_requested": False})):
+                    task = {"task_id": str(uuid4()), "worker_id": "worker", "status": "failed", "lease": False}
+                    store.save_task(conn, task)
+                    ids = []
+                    for kind, status, outcome in (("commit", "recovery_required", {}), (action, "succeeded", result),
+                                                   ("recover", "succeeded", {"recovered": True})):
+                        job = {"job_id": str(uuid4()), "request_id": str(uuid4()), "task_id": task["task_id"],
+                               "action": kind, "status": status, "stage_result": outcome}
+                        store.save_job(conn, job)
+                        ids.append(job["job_id"])
+                    with self.subTest(action=action):
+                        self.assertIsNone(store.recovery_after(conn, task["task_id"], ids[0]))

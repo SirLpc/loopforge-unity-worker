@@ -276,6 +276,9 @@ class WorkflowDeliveryTests(WorkflowFixture):
             worker = client.app.state.worker
 
             def interrupted(job, *args):
+                cancel = worker.action(task["task_id"], "cancel", str(uuid4()), {})
+                self.assertEqual(cancel["status"], "succeeded")
+                self.assertEqual(worker.task(task["task_id"])["job_id"], job["job_id"])
                 worker.store.recover_interrupted(job["job_id"])
 
             request_id = str(uuid4())

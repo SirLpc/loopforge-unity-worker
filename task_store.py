@@ -206,11 +206,13 @@ class Store:
 
     @staticmethod
     def recovery_after(db, task_id, job_id):
-        # A failed recovery can be repeated. Any other admitted operation ends this recovery window.
+        # An in-flight cancellation only signals the running job. A failed recovery may be repeated.
         row = db.execute(
             """SELECT id, json_extract(data, '$.action') FROM jobs
                WHERE task_id = ? AND rowid > (SELECT rowid FROM jobs WHERE id = ?)
                  AND (json_extract(data, '$.action') != 'recover' OR status = 'succeeded')
+                 AND NOT (json_extract(data, '$.action') = 'cancel' AND status = 'succeeded'
+                          AND COALESCE(json_extract(data, '$.stage_result.cancel_requested'), 0) = 1)
                ORDER BY rowid LIMIT 1""", (task_id, job_id),
         ).fetchone()
         return row[0] if row and row[1] == "recover" else None
