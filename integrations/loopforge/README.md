@@ -8,6 +8,39 @@
 2. 以 Windows 主机在 Docker 容器内的可达地址设置 UNITY_WORKER_URL。可以在沙箱环境设置 URL，或用项目凭据中的自定义变量一起交付。将普通 UNITY_WORKER_TOKEN 保存为项目凭据，复制或建立项目 SOP 并勾选需要的凭据。ProjectCredentialIDs 是 SOP 范围。把凭据绑定到仅含受信任脚本与人工门的执行 SOP。需求分析和方案 Agent 在凭据未绑定的流程中运行。旧版缺少项目凭据时，用受保护的沙箱环境或外部安全注入。
 3. Operator Token 保存在人工审批者的客户端及 Windows Worker。交付脚本使用普通 Token，只将已经人工写入 Worker 的审批推进到 commit。 [凭据解析源码](https://github.com/Tencent/LoopForge/blob/main/internal/engine/project_credentials.go) [项目凭据 UI 源码](https://github.com/Tencent/LoopForge/blob/main/web/app/project-credentials.js)
 
+## 从仓库安装 SOP
+
+从 Worker 仓库根目录运行。`--worker-url` 使用 LoopForge 容器能访问的地址。`--probe-url` 可单独指定本机能访问的 Worker 地址。下面的预检只读取 Worker 的注册状态，结果写入本机 `state/loopforge/worker-preflight.json`。
+
+~~~~powershell
+$workerUrl = 'http://WINDOWS-HOST:8765'
+$probeUrl = 'http://127.0.0.1:8765'
+.\.venv\Scripts\python.exe -m integrations.loopforge.install_sops --preflight --config .\config.toml --worker-url $workerUrl --probe-url $probeUrl
+~~~~
+
+准备目标 LoopForge 项目的 Owner API Key，安全注入到环境变量 `UNITY_FORMAL_STUDIO_TOKEN`。按目标项目设置 `--project-id`、`--api-url`，自定义脚本环境用 `--sandbox-profile`。省略 `--pool` 会使用 Worker 配置的默认池。
+
+~~~~powershell
+.\.venv\Scripts\python.exe -m integrations.loopforge.install_sops --config .\config.toml --project-id GAME-PROJECT --api-url 'http://LOOPFORGE-HOST:8090' --worker-url $workerUrl --probe-url $probeUrl
+~~~~
+
+默认保存草稿，已存在的凭据和已发布 SOP 保留原设置。按[端到端验收清单](../../docs/ACCEPTANCE.md)确认 Unity 编译、定向测试和产物交接后，追加 `--publish` 更新并发布目标项目中由本安装器管理的 SOP，设置项目默认入口。安装器会重查 Worker、目标池和 LoopForge 执行器。操作员验证交付 revision 后用 `scripts/approve-delivery.ps1` 签批。它使用本机的 Operator Token，或从 `-CredentialDirectory` 读取对应 DPAPI 文件。
+
+### 启用 Windows 提前规划
+
+在运行专用 LoopForge Docker Runner 的 Linux 或 WSL 主机上克隆同一仓库。用能读取该 Runner 的 Docker 容器元数据及工作目录的账号运行以下中继。将平台 API Token 和独立的至少 32 字符签名密钥保存在该账号可读的受保护文件中。工作目录指向 Runner 主机上实际挂载到容器 `/workspace` 的根目录，下面应有 `runs/<run-id>/workspace`。
+
+~~~~bash
+python3 -m integrations.loopforge.planning_context \
+  --project-id GAME-PROJECT \
+  --platform-url http://127.0.0.1:8090 \
+  --platform-token-file "$HOME/.config/unity-worker/loopforge-token" \
+  --context-token-file "$HOME/.config/unity-worker/planning-context.key" \
+  --runner-workspaces /path/to/dedicated-runner/workspaces
+~~~~
+
+让中继随 Runner 常驻，项目 ID 与安装器保持一致。在运行安装器的进程里通过 `UNITY_PLANNING_CONTEXT_TOKEN` 注入同一签名密钥，再追加 `--windows-planning`。中继向当前容器的工作目录写入短时有效的签名记录，用于绑定需求、审批状态和当前计划产物的摘要。用测试 SOP 验证规划、打回重做和审批后交接，再更新正式项目。
+
 ## 生成 Script 节点内容
 
 在服务源代码目录用 python3 integrations/loopforge/worker_client.py render <命令> [参数] 生成节点正文，将输出完整复制进 SOP 的 Script 节点，语言选 Python。每个节点使用同一客户端实现。LoopForge 将 Python 节点正文交给 python3 -c，stdout 出现在节点输出。JSON 文件由节点产物定义收集。根目录执行，工作流运行目录按节点依赖挂载上游产物。 [脚本执行源码](https://github.com/Tencent/LoopForge/blob/main/internal/engine/node_execute.go) [产物挂载源码](https://github.com/Tencent/LoopForge/blob/main/internal/engine/artifacts.go)

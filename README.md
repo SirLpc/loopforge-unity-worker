@@ -2,21 +2,24 @@
 
 Windows Worker 在常驻 Unity 工程中执行 Git 同步、Codex 开发、Unity 编译和测试、独立审查及审批交付。LoopForge 管理需求、方案和人工审批，以 HTTP 调度 Worker。每单固定使用分配到的常驻工程及其 Library、Git 对象、LFS 与依赖缓存。支持单目录，也可配置多个命名池。
 
-## Windows 部署
+## 从克隆部署到 Windows
 
-在专用的低权限 Windows 账号下运行 Worker。准备已完成首次导入的 NTFS Unity 工程，关闭该工程的 Editor。配置 Git 提交身份、远端凭据及分支保护。Worker 的代码和状态目录放在 Unity 工程之外，限制同机其他账号的写权限。
+使用专用的 Windows 账号。准备 Python 3.11+、Git for Windows、项目指定版本的 Unity Editor 和 Windows 原生 `codex.exe`。如果游戏仓库使用 Git LFS 或子模块，先准备相应工具和远端权限。
 
-服务需要 Python 3.11+。从服务目录运行：
+1. 克隆这个 Worker 仓库。为每个槽位独立克隆游戏仓库，按游戏项目的说明还原依赖、完成首次导入，再关闭这些工程的 Editor。
+2. 在 Worker 仓库根目录初始化。带 `-Pool` 会采用[两槽位模板](config.pools.example.toml)，省略则采用[单工程模板](config.example.toml)。重复初始化会保留已有配置。Python Launcher 不可用时传 `-PythonExe`。
+3. 在 `config.toml` 填写本机的 Unity、Git 检出、日志和 Codex 路径。进入游戏检出前核对每份目录的基础分支和 Git 远端。在配置的 `CODEX_HOME` 登录 Codex。
+4. 设置两个 Token 并启动。需要从 LoopForge 容器访问时，按下文配置监听地址和防火墙规则。
 
 ~~~~powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item config.example.toml config.toml
-notepad config.toml
+.\scripts\initialize-worker.ps1 -Pool
+notepad .\config.toml
 $env:UNITY_WORKER_TOKEN = [System.Net.NetworkCredential]::new('', (Read-Host 'Worker Token' -AsSecureString)).Password
 $env:UNITY_WORKER_APPROVAL_TOKEN = [System.Net.NetworkCredential]::new('', (Read-Host 'Operator Token' -AsSecureString)).Password
 .\start_worker.ps1 -ConfigPath .\config.toml
 ~~~~
+
+启动脚本直接运行当前 Git 检出的 Worker 代码。配置和状态留在本机。实际 Token、DPAPI 文件、Codex 登录目录、SQLite、任务产物和游戏检出应放在源码提交之外。
 
 两个 Token 各使用至少 32 个 ASCII 字符的独立随机值。Worker Token 交给受信任的 LoopForge SOP。Operator Token 留在授权审批者和 Windows 服务端。只部署旧 smoke 时可省略 Operator Token 和 Codex 配置。服务支持原有变量 UNITY_EXE、UNITY_PROJECT、UNITY_WORKER_LOGS、UNITY_WORKER_TOKEN、UNITY_TIMEOUT_SECONDS，环境变量覆盖 TOML。
 
@@ -31,12 +34,16 @@ Unity 位于仓库子目录时，`project` 指向 Unity 工程，`git_root` 指�
 ## 目录池
 
 1. 为同一个受信任仓库预备至少一份独立 Git 检出。每份使用私有的 `.git` 和 Unity `Library`/`Temp`。通过预热确认 Unity 版本、依赖、Git LFS 和选定测试均可用。顶层 `codex_home` 或 `UNITY_CODEX_HOME` 指向所有槽位共用的登录目录，位置在所有检出和 Worker 状态目录之外。
-2. 按 [配置示例](config.example.toml) 设置 `default_pool`、`legacy_slot`、`[pools.<id>]` 与各 `slots`。显式池启用每个目录的预检。若 `GET /api/v1/pools` 显示 `unavailable`，检查该 checkout 的远端、Unity 版本、路径、Editor 锁和 Git 清洁度，修复后重启复检。
+2. 按 [两槽位模板](config.pools.example.toml) 设置 `default_pool`、`legacy_slot`、`[pools.<id>]` 与各 `slots`。显式池启用每个目录的预检。若 `GET /api/v1/pools` 显示 `unavailable`，检查该 checkout 的远端、Unity 版本、路径、Editor 锁和 Git 清洁度，修复后重启复检。
 3. `remote_identity` 是 UTF-8 `git remote get-url origin`、一个 NUL 字节、`git remote get-url --push origin` 的 SHA-256 小写十六进制。仅比较摘要。命名池需固定仓库、基础分支、Unity 版本和相对工程路径。第二个仓库用独立的池 ID。工作流用可信 `--pool` 参数选池。
 4. `max_parallel_unity` 默认 1，限制该 Worker 管理的 Editor 进程。多个任务的 Git、Codex 和审查可以重叠。确认宿主授权和容量后可调高。退出状态不明时保留 Editor 名额，核验进程后用 `recover` 释放。
 5. 改版前停止接单并备份数据库和运行配置。保留原目录作为 `legacy_slot`，正式 `default_pool` 为原 Worker ID。数据库升级保留原任务、Job、审批与产物。设置槽位 `enabled = false` 暂停新分配，已绑定任务继续完成。排空后可以从配置移除非默认槽位。更换仓库或目录用新的池或槽位 ID。
 
 命名池准备可选 `[pools.<id>.pr]`，填写 `provider`、`api_url`、`repository`、`token_env`。`token_env` 仅指服务进程的凭据环境变量名。没有池专用适配器时只有默认池继承现有宿主 PR/MR 配置。
+
+### 迁移本机旧部署
+
+先运行 `scripts/initialize-worker.ps1` 安装新仓库的依赖。停止旧 Worker 接单，等队列和执行中的 Job 排空，再停服并备份旧配置和完整状态目录。用原账号从新仓库执行 `start_worker.ps1`，将 `-ConfigPath` 指向原配置，保留配置里的 `logs`、槽位 ID、游戏检出路径和 Codex home。已有 DPAPI 文件时传 `-CredentialDirectory` 指向它们所在的目录。保持原监听地址和端口即可沿用现有 SOP 地址。用[预检命令](integrations/loopforge/README.md)核对服务，再确认旧任务、审批和产物仍可查询。需要回退时先停掉新 Worker，再用原启动入口恢复。
 
 ## 开发与交付
 

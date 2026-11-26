@@ -1,5 +1,6 @@
 # Local configuration
 /config.toml
+*.dpapi
 .env
 .env.*
 !.env.example
@@ -8,6 +9,10 @@
 # Worker state and test workspaces
 /logs/
 /state/
+*.sqlite3
+*.sqlite3-*
+*.log
+/.superpowers/
 /worker.sqlite3
 /worker.sqlite3-*
 /.tmp-test-*/

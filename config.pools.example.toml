@@ -1,0 +1,31 @@
+worker_id = "game-worker"
+logs = 'C:\UnityWorkerData\state'
+codex_exe = 'C:\Tools\codex\codex.exe'
+codex_home = 'C:\UnityWorkerData\codex-home'
+codex_sandbox = "mxc"
+
+default_pool = "game"
+legacy_slot = "worker-01"
+max_parallel_unity = 1
+
+[pools.game]
+unity_exe = 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe'
+unity_version = "2022.3.62f3"
+git_remote = "origin"
+base_branch = "main"
+remote_identity = "<SHA-256 of fetch URL, NUL, then push URL>"
+test_modes = ["editmode", "playmode"]
+
+[pools.game.test_assemblies]
+editmode = ["Game.Tests.EditMode"]
+playmode = ["Game.Tests.PlayMode"]
+
+[[pools.game.slots]]
+id = "worker-01"
+git_root = 'C:\UnityWorkerData\worker-01'
+project = 'C:\UnityWorkerData\worker-01\client'
+
+[[pools.game.slots]]
+id = "worker-02"
+git_root = 'C:\UnityWorkerData\worker-02'
+project = 'C:\UnityWorkerData\worker-02\client'
