@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -172,6 +173,158 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(client.post(path, json=payload).status_code, 403)
         self.assertEqual(client.post(path, json=payload, headers={"Authorization": f"Bearer {APPROVER}"}).status_code, 202)
 
+    def staged_client(self):
+        from test_planning import PlanningAgent
+        from worker_config import Settings
+
+        self.agent = PlanningAgent(self.project)
+        cfg = replace(Settings.load(), test_assemblies={"editmode": ("Tests",), "playmode": ("PlayTests",)})
+        return TestClient(create_app(cfg, runner=self.runner, agent=self.agent),
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+
+    def accepted_staged_plan(self, client):
+        response = client.post("/api/v1/planning-tasks", json={
+            "request_id": str(uuid4()), "workflow_run_id": "run-feature-41", "workflow_mode": "staged-feature",
+            "workflow_project_id": "Game-1", "planning_profile": "feature", "requirement": "Change the greeting",
+        })
+        self.assertEqual(response.status_code, 202, response.text)
+        task = response.json()["task_id"]
+        for action in ("clarify", "plan"):
+            job = self.stage(client, task, action)
+            self.assertEqual(job["status"], "succeeded", job)
+        planned = self.task(client, task)
+        job = self.stage(client, task, "accept-plan", slot_id=planned["slot_id"], base_commit=planned["base_commit"],
+                         plan_digest=planned["planning"]["plan_digest"])
+        self.assertEqual(job["status"], "succeeded", job)
+        return task
+
+    def test_staged_review_precedes_tests_and_rework_invalidates_evidence(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+
+            def action(name, request_id=None, **payload):
+                return client.post(f"/api/v1/tasks/{task}/{name}", json={
+                    "request_id": request_id or str(uuid4()), **payload})
+
+            rework = {"workflow_run_id": "run-feature-41", "implementation_attempt": 1,
+                      "feedback": "  Keep the friendly greeting.\nMention the welcome screen.  "}
+            for stage in ("implement", "compile"):
+                job = self.stage(client, task, stage)
+                self.assertEqual(job["status"], "succeeded", job)
+            compiled = self.task(client, task)
+            self.assertEqual(action("test").status_code, 409)
+            self.assertEqual(action("rework", **rework).status_code, 409)
+            reviewed_job = self.stage(client, task, "review")
+            self.assertEqual(reviewed_job["status"], "succeeded", reviewed_job)
+            reviewed = self.task(client, task)
+            self.assertEqual(reviewed["review_result"]["revision"], compiled["compile_report"]["revision"])
+            self.assertIsNone(reviewed["test_report"])
+            self.assertIsNone(reviewed["verification"])
+
+            tested_job = self.stage(client, task, "test")
+            self.assertEqual(tested_job["status"], "succeeded", tested_job)
+            tested = self.task(client, task)
+            self.assertEqual(tested["verification"], {"revision": tested["revision"], "test_job_id": tested_job["job_id"],
+                                                      "implementation_attempt": 0})
+            self.assertEqual(tested["test_report"]["editmode"]["revision"], reviewed["review_result"]["revision"])
+            self.approve(client, task)
+            self.assertEqual(self.task(client, task)["approved_revision"], tested["revision"])
+            for wrong in ({"workflow_run_id": "run-other-41"}, {"implementation_attempt": 2}):
+                self.assertEqual(action("rework", **{**rework, **wrong}).status_code, 409)
+
+            started, allow_fix = threading.Event(), threading.Event()
+            execute = self.agent.execute
+
+            def pause_fix(ctx, prompt, *, review=False):
+                started.set()
+                if not allow_fix.wait(10):
+                    raise AssertionError("Rework test did not release the agent")
+                return execute(ctx, prompt, review=review)
+
+            request_id = str(uuid4())
+            with patch.object(self.agent, "execute", side_effect=pause_fix):
+                try:
+                    response = action("rework", request_id=request_id, **rework)
+                    self.assertEqual(response.status_code, 202, response.text)
+                    job_id = response.json()["job_id"]
+                    self.assertTrue(started.wait(10), "Rework did not reach the implementation agent")
+                    reworked = self.task(client, task)
+                    for key in ("verification", "test_report", "review_result", "approved_revision", "approval"):
+                        self.assertIsNone(reworked[key], key)
+                    for key in ("slot_id", "base_commit", "task_branch", "approved_plan_digest", "plan"):
+                        self.assertEqual(reworked[key], tested[key], key)
+                    self.assertEqual(reworked["implementation_attempt"], 1)
+                    self.assertEqual(action("test").status_code, 409)
+                    self.assertEqual(action("rework", **{**rework, "implementation_attempt": 2}).status_code, 409)
+                    repeated = action("rework", request_id=request_id, **rework)
+                    self.assertEqual(repeated.json()["job_id"], job_id)
+                    self.assertEqual(action("rework", request_id=request_id, **{**rework, "feedback": "Other"}).status_code, 409)
+                finally:
+                    allow_fix.set()
+                finished = self.wait(client, job_id)
+            self.assertEqual(finished["status"], "succeeded", finished)
+            self.assertEqual(self.agent.implementation_briefs[-1]["previous_failure"]["feedback"], rework["feedback"])
+            self.assertEqual(action("rework", **rework).status_code, 409)
+            run_job = self.stage(client, task, "run")
+            self.assertEqual(run_job["status"], "succeeded", run_job)
+            current = self.task(client, task)
+            self.assertEqual(current["verification"], {"revision": current["revision"], "test_job_id": run_job["job_id"],
+                                                       "implementation_attempt": 1})
+            self.assertEqual(current["retry_count"], 1)
+            self.assertEqual(action("rework", **{**rework, "implementation_attempt": 2}).status_code, 409)
+
+    def test_staged_compile_failure_preserves_bounded_implementation_corrections(self):
+        (self.root / "broken_compile").touch()
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            failed = self.stage(client, task, "run")
+            self.assertEqual(failed["failure_kind"], "compile_failed", failed)
+            current = self.task(client, task)
+            self.assertEqual(current["retry_count"], 1)
+            self.assertEqual(current.get("implementation_attempt"), 0)
+            self.assertIsNone(current["verification"])
+            self.assertIsNone(current["review_result"])
+
+    def test_staged_unity_retries_need_review_again_when_the_tree_changes(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for stage in ("implement", "compile", "review"):
+                job = self.stage(client, task, stage)
+                self.assertEqual(job["status"], "succeeded", job)
+            reviewed = self.task(client, task)
+
+            (self.root / "license_fail").touch()
+            failed = self.stage(client, task, "test")
+            self.assertEqual(failed["failure_kind"], "license_failed", failed)
+            blocked = self.task(client, task)
+            self.assertEqual(blocked["retry_count"], 0)
+            self.assertEqual(blocked["review_result"], reviewed["review_result"])
+            self.assertIsNone(blocked["verification"])
+
+            run = self.runner.run
+
+            def update_during_unity(argv, cwd, prefix, **kwargs):
+                result = run(argv, cwd, prefix, **kwargs)
+                if "-runTests" in argv:
+                    (self.project / "hello.txt").write_text("Unity rewrote the greeting\n")
+                return result
+
+            with patch.object(self.runner, "run", side_effect=update_during_unity):
+                changed = self.stage(client, task, "test")
+            self.assertEqual(changed["failure_kind"], "unity_changed", changed)
+            self.assertIsNone(self.task(client, task)["verification"])
+            (self.root / "license_fail").unlink()
+
+            self.assertEqual(self.stage(client, task, "compile")["status"], "succeeded")
+            self.assertEqual(client.post(f"/api/v1/tasks/{task}/test", json={"request_id": str(uuid4())}).status_code, 409)
+            self.assertEqual(self.stage(client, task, "review")["status"], "succeeded")
+            tested = self.stage(client, task, "test")
+            self.assertEqual(tested["status"], "succeeded", tested)
+            current = self.task(client, task)
+            self.assertNotEqual(current["revision"], reviewed["revision"])
+            self.assertEqual(current["verification"]["revision"], current["review_result"]["revision"])
+            self.assertEqual(current["retry_count"], 0)
+
     def test_lease_duplicate_requests_and_stages(self):
         with self.client() as client:
             req = str(uuid4())
@@ -188,6 +341,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(self.stage(client, task, "implement")["status"], "succeeded")
             self.assertEqual(self.stage(client, task, "compile")["status"], "succeeded")
             self.assertEqual(self.task(client, task)["current_stage"], "compiled")
+            self.assertEqual(client.post(f"/api/v1/tasks/{task}/review", json={"request_id": str(uuid4())}).status_code, 409)
             self.assertEqual((self.project / "Library/cache").read_text(), "keep")
 
     def test_review_rework_approval_restart_and_delivery(self):

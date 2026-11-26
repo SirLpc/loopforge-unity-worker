@@ -291,6 +291,9 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(final['slot_id'], first['slot_id'])
         self.assertEqual(final['base_commit'], first['base_commit'])
         self.assertEqual(final['status'], 'awaiting_approval')
+        self.assertEqual(final['current_stage'], 'reviewed')
+        self.assertEqual(final['test_report']['editmode']['status'], 'passed')
+        self.assertNotIn('verification', final)
         self.assertFalse(final['pushed'])
 
     def test_existing_source_citation_must_match_git_baseline(self):

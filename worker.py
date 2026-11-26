@@ -21,6 +21,7 @@ from workspace_storage import CacheName
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
 Criterion = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2_000)]
+WorkflowRunId = Annotated[str, Field(pattern=r"^run-[A-Za-z0-9_-]{1,120}$")]
 Action = Literal["clarify", "prepare", "implement", "compile", "test", "review", "fix", "run", "cancel", "release", "pr"]
 
 
@@ -62,7 +63,7 @@ class TaskRequest(OperationRequest):
 
 class PlanningTaskRequest(OperationRequest):
     pool_id: str | None = Field(default=None, pattern=rf"^{REMOTE_PATTERN}$")
-    workflow_run_id: str = Field(pattern=r"^run-[A-Za-z0-9_-]{1,120}$")
+    workflow_run_id: WorkflowRunId
     workflow_mode: Literal["staged-feature"] | None = None
     workflow_project_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     requirement: Text
@@ -83,6 +84,12 @@ class AcceptPlanRequest(OperationRequest):
     slot_id: str = Field(pattern=rf"^{REMOTE_PATTERN}$")
     base_commit: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ReworkRequest(OperationRequest):
+    workflow_run_id: WorkflowRunId
+    implementation_attempt: int = Field(strict=True, ge=1)
+    feedback: str = Field(max_length=4000)
 
 
 class RevisionRequest(OperationRequest):
@@ -326,6 +333,10 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
     @app.post("/api/v1/tasks/{task_id}/accept-plan", status_code=202)
     def accept_plan(task_id: UUID, request: AcceptPlanRequest):
         return worker().action(str(task_id), "accept-plan", str(request.request_id), payload_for(request))
+
+    @app.post("/api/v1/tasks/{task_id}/rework", status_code=202)
+    def rework(task_id: UUID, request: ReworkRequest):
+        return worker().action(str(task_id), "rework", str(request.request_id), payload_for(request))
 
     @app.post("/api/v1/tasks/{task_id}/{action}", status_code=202)
     def operation(task_id: UUID, action: Action, request: StageRequest):

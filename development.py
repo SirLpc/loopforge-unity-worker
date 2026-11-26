@@ -35,6 +35,7 @@ STAGES = {
 }
 NEXT_STAGE = {"created": "prepare", "prepared": "implement", "implemented": "compile",
               "compiled": "test", "tested": "review"}
+STAGED_FEATURE_NEXT_STAGE = {**NEXT_STAGE, "compiled": "review", "reviewed": "test", "tested": None}
 FIXABLE = {"compile_failed", "tests_failed", "review_changes", "asset_metadata"}
 TERMINAL = {"completed", "cancelled", "failed"}
 RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "license_failed", "package_failed",
@@ -64,6 +65,13 @@ def freeze_plan(task):
                 acceptance_criteria=plan["acceptance_criteria"], approved_plan_digest=plan["plan_digest"])
     if plan["test_selection"]:
         task["test_selection"] = plan["test_selection"]
+
+
+def validation_reset(task):
+    fields = dict(approved_revision=None, approval=None, compile_report=None, test_report=None, review_result=None)
+    if task.get("workflow_mode") == "staged-feature":
+        fields["verification"] = None
+    return fields
 
 
 class DevelopmentWorker:
@@ -252,7 +260,7 @@ class DevelopmentWorker:
     def new_task(self, task_id, payload, task_type):
         pool_id = payload.get("pool_id", self.cfg.default_pool)
         policy = self.cfg.pools[pool_id].policy
-        return {
+        task = {
             "task_id": task_id, "job_id": None, "worker_id": self.cfg.worker_id, "task_type": task_type,
             "pool_id": pool_id, "slot_id": None,
             "workflow_run_id": None, "requirement": "", "plan": "", "acceptance_criteria": [], "project_rules": "",
@@ -264,6 +272,9 @@ class DevelopmentWorker:
             "approval": None, "changed_files": [], "review_result": None, "stage_result": {},
             "commit_sha": None, "pushed": False, "cancel_requested": False,
         }
+        if task.get("workflow_mode") == "staged-feature":
+            task.update(implementation_attempt=0, verification=None)
+        return task
 
     @staticmethod
     def new_job(task_id, request_id, action, payload, *, job_id=None):
@@ -316,6 +327,7 @@ class DevelopmentWorker:
 
     def next_stage(self, task):
         stage, failure = task["current_stage"], task["failure_kind"]
+        staged_feature = task.get("workflow_mode") == "staged-feature"
         if task.get("planning_profile") and not task.get("approved_plan_digest"):
             return None
         if stage == "plan_accepted":
@@ -327,15 +339,17 @@ class DevelopmentWorker:
                 return "fix"
             if failure == "unity_changed" and stage in {"compile", "test"}:
                 return "compile"
-            if stage in {"prepare", "compile", "test", "review"} and failure in RETRYABLE:
-                return stage
+            if stage in {"prepare", "compile", "test", "review"}:
+                if failure in RETRYABLE or (staged_feature and failure == "recovered"):
+                    return stage
             if stage in {"compile", "test", "review", "commit"} and failure == "workspace_changed" and not task["commit_sha"]:
                 return "compile"
             return None
-        return NEXT_STAGE.get(stage)
+        return (STAGED_FEATURE_NEXT_STAGE if staged_feature else NEXT_STAGE).get(stage)
 
     def check_action(self, db, task, action, payload):
         status, stage = task["status"], task["current_stage"]
+        staged_feature = task.get("workflow_mode") == "staged-feature"
         if self.stopping:
             raise RequestConflict("Worker is shutting down")
         active_job = self.store.active_job(db, task["task_id"])
@@ -350,12 +364,12 @@ class DevelopmentWorker:
                 return
         elif active_job:
             raise RequestConflict("The task already has an active job")
-        elif action == "clarify" and task.get("workflow_mode") == "staged-feature":
+        elif action == "clarify" and staged_feature:
             if (status in {"pending", "failed"} and stage in {"created", "clarify"}
                     and (task["lease"] or task["slot_id"] is None)):
                 return
         elif action == "plan" and task.get("planning_profile") and not task.get("approved_plan_digest"):
-            if task.get("workflow_mode") == "staged-feature" and not (task["lease"] and task.get("clarification")):
+            if staged_feature and not (task["lease"] and task.get("clarification")):
                 raise RequestConflict("Clarify the requirement in the assigned workspace before planning")
             if (status in {"pending", "failed", "awaiting_plan_approval"}
                     and (task["lease"] or task["slot_id"] is None)):
@@ -369,8 +383,18 @@ class DevelopmentWorker:
             if self.store.has_task_permit(db, task["task_id"]):
                 raise RequestConflict("Confirm the previous Unity process stopped before releasing the workspace")
             return
+        elif action == "rework" and staged_feature:
+            if (status == "awaiting_approval" and stage in {"tested", "approved"} and task["lease"]
+                    and task.get("verification") and not task["commit_sha"]):
+                if (payload["workflow_run_id"] != task["workflow_run_id"]
+                        or payload["implementation_attempt"] != task.get("implementation_attempt", 0) + 1):
+                    raise RequestConflict("Rework does not match the current workflow run and next implementation attempt")
+                if task["retry_count"] >= self.cfg.pools[task["pool_id"]].policy.max_fixes:
+                    raise RequestConflict("The task has reached its correction limit")
+                return
         elif action == "approve":
-            if status == "awaiting_approval" and stage == "reviewed" and task["lease"]:
+            ready = (stage == "tested" and task.get("verification")) if staged_feature else stage == "reviewed"
+            if status == "awaiting_approval" and ready and task["lease"]:
                 if task["revision"] != payload["revision"]:
                     raise RequestConflict("Approval revision does not match the reviewed revision")
                 if payload["create_pr"] and self.adapters.get(task["pool_id"]) is None:
@@ -434,6 +458,13 @@ class DevelopmentWorker:
                 if action == "plan":
                     task.update(planning_feedback=payload["feedback"], planning=None,
                                 plan_version=task.get("plan_version", 0) + 1)
+                if action == "rework":
+                    running, _ = STAGES["fix"]
+                    task.update(**validation_reset(task), status=running, current_stage="fix",
+                                implementation_attempt=payload["implementation_attempt"], rework_feedback=payload["feedback"],
+                                retry_count=task["retry_count"] + 1, revision=None, changed_files=[],
+                                implementation_result=None, agent_session_id=None, stage_result={}, failure_kind=None,
+                                error_message=None, exit_code=None)
                 self.store.save_task(db, task)
                 self.store.save_job(db, job)
             if action == "cancel" and task_id in self.active:
@@ -484,6 +515,8 @@ class DevelopmentWorker:
             ctx.workspace = workspace
             if action == "run":
                 result = self.run(ctx)
+            elif action == "rework":
+                result = self.run_stage(ctx, "fix")
             elif action == "clarify":
                 result = self.build_clarification(ctx)
             elif action == "plan":
@@ -553,6 +586,9 @@ class DevelopmentWorker:
                                 stage_result=job["stage_result"], exit_code=error.exit_code)
                 if action == "commit" and kind in {"workspace_changed", "dirty_workspace", "unsafe_change", "asset_metadata"}:
                     task.update(approved_revision=None, approval=None)
+                if (task.get("workflow_mode") == "staged-feature" and kind in {"workspace_changed", "unity_changed"}
+                        and task["current_stage"] in {"compile", "review", "test", "commit"}):
+                    task.update(validation_reset(task))
             if action == "smoke" and task["status"] != "recovery_required":
                 task.update(lease=False, status="failed" if error else "completed", finished_at=timestamp,
                             exit_code=error.exit_code if error else 0)
@@ -566,6 +602,10 @@ class DevelopmentWorker:
                             failure_kind=None, error_message=None, exit_code=0)
             if action == "accept-plan" and not error:
                 freeze_plan(task)
+            if (not error and action in {"test", "run"} and task["current_stage"] == "tested"
+                    and task.get("workflow_mode") == "staged-feature"):
+                task["verification"] = {"revision": task["revision"], "test_job_id": job["job_id"],
+                                        "implementation_attempt": task.get("implementation_attempt", 0)}
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
@@ -574,6 +614,7 @@ class DevelopmentWorker:
 
     def run(self, ctx):
         action = self.next_stage(ctx.task)
+        last_stage = "test" if ctx.task.get("workflow_mode") == "staged-feature" else "review"
         while action:
             try:
                 result = self.run_stage(ctx, action)
@@ -583,7 +624,7 @@ class DevelopmentWorker:
                 ctx.save(status="failed", failure_kind=error.kind, error_message=str(error), stage_result=error.result)
                 action = "fix"
                 continue
-            if action == "review":
+            if action == last_stage:
                 return result
             action = self.next_stage(ctx.task)
         raise StageError("worker_error", "No valid next stage")
@@ -593,7 +634,8 @@ class DevelopmentWorker:
         running, finished = STAGES[stage]
         ctx.save(status=running, current_stage=stage, finished_at=None)
         result = getattr(self, f"stage_{stage}")(ctx)
-        status = "awaiting_approval" if stage == "review" else "completed" if stage == "commit" else running
+        approval_stage = "test" if ctx.task.get("workflow_mode") == "staged-feature" else "review"
+        status = "awaiting_approval" if stage == approval_stage else "completed" if stage == "commit" else running
         ctx.save(status=status, current_stage=finished, stage_result=result, failure_kind=None, error_message=None,
                  exit_code=0, finished_at=now() if stage == "commit" else None)
         return result
@@ -636,8 +678,7 @@ class DevelopmentWorker:
 
     def agent_implementation(self, ctx, diagnostics=None):
         ctx.workspace.git.checkout_is(ctx, ctx.task, ctx.task["base_commit"])
-        ctx.save(revision=None, approved_revision=None, approval=None, compile_report=None, test_report=None,
-                 review_result=None, agent_session_id=None)
+        ctx.save(**validation_reset(ctx.task), revision=None, agent_session_id=None)
         info = self.brief(ctx.task)
         if ctx.task.get("test_selection"):
             info["test_selection"] = ctx.task["test_selection"]
@@ -663,6 +704,8 @@ class DevelopmentWorker:
         return self.agent_implementation(ctx)
 
     def stage_fix(self, ctx):
+        if ctx.job["action"] == "rework":
+            return self.agent_implementation(ctx, {"kind": "rework_requested", "feedback": ctx.task["rework_feedback"]})
         result = ctx.task["stage_result"]
         diagnostics = {"kind": ctx.task["failure_kind"], "message": ctx.task["error_message"], "result": result}
         if log := result.get("log"):
@@ -675,10 +718,8 @@ class DevelopmentWorker:
         before = ctx.workspace.git.snapshot(ctx, ctx.task)
         if not before.changes:
             raise StageError("no_changes", "No Git differences to validate")
-        ctx.save(revision=before.tree, approved_revision=None, approval=None, changed_files=before.changes,
-                 compile_report=None, test_report=None, review_result=None)
-        result = ctx.workspace.unity.run(ctx, "compile")
-        self.assert_same_revision(ctx, before.tree, unity=True)
+        ctx.save(**validation_reset(ctx.task), revision=before.tree, changed_files=before.changes)
+        result = self.run_unity_for_revision(ctx, "compile", before.tree)
         result["revision"] = before.tree
         ctx.save(compile_report=result)
         return result
@@ -688,10 +729,28 @@ class DevelopmentWorker:
             kind = "unity_changed" if unity else "workspace_changed"
             raise StageError(kind, "Workspace changed during or after validation. Inspect the changes and recompile.")
 
+    def run_unity_for_revision(self, ctx, mode, revision, **kwargs):
+        try:
+            result = ctx.workspace.unity.run(ctx, mode, **kwargs)
+        except StageError as error:
+            if (ctx.task.get("workflow_mode") == "staged-feature"
+                    and error.kind not in {"cancelled", "recovery_required", "workspace_in_use"}):
+                self.assert_same_revision(ctx, revision, unity=True)
+            raise
+        self.assert_same_revision(ctx, revision, unity=True)
+        return result
+
     def stage_test(self, ctx):
         revision = ctx.task["compile_report"]["revision"]
+        staged_feature = ctx.task.get("workflow_mode") == "staged-feature"
+        if staged_feature:
+            review = ctx.task.get("review_result") or {}
+            if review.get("verdict") != "pass" or review.get("revision") != revision:
+                raise StageError("workspace_changed", "Recompile and review the same revision before testing.")
         self.assert_same_revision(ctx, revision)
         selection = ctx.task.get("test_selection")
+        if staged_feature and not selection:
+            raise StageError("unsupported", "Staged features require an approved EditMode test scope")
         try:
             validate_test_selection(selection, ctx.settings.test_assemblies)
         except ValueError as error:
@@ -706,7 +765,7 @@ class DevelopmentWorker:
                 reports[mode] = report = {"status": "running", "revision": revision, "runs": []}
                 for scope in selection[mode]:
                     try:
-                        result = ctx.workspace.unity.run(ctx, mode, scope=scope)
+                        result = self.run_unity_for_revision(ctx, mode, revision, scope=scope)
                     except StageError as error:
                         report["runs"].append({"status": error.kind, "scope": scope, **error.result})
                         report["status"] = error.kind
@@ -714,24 +773,26 @@ class DevelopmentWorker:
                         raise
                     report["runs"].append({"status": "passed", "scope": scope, **result})
                     ctx.save(test_report=reports)
-                    self.assert_same_revision(ctx, revision, unity=True)
+
                 report["status"] = "passed"
                 ctx.save(test_report=reports)
                 continue
             try:
-                reports[mode] = {"status": "passed", **ctx.workspace.unity.run(ctx, mode)}
+                reports[mode] = {"status": "passed", **self.run_unity_for_revision(ctx, mode, revision)}
             except StageError as error:
                 reports[mode] = {"status": error.kind, **error.result}
                 ctx.save(test_report=reports)
                 raise
             ctx.save(test_report=reports)
-            self.assert_same_revision(ctx, revision, unity=True)
+
         return reports
 
     def stage_review(self, ctx):
         task = ctx.task
+        staged_feature = task.get("workflow_mode") == "staged-feature"
         snapshot = ctx.workspace.git.snapshot(ctx, task, check_meta=True)
-        if snapshot.tree != task["revision"]:
+        compiled_revision = (task.get("compile_report") or {}).get("revision")
+        if snapshot.tree != task["revision"] or (staged_feature and snapshot.tree != compiled_revision):
             raise StageError("workspace_changed", "Workspace changed after validation. Recompile before review.")
         diff = self.clean_output(ctx.workspace.git.diff(ctx, task, snapshot).decode("utf-8", errors="replace"))
         patch_file = ctx.artifact("change", ".diff", "diff")
@@ -750,6 +811,8 @@ class DevelopmentWorker:
         if review.get("session_id") and review["session_id"] == task["agent_session_id"]:
             raise StageError("review_blocked", "Review reused the implementation session")
         self.assert_same_revision(ctx, snapshot.tree)
+        if staged_feature:
+            review["revision"] = snapshot.tree
         ctx.save(review_result=review)
         if review["verdict"] != "pass":
             kind = "review_changes" if review["verdict"] == "request_changes" else "review_blocked"
