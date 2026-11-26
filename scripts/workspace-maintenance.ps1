@@ -1,5 +1,6 @@
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('Status', 'Measure', 'Release', 'Clean')][string] $Operation = 'Status',
+    [Parameter(Position = 0)][ValidateSet('Status', 'Measure', 'Release', 'Clean')][string] $Operation = 'Status',
     [string] $WorkerUrl = $env:UNITY_WORKER_URL,
     [string] $CredentialDirectory,
     [string] $SlotId,

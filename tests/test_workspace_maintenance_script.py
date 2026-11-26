@@ -29,6 +29,9 @@ PREVIEW = {
     "buckets": {"Library": 3991, "other": 0}, "skipped_links": 0, "read_errors": 0,
     "volume": VOLUME,
 }
+CLEANED = {
+    "status": "cleaned", "cache": "Library", "path": CACHE_PATH, "logical_bytes": 3991, "volume": VOLUME,
+}
 OVERVIEW = {
     "state": {"path": r"D:\Fixture\state", "volume": VOLUME},
     "pools": [{"id": "game", "queued_count": 0, "slots": [{
@@ -152,9 +155,7 @@ class WorkspaceMaintenanceScriptTests(unittest.TestCase):
         self.assertEqual(self.api.requests[0][:2], ("POST", RELEASE))
 
     def test_clean_previews_then_submits_one_confirmed_canonical_cache(self):
-        self.api.responses.extend([(200, PREVIEW), (200, {
-            "status": "cleaned", "cache": "Library", "path": CACHE_PATH, "logical_bytes": 3991, "volume": VOLUME,
-        })])
+        self.api.responses.extend([(200, PREVIEW), (200, CLEANED)])
         code, output = self.invoke("Clean", "-SlotId", "game-01", "-Cache", "library", reply="YES\n")
         self.assertEqual(code, 0, output)
         self.assert_requests(("GET", SLOT + "?cache=Library", None),
@@ -204,6 +205,21 @@ class WorkspaceMaintenanceScriptTests(unittest.TestCase):
         self.assertIn("-State", output)
         self.assertIn("-SlotId", output)
         self.assert_requests()
+
+    def test_clean_rejects_unsupported_whatif_before_http(self):
+        self.api.responses.extend([(200, PREVIEW), (200, CLEANED)])
+        code, output = self.invoke("Clean", "-SlotId", "game-01", "-Cache", "Library", "-WhatIf", reply="YES\n")
+        self.assert_requests()
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("NamedParameterNotFound", output)
+
+    def test_clean_rejects_unexpected_positional_operand_before_http(self):
+        self.api.responses.extend([(200, PREVIEW), (200, CLEANED)])
+        code, output = self.invoke("Clean", "-SlotId", "game-01", "-Cache", "Library",
+                                   self.env["UNITY_WORKER_URL"], reply="YES\n")
+        self.assert_requests()
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("PositionalParameterNotFound", output)
 
     def test_dpapi_file_overrides_environment_credential(self):
         directory = self.enterContext(test_directory())
