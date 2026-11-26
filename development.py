@@ -16,7 +16,7 @@ from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, AgentExecutor, CodexEx
 from git_workspace import GitWorkspace
 from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
-from planning import clarify_requirements, investigate
+from planning import assert_baseline, clarify_requirements, investigate
 from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
@@ -56,6 +56,14 @@ def publishable(job):
 def plan_binding(task):
     return {"slot_id": task["slot_id"], "base_commit": task["base_commit"],
             "plan_digest": task["planning"]["plan_digest"]}
+
+
+def freeze_plan(task):
+    plan = task["planning"]
+    task.update(status="pending", current_stage="plan_accepted", plan=plan["plan"],
+                acceptance_criteria=plan["acceptance_criteria"], approved_plan_digest=plan["plan_digest"])
+    if plan["test_selection"]:
+        task["test_selection"] = plan["test_selection"]
 
 
 class DevelopmentWorker:
@@ -394,16 +402,12 @@ class DevelopmentWorker:
                 task = self.require_task(db, task_id)
                 self.check_action(db, task, action, payload)
                 job = self.new_job(task_id, request_id, action, payload)
-                if action in {"accept-plan", "approve", "cancel"}:
+                inline_accept = action == "accept-plan" and task.get("workflow_mode") != "staged-feature"
+                if inline_accept or action in {"approve", "cancel"}:
                     active = self.store.active_job(db, task_id)
                     running = active and active["status"] == "running"
-                    if action == "accept-plan":
-                        plan = task["planning"]
-                        task.update(status="pending", current_stage="plan_accepted", plan=plan["plan"],
-                                    acceptance_criteria=plan["acceptance_criteria"],
-                                    approved_plan_digest=plan["plan_digest"])
-                        if plan["test_selection"]:
-                            task["test_selection"] = plan["test_selection"]
+                    if inline_accept:
+                        freeze_plan(task)
                     elif action == "approve":
                         task.update(current_stage="approved", approved_revision=payload["revision"],
                                     approval={**payload, "approved_at": now()})
@@ -484,6 +488,9 @@ class DevelopmentWorker:
                 result = self.build_clarification(ctx)
             elif action == "plan":
                 result = self.build_plan(ctx)
+            elif action == "accept-plan":
+                assert_baseline(ctx)
+                result = {"status": "pending", **plan_binding(task)}
             elif action == "smoke":
                 result = ctx.workspace.unity.run(ctx, "startup_smoke", safe_child(self.cfg.logs, f"{task['task_id']}.log"))
             elif action == "release":
@@ -508,7 +515,7 @@ class DevelopmentWorker:
         if error and (action == "commit" and error.kind in {"timeout", "cancelled"}
                       or action == "smoke" and error.kind == "workspace_in_use"):
             error.kind = "recovery_required"
-        if ctx and action != "smoke" and action != "release":
+        if ctx and action not in {"smoke", "release", "accept-plan"}:
             try:
                 self.report(ctx, error)
             except Exception as exc:
@@ -517,6 +524,8 @@ class DevelopmentWorker:
                     error = StageError("worker_error", "Cannot save the development report")
         with self.guard:
             try:
+                if action == "accept-plan" and cancel.is_set() and (error is None or error.kind != "recovery_required"):
+                    error = StageError("cancelled", "Cancellation requested")
                 self.finish(job, self.clean_output(result), error, time.monotonic() - started)
             finally:
                 self.active.pop(job["task_id"], None)
@@ -537,7 +546,9 @@ class DevelopmentWorker:
                 message = self.clean_output(str(error))
                 job.update(status=state, exit_code=error.exit_code, error_message=message, failure_kind=kind,
                            stage_result=self.clean_output(error.result))
-                if action not in {"release", "recover", "pr"} or kind == "recovery_required":
+                preserve_task = (action in {"release", "recover", "pr"}
+                                 or (action == "accept-plan" and kind != "cancelled"))
+                if not preserve_task or kind == "recovery_required":
                     task.update(status=state, finished_at=timestamp, failure_kind=kind, error_message=message,
                                 stage_result=job["stage_result"], exit_code=error.exit_code)
                 if action == "commit" and kind in {"workspace_changed", "dirty_workspace", "unsafe_change", "asset_metadata"}:
@@ -553,6 +564,8 @@ class DevelopmentWorker:
             if action == "plan" and not error:
                 task.update(status="awaiting_plan_approval", current_stage="plan_ready", planning=result,
                             failure_kind=None, error_message=None, exit_code=0)
+            if action == "accept-plan" and not error:
+                freeze_plan(task)
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
                 task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
@@ -616,7 +629,10 @@ class DevelopmentWorker:
 
     @staticmethod
     def brief(task):
-        return {key: task[key] for key in ("requirement", "plan", "acceptance_criteria", "project_rules")}
+        briefing = {key: task[key] for key in ("requirement", "plan", "acceptance_criteria", "project_rules")}
+        if scope := (task.get("planning") or {}).get("scope"):
+            briefing["scope"] = scope
+        return briefing
 
     def agent_implementation(self, ctx, diagnostics=None):
         ctx.workspace.git.checkout_is(ctx, ctx.task, ctx.task["base_commit"])

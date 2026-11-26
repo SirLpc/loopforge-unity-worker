@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ class PlanningAgent:
     def __init__(self, project):
         self.project = project
         self.calls = []
+        self.implementation_briefs = []
 
     def clarify(self, ctx, briefing):
         text = (self.project / 'hello.txt').read_text().strip()
@@ -45,6 +47,7 @@ class PlanningAgent:
     def execute(self, ctx, prompt, *, review=False):
         if review:
             return {'verdict': 'pass', 'summary': 'Verified greeting', 'issues': [], 'session_id': 'review-test'}
+        self.implementation_briefs.append(json.loads(prompt.split('\n\n', 1)[1]))
         (self.project / 'hello.txt').write_text('new greeting\n')
         return {'success': True, 'summary': 'Changed greeting', 'changed_files': ['hello.txt'],
                 'implementation_notes': [], 'known_issues': [], 'session_id': 'implementation-test'}
@@ -144,7 +147,77 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.wait(self.action(task_id, 'plan', feedback='Keep the text short'))['status'], 'succeeded')
         self.assertEqual(self.action(task_id, 'accept-plan', **binding).status_code, 409)
         latest = self.task(task_id)['planning']['plan_digest']
-        self.assertEqual(self.action(task_id, 'accept-plan', **{**binding, 'plan_digest': latest}).status_code, 202)
+        accepted = self.wait(self.action(task_id, 'accept-plan', **{**binding, 'plan_digest': latest}))
+        self.assertEqual(accepted['status'], 'succeeded', accepted)
+
+    def test_staged_plan_freeze_revalidates_the_live_checkout(self):
+        task_id = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        self.assertEqual(self.wait(self.action(task_id, 'clarify'))['status'], 'succeeded')
+        self.assertEqual(self.wait(self.action(task_id, 'plan'))['status'], 'succeeded')
+        planned = self.task(task_id)
+        binding = {'slot_id': planned['slot_id'], 'base_commit': planned['base_commit'],
+                   'plan_digest': planned['planning']['plan_digest']}
+        greeting = self.project / 'hello.txt'
+
+        for mismatch in ('branch', 'HEAD', 'dirty'):
+            with self.subTest(mismatch=mismatch):
+                if mismatch == 'branch':
+                    git(self.project, 'switch', 'main')
+                elif mismatch == 'HEAD':
+                    git(self.project, 'commit', '--allow-empty', '-m', 'Change HEAD without changing the tree')
+                else:
+                    greeting.write_text('outside change\n')
+                try:
+                    job = self.wait(self.action(task_id, 'accept-plan', **binding))
+                    self.assertEqual(job['status'], 'failed', job)
+                    self.assertEqual(job['failure_kind'], 'dirty_workspace' if mismatch == 'dirty' else 'workspace_changed')
+                    current = self.task(task_id)
+                    self.assertTrue(current['lease'])
+                    self.assertEqual(current['planning']['plan_digest'], binding['plan_digest'])
+                    self.assertFalse(current.get('approved_plan_digest'))
+                    self.assertEqual(self.action(task_id, 'implement').status_code, 409)
+                finally:
+                    if mismatch == 'branch':
+                        git(self.project, 'switch', planned['task_branch'])
+                    elif mismatch == 'HEAD':
+                        git(self.project, 'reset', '--soft', planned['base_commit'])
+                    else:
+                        greeting.write_text('old\n')
+
+        request_id = str(uuid4())
+        accepted = self.wait(self.action(task_id, 'accept-plan', request_id=request_id, **binding))
+        self.assertEqual(accepted['status'], 'succeeded', accepted)
+        self.assertEqual(self.task(task_id)['current_stage'], 'plan_accepted')
+        self.assertEqual(self.task(task_id)['approved_plan_digest'], binding['plan_digest'])
+        repeated = self.action(task_id, 'accept-plan', request_id=request_id, **binding)
+        self.assertEqual(repeated.json()['job_id'], accepted['job_id'])
+
+    def test_staged_plan_keeps_clarified_criteria_and_scope_for_implementation(self):
+        task_id = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
+        settled = ['The greeting updates', 'The greeting remains local']
+        extra = 'The editor starts with the new greeting'
+
+        def clarify(ctx, briefing):
+            return {**PlanningAgent.clarify(self.agent, ctx, briefing), 'acceptance_criteria': settled}
+
+        def plan(ctx, briefing):
+            return {**PlanningAgent.plan(self.agent, ctx, briefing), 'acceptance_criteria': [settled[0], extra]}
+
+        with patch.object(self.agent, 'clarify', side_effect=clarify), patch.object(self.agent, 'plan', side_effect=plan):
+            self.assertEqual(self.wait(self.action(task_id, 'clarify'))['status'], 'succeeded')
+            self.assertEqual(self.wait(self.action(task_id, 'plan'))['status'], 'succeeded')
+        planned = self.task(task_id)
+        scope = ["Replace the current greeting 'old'"]
+        self.assertEqual(planned['planning']['acceptance_criteria'], [*settled, extra])
+        self.assertEqual(planned['planning']['scope'], scope)
+        binding = {'slot_id': planned['slot_id'], 'base_commit': planned['base_commit'],
+                   'plan_digest': planned['planning']['plan_digest']}
+        accepted = self.wait(self.action(task_id, 'accept-plan', **binding))
+        self.assertEqual(accepted['status'], 'succeeded', accepted)
+        implemented = self.wait(self.action(task_id, 'implement'))
+        self.assertEqual(implemented['status'], 'succeeded', implemented)
+        self.assertEqual(self.agent.implementation_briefs[-1]['acceptance_criteria'], [*settled, extra])
+        self.assertEqual(self.agent.implementation_briefs[-1]['scope'], scope)
 
     def test_clarify_waits_for_a_slot_and_can_reconnect_to_the_queued_job(self):
         first = self.create(workflow_mode='staged-feature', workflow_project_id='Game_Project-1')
@@ -163,7 +236,6 @@ class PlanningTests(unittest.TestCase):
         self.assertTrue(self.task(second)['lease'])
 
     def test_codex_clarification_reads_the_assigned_checkout_with_planning_permissions(self):
-        import json
         from pathlib import Path
 
         sibling = self.root / 'unleased-checkout'
@@ -257,7 +329,6 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.agent.calls[-1][1]['baseline_results'], records)
 
     def test_baseline_keeps_scoped_assertion_failure_as_evidence(self):
-
         scope = {'assembly': 'Tests', 'fixtures': ['Example.ExistingTests']}
         result = {'failed': 1, 'test_results': 'baseline.xml', 'failed_tests': [{'name': 'Example.ExistingTests.Case'}]}
         workspace = SimpleNamespace(unity=SimpleNamespace(), git=SimpleNamespace(
