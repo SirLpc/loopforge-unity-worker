@@ -89,6 +89,118 @@ def run_context(run, run_id, operation, project_id):
     return {**context, "plan_sha256": hashes.pop()}
 
 
+FEATURE_NODES = {
+    "clarify": "unity-scope", "design": "unity-planning", "implement": "unity-implementation",
+    "review": "unity-review", "test": "unity-verification", "accept": "decision",
+    "mr": "unity-delivery", "deliver": None,
+}
+ASSIGNMENT = ("task_id", "pool_id", "slot_id", "base_commit")
+HUMAN_APPROVAL = b"# Approval\n\nApproved by a human gate.\n"
+ARTIFACT_LIMIT = 8 * 1024 * 1024
+
+
+def feature_artifact(run, node_id, reader):
+    attempt = run["nodes"][node_id]["attempt"]
+    matches = [a for a in run.get("artifacts", []) if a.get("nodeId") == node_id and a.get("attempt") == attempt
+               and a.get("name") == FEATURE_NODES[node_id]]
+    if len(matches) != 1 or matches[0].get("runId") != run["id"]:
+        raise ContextError("Missing or ambiguous current artifact from " + node_id)
+    meta = matches[0]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", meta["id"]):
+        raise ContextError("Invalid platform artifact ID")
+    raw = reader(meta["id"])
+    if not isinstance(raw, bytes) or len(raw) > ARTIFACT_LIMIT or hashlib.sha256(raw).hexdigest() != meta["sha256"]:
+        raise ContextError("Platform content differs from its recorded digest")
+    return {key: meta[key] for key in ("id", "sha256", "name")}, raw
+
+
+def feature_context(run, run_id, project_id, artifact_reader, approval_key, now):
+    from workflow_approval import sign_approval
+
+    workflow_id = project_id + "-feature"
+    wf = run.get("workflowSnapshot", {})
+    kinds = [(n.get("id"), n.get("type")) for n in wf.get("nodes", [])]
+    edges = [(e.get("source"), e.get("target"), e.get("when")) for e in wf.get("edges", [])]
+    order = list(FEATURE_NODES)
+    if (run.get("id") != run_id or run.get("workflowId") != workflow_id or wf.get("id") != workflow_id
+            or wf.get("projectId") != project_id or run.get("executionContext", {}).get("projectId") != project_id
+            or run.get("status") != "running" or run.get("pauseRequested") or run.get("cancelRequested")
+            or sorted(kinds) != sorted((n, "approval" if n == "accept" else "script") for n in order)
+            or sorted(edges) != sorted((a, b, "success") for a, b in zip(order, order[1:]))):
+        raise ContextError("Run is outside the installed staged feature flow")
+    nodes = run["nodes"]
+    active = [n for n, state in nodes.items() if state.get("status") == "running"]
+    if len(active) != 1 or active[0] not in FEATURE_NODES or active[0] == "accept":
+        raise ContextError("No unique active feature script")
+    node = active[0]
+    state = nodes[node]
+    attempt = state["attempt"]
+    rework = nodes["implement"].get("reworkCount", 0)
+    feedback = state.get("feedback", "")
+    if (type(attempt) is not int or attempt < 1 or type(rework) is not int or rework < 0
+            or not isinstance(feedback, str) or len(feedback) > 4000 or "\0" in feedback):
+        raise ContextError("Invalid current feature execution")
+    scope = {"workflow_project_id": project_id, "workflow_id": workflow_id, "workflow_run_id": run_id}
+    context = {**scope, "node_id": node, "node_attempt": attempt, "rework": rework, "feedback": feedback,
+               "operation": "feature-" + ("delivery" if node == "deliver" else node)}
+    if node == "clarify":
+        requirement = run.get("input", "").strip()
+        if not 0 < len(requirement) <= 20000 or "\0" in requirement:
+            raise ContextError("Unsupported feature requirement")
+        context["requirement"] = requirement
+        return context
+
+    binding = dict(scope)
+    previous = approval_meta = None
+    for upstream in order[:order.index(node)]:
+        prior = nodes[upstream]
+        if prior.get("status") != "succeeded" or type(prior.get("attempt")) is not int or prior["attempt"] < 1:
+            raise ContextError("Feature predecessor has no successful current attempt")
+        meta, raw = feature_artifact(run, upstream, artifact_reader)
+        if upstream == "accept":
+            if raw != HUMAN_APPROVAL and not raw.startswith(HUMAN_APPROVAL + b"\n"):
+                raise ContextError("Current decision is not an approval by a human gate")
+            approval_meta = meta
+            continue
+        try:
+            record = json.loads(raw)
+        except (UnicodeError, ValueError) as error:
+            raise ContextError("Invalid feature evidence JSON") from error
+        expected = {**binding, "node_id": upstream, "node_attempt": prior["attempt"],
+                    "parent_artifact_id": previous["id"] if previous else None}
+        if not isinstance(record, dict) or any(k not in record or record[k] != v for k, v in expected.items()):
+            raise ContextError("Feature evidence does not belong to the current execution chain")
+        if upstream == "clarify":
+            binding.update({k: record[k] for k in ASSIGNMENT})
+        if upstream == "design":
+            binding["plan_digest"] = record["plan_digest"]
+        if upstream == "implement":
+            if record.get("implementation_attempt") != rework:
+                raise ContextError("Stale implementation round")
+            binding.update(revision=record["revision"], implementation_attempt=rework)
+        if upstream == "review":
+            review = record.get("review_result") or {}
+            if review.get("verdict") != "pass" or review.get("revision") != binding["revision"]:
+                raise ContextError("Missing current passing review")
+        if upstream == "test":
+            checked = {"revision": binding["revision"], "test_job_id": record["job_id"], "implementation_attempt": rework}
+            if record.get("verification") != checked:
+                raise ContextError("Missing current successful test job")
+            test_job_id = checked["test_job_id"]
+        if upstream == "mr" and record.get("approval_artifact_id") != approval_meta["id"]:
+            raise ContextError("Delivery receipt references a different approval")
+        previous = meta
+    context["upstream"] = previous
+    if node == "mr":
+        claims = {k: v for k, v in binding.items() if k != "workflow_project_id"}
+        claims.update(project_id=project_id, accept_attempt=nodes["accept"]["attempt"], test_job_id=test_job_id,
+                      approval_artifact_id=approval_meta["id"], approval_digest=approval_meta["sha256"],
+                      test_artifact_id=previous["id"], test_digest=previous["sha256"])
+        context["approval"] = sign_approval(claims, approval_key, now)
+    return context
+
+
+
 def service_client(base_url, secret):
     def call(path, payload=None):
         headers = {"Authorization": "Bearer " + secret, "Content-Type": "application/json"}
@@ -96,7 +208,10 @@ def service_client(base_url, secret):
         request = Request(base_url + path, data, headers)
         opener = build_opener(ProxyHandler({}), NoRedirect())
         with opener.open(request, timeout=6) as response:
-            return json.loads(response.read(8 * 1024 * 1024 + 1))
+            raw = response.read(ARTIFACT_LIMIT + 1)
+            if len(raw) > ARTIFACT_LIMIT:
+                raise ContextError("Platform response exceeds supported size")
+            return raw if "/artifacts/" in path else json.loads(raw)
     return call
 
 
@@ -142,7 +257,7 @@ def list_sandboxes():
     return result.stdout.split()
 
 
-def publish_workspace_contexts(workspace_root, context_secret, platform_call, project_id):
+def publish_workspace_contexts(workspace_root, context_secret, platform_call, project_id, approval_key=None):
     workspaces = {}
     issued = time.time()
     for sandbox in list_sandboxes():
@@ -151,11 +266,16 @@ def publish_workspace_contexts(workspace_root, context_secret, platform_call, pr
             run = platform_call("/api/runs/" + run_id)
             if (run.get("executionContext", {}).get("workspaceRunId") or run_id) != workspace_owner:
                 continue
-            if run.get("nodes", {}).get("worker-plan", {}).get("status") == "running":
-                operation = "plan"
+            if "clarify" in run.get("nodes", {}) and "mr" in run["nodes"]:
+                if not approval_key:
+                    continue
+                def artifact_reader(identifier):
+                    return platform_call("/api/runs/" + run_id + "/artifacts/" + identifier)
+                record = feature_context(run, run_id, project_id, artifact_reader, approval_key, issued)
+                operation = record["operation"]
             else:
-                operation = "approve"
-            record = run_context(run, run_id, operation, project_id)
+                operation = "plan" if run.get("nodes", {}).get("worker-plan", {}).get("status") == "running" else "approve"
+                record = run_context(run, run_id, operation, project_id)
         except (ContextError, KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError):
             continue
         workspaces.setdefault(workspace_owner, {})[sandbox] = {"operation": operation, **record}
@@ -173,6 +293,7 @@ def main():
     parser.add_argument("--platform-url", default="http://127.0.0.1:8090")
     parser.add_argument("--platform-token-file", type=Path, required=True)
     parser.add_argument("--context-token-file", type=Path, required=True)
+    parser.add_argument("--approval-key-file", type=Path, help="Protected staged delivery signing key")
     parser.add_argument("--runner-workspaces", type=Path, required=True)
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.project_id):
@@ -181,12 +302,18 @@ def main():
     context_secret = args.context_token_file.read_text(encoding="utf-8").strip()
     if not platform_secret or len(context_secret) < 32 or hmac.compare_digest(context_secret, platform_secret):
         raise SystemExit("Configure independent protected platform and context credentials")
+    approval_key = None
+    if args.approval_key_file:
+        approval_key = args.approval_key_file.read_text(encoding="ascii").rstrip("\r\n")
+        if (len(approval_key) < 32 or not approval_key.isprintable() or " " in approval_key
+                or approval_key in {context_secret, platform_secret}):
+            raise SystemExit("Configure an independent protected workflow approval key")
     platform_call = service_client(args.platform_url.rstrip("/"), platform_secret)
     workspace_root = args.runner_workspaces.resolve(strict=True)
     try:
         while True:
             try:
-                publish_workspace_contexts(workspace_root, context_secret, platform_call, args.project_id)
+                publish_workspace_contexts(workspace_root, context_secret, platform_call, args.project_id, approval_key)
             except (OSError, subprocess.SubprocessError):
                 pass
             time.sleep(2)

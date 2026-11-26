@@ -1,0 +1,346 @@
+"""Staged feature actions for the standalone LoopForge Runner client."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import signal
+import sys
+from pathlib import Path
+from uuid import UUID, uuid4
+
+if "SOP_ARGS" in globals():
+    api = sys.modules[__name__]
+elif __package__:
+    from . import worker_client as api
+else:
+    import worker_client as api
+
+
+OUTPUTS = {
+    "clarify": ("unity-scope", "requirement"), "design": ("unity-planning", "design"),
+    "implement": ("unity-implementation", "implementation"), "review": ("unity-review", "review"),
+    "test": ("unity-verification", "test-report"), "mr": ("unity-delivery", "mr-body"),
+    "deliver": (None, "delivery"),
+}
+SCOPE = ("workflow_project_id", "workflow_id", "workflow_run_id")
+ASSIGNMENT = ("task_id", "pool_id", "slot_id", "base_commit")
+
+
+def require(condition, message):
+    if not condition:
+        raise api.ClientError(message)
+
+
+def mounted_evidence(ref):
+    require(re.fullmatch(r"unity-[a-z]+", ref["name"]), "Invalid upstream artifact name")
+    for path in Path(".agentflow/inputs").glob("**/" + ref["name"] + ".json"):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+            continue
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() == ref["sha256"]:
+            value = json.loads(raw)
+            require(isinstance(value, dict), "Invalid mounted feature evidence")
+            return value
+    raise api.ClientError("No mounted artifact matches the current platform digest")
+
+
+def write_report(node, sections):
+    title = {"clarify": "需求定型", "design": "方案设计", "implement": "开发实现", "review": "独立评审",
+             "test": "测试验证", "mr": "发起 MR", "deliver": "交付汇总"}[node]
+    lines = ["# " + title, ""]
+    for label, value in sections.items():
+        lines.extend(["## " + label, ""])
+        if isinstance(value, str):
+            lines.append(value)
+        else:
+            lines.extend(["```json", json.dumps(value, ensure_ascii=False, indent=2), "```"])
+        lines.append("")
+    path = Path(OUTPUTS[node][1] + ".md")
+    tmp = path.with_name("." + path.name + "." + uuid4().hex)
+    try:
+        tmp.write_text("\n".join(lines), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+class FeatureStage:
+    def __init__(self, client, args, context):
+        self.client = client
+        self.args = args
+        self.ctx = context
+        self.node = context["node_id"]
+        self.attempt = context["node_attempt"]
+        self.ref = context.get("upstream")
+        self.source = mounted_evidence(self.ref) if self.ref else {}
+        expected = "feature-" + ("delivery" if self.node == "deliver" else self.node)
+        require(expected == args.action and (self.node == "clarify") == (self.ref is None),
+                "Signed context belongs to a different stage")
+        if self.source:
+            require(all(self.source.get(k) == context[k] for k in SCOPE) and self.source["pool_id"] == args.pool,
+                    "Upstream evidence belongs to a different workflow or pool")
+            task_id = self.source["task_id"]
+        else:
+            payload = {"workflow_mode": "staged-feature", "planning_profile": "feature", "pool_id": args.pool,
+                       "workflow_project_id": context["workflow_project_id"], "workflow_run_id": context["workflow_run_id"],
+                       "requirement": context["requirement"],
+                       "request_id": api.operation_id(context["workflow_run_id"], "feature-create", 0)}
+            task_id = client.request("/api/v1/planning-tasks", payload)["task_id"]
+        self.task_id = str(UUID(task_id))
+        self.path = "/api/v1/tasks/" + self.task_id
+        self.task = client.request(self.path)
+        self.check_task()
+        self.scope = ":".join((self.task_id, self.node, self.ref["id"] if self.ref else "create",
+                               str(context["rework"])))
+        self.last_job = None
+
+    def check_task(self):
+        t = self.task
+        require(t.get("task_id") == self.task_id and t.get("workflow_mode") == "staged-feature"
+                and t.get("planning_profile") == "feature" and t.get("pool_id") == self.args.pool
+                and all(t.get(k) == self.ctx[k] for k in ("workflow_run_id", "workflow_project_id")),
+                "Worker assignment does not match this staged feature")
+        if self.source:
+            require(all(t.get(k) == self.source[k] for k in ASSIGNMENT), "Worker slot or Git baseline changed")
+
+    def state_file(self, operation):
+        return Path(".unity-feature-" + api.operation_id(self.scope, operation, 0) + ".json")
+
+    def job(self, action, payload=None, *, version="", predecessor=None):
+        """Replay the bound request. Only a later platform attempt can replace a failed request."""
+        payload = payload or {}
+        operation = action + ":" + version
+        path = self.state_file(operation)
+        saved = api.read_json(path) if path.is_file() else {}
+        if not saved and predecessor is not None:
+            require(self.task["job_id"] == predecessor, "Current Worker job differs from the upstream evidence")
+        first = saved.get("attempt", self.attempt)
+        require(type(first) is int and 1 <= first <= self.attempt, "Invalid operation checkpoint")
+        for attempt in dict.fromkeys((first, self.attempt)):
+            generation = saved.get("generation", 0) if attempt == first else attempt
+            require(type(generation) is int and generation in (0, attempt), "Invalid operation generation")
+            request_id = api.operation_id(self.scope, operation, generation)
+            api.save_json(path, {"attempt": attempt, "generation": generation, "request_id": request_id})
+            submitted = self.client.request(self.path + "/" + action, {**payload, "request_id": request_id})
+            actions = {"commit", "pr"} if action == "workflow-deliver" else {action}
+            require(submitted["task_id"] == self.task_id and submitted["action"] in actions,
+                    "Worker returned a different operation")
+            job_id = str(UUID(submitted["job_id"]))
+            try:
+                self.task, job = api.wait_job(self.client, self.path, job_id, self.args.wait_seconds, self.args.follow,
+                                             queue_wait_seconds=self.args.queue_wait_seconds)
+            except (KeyboardInterrupt, api.Interrupted):
+                current = self.client.request(self.path)
+                running = self.client.request("/api/v1/jobs/" + job_id)
+                if current.get("job_id") == job_id and running["status"] in {"queued", "running"}:
+                    self.client.request(self.path + "/cancel", {"request_id": api.operation_id(job_id, "cancel", 0)})
+                raise api.ClientError("Node stopped while waiting for Worker job " + job_id) from None
+            self.check_task()
+            require(job["task_id"] == self.task_id and job["job_id"] == job_id and job["action"] in actions,
+                    "Worker polling returned a different operation")
+            self.last_job = job
+            if job["status"] == "succeeded":
+                return job
+            if (attempt == self.attempt or submitted["status"] in {"queued", "running"}
+                    or job["status"] != "failed"):
+                break
+        failure = {k: job.get(k) for k in ("job_id", "action", "status", "failure_kind", "error_message", "stage_result")}
+        evidence = {"Worker 作业": failure, "Worker 产物": api.handoff(self.task, job)["artifact_reference"]}
+        if self.task.get("delivery"):
+            evidence["已记录的交付"] = self.task["delivery"]
+        write_report(self.node, evidence)
+        raise api.ClientError(f"Worker {action} job {job_id}: {job.get('failure_kind') or job['status']}")
+
+    def current(self, stage):
+        require(self.task["job_id"] == self.last_job["job_id"] and self.task["current_stage"] == stage,
+                "A different Worker job or phase is current")
+
+    def clarify(self):
+        options = {"queue_wait_seconds": self.args.queue_wait_seconds} if self.args.queue_wait_seconds else {}
+        self.job("clarify", options)
+        self.current("clarified")
+        require(self.task["lease"], "No active clarification lease")
+        return {"clarification": self.task["clarification"]}, {"需求": self.ctx["requirement"], "定型结果": self.task["clarification"]}
+
+    def design(self):
+        require(self.task["clarification"] == self.source["clarification"] and self.task["lease"],
+                "Worker clarification differs from the current scope")
+        self.job("plan", {"feedback": ""}, predecessor=self.source["job_id"])
+        self.current("plan_ready")
+        plan = api.planning_artifact(self.task)
+        return plan, {"需求": plan["requirement_summary"], "方案": plan["plan"], "验收标准": plan["acceptance_criteria"],
+                      "源码依据": plan["source_evidence"], "基线检查": plan["baseline"], "测试范围": plan["test_selection"]}
+
+    def implement(self):
+        plan = self.source
+        api.check_planning_assignment(self.task, plan)
+        require(self.task["lease"], "Worker no longer holds the planning lease")
+        if not self.task.get("approved_plan_digest"):
+            self.job("accept-plan", {k: plan[k] for k in ("slot_id", "base_commit", "plan_digest")},
+                     predecessor=plan["job_id"])
+            self.current("plan_accepted")
+        require(self.task["approved_plan_digest"] == plan["plan_digest"], "Worker did not freeze the matched plan")
+        worker_round, target = self.task["implementation_attempt"], self.ctx["rework"]
+        require(worker_round <= target <= worker_round + 1, "Stale or skipped Worker rework round")
+        edit_path = self.state_file("edit-selection")
+        edit = api.read_json(edit_path) if edit_path.is_file() else {}
+        if edit.get("attempt") != self.attempt:
+            if (self.task["status"] == "failed" and self.task.get("failure_kind") in
+                    {"compile_failed", "tests_failed", "review_changes", "asset_metadata"}):
+                edit["fix"] = self.task["job_id"]
+                edit.pop("recompile", None)
+            elif (self.task["status"] == "failed" and self.task.get("failure_kind") in {"workspace_changed", "unity_changed"}
+                  and self.task["current_stage"] in {"compile", "review", "test", "commit"}):
+                edit["recompile"] = self.task["job_id"]
+            edit["attempt"] = self.attempt
+            api.save_json(edit_path, edit)
+        if edit.get("fix"):
+            self.job("fix", version=str(UUID(edit["fix"])))
+        elif target:
+            feedback = self.task["rework_feedback"] if worker_round == target else self.ctx["feedback"]
+            self.job("rework", {"workflow_run_id": self.ctx["workflow_run_id"], "implementation_attempt": target,
+                                "feedback": feedback})
+        else:
+            self.job("implement")
+        require(self.task["implementation_attempt"] == target, "Worker edited a different round")
+        compile_version = edit.get("recompile") or self.last_job["job_id"]
+        self.job("compile", version=compile_version)
+        self.current("compiled")
+        revision = self.task["revision"]
+        require(revision and self.task["compile_report"]["revision"] == revision, "Compiled tree changed")
+        fields = {"plan_digest": plan["plan_digest"], "revision": revision, "implementation_attempt": target,
+                  "changed_files": self.task.get("changed_files", []), "compile_report": self.task["compile_report"]}
+        return fields, {"修改": fields["changed_files"], "实现结果": self.task.get("implementation_result"),
+                        "编译结果": fields["compile_report"]}
+
+    def validated_tree(self):
+        require(all(self.source.get(k) == self.task.get(k) for k in ("revision", "implementation_attempt"))
+                and self.source["implementation_attempt"] == self.ctx["rework"]
+                and self.task["approved_plan_digest"] == self.source["plan_digest"] and self.source["revision"],
+                "Upstream evidence differs from the current Worker revision, round or frozen plan")
+        return {k: self.source[k] for k in ("revision", "implementation_attempt", "plan_digest")}
+
+    def review(self):
+        fields = self.validated_tree()
+        require(self.task["compile_report"] == self.source["compile_report"], "Worker compile evidence changed")
+        self.job("review", predecessor=self.source["job_id"])
+        self.current("reviewed")
+        self.validated_tree()
+        result = self.task["review_result"]
+        require(result["revision"] == fields["revision"] and result["verdict"] == "pass", "Review did not pass")
+        return {**fields, "review_result": result}, {"独立评审": result}
+
+    def test(self):
+        fields = self.validated_tree()
+        review = self.task["review_result"]
+        require(review == self.source["review_result"] and review["verdict"] == "pass"
+                and review["revision"] == fields["revision"], "Worker lacks the current passing review")
+        self.job("test", predecessor=self.source["job_id"])
+        self.current("tested")
+        self.validated_tree()
+        verification = self.task.get("verification")
+        require(verification == {"revision": fields["revision"], "implementation_attempt": fields["implementation_attempt"],
+                                 "test_job_id": self.last_job["job_id"]}, "Missing successful current test verification")
+        report = self.task["test_report"]
+        return {**fields, "verification": verification, "test_report": report}, {"验证记录": verification, "测试结果与范围": report}
+
+    def checked_tests(self):
+        fields = self.validated_tree()
+        verification = self.source["verification"]
+        require(self.task.get("verification") == verification and self.task["test_report"] == self.source["test_report"],
+                "Worker verification or tests differ from the current platform evidence")
+        return {**fields, "verification": verification, "test_report": self.source["test_report"]}
+
+    def resume_receipt(self, actions):
+        job_id = str(UUID(self.task["job_id"]))
+        job = self.client.request("/api/v1/jobs/" + job_id)
+        require(job["task_id"] == self.task_id and job["job_id"] == job_id, "Worker returned a foreign receipt")
+        if job["action"] not in actions or job["status"] not in {"running", "queued", "succeeded"}:
+            return False
+        if job["status"] in {"queued", "running"}:
+            self.task, job = api.wait_job(self.client, self.path, job_id, self.args.wait_seconds, self.args.follow)
+            self.check_task()
+        require(job["status"] == "succeeded", "Missing completed Worker receipt")
+        self.last_job = job
+        return True
+
+    def mr(self):
+        fields = self.checked_tests()
+        approval = self.ctx["approval"]
+        claims = approval["claims"]
+        expected = {**{k: self.source[k] for k in (*ASSIGNMENT, "workflow_id", "workflow_run_id", "plan_digest",
+                                                   "revision", "implementation_attempt")},
+                    "project_id": self.ctx["workflow_project_id"], "test_job_id": self.source["job_id"],
+                    "test_artifact_id": self.ref["id"], "test_digest": self.ref["sha256"]}
+        require(all(claims[k] == v for k, v in expected.items()), "Delivery approval differs from the tested assignment")
+        previous = self.task.get("approval")
+        if previous:
+            require(previous.get("claims") == claims, "Worker is delivering a different approval")
+        if not previous or not self.resume_receipt({"commit", "pr"}):
+            self.job("workflow-deliver", {"approval": approval}, version=claims["approval_artifact_id"],
+                     predecessor=None if previous else self.source["job_id"])
+        self.current("delivered")
+        self.checked_tests()
+        require(self.task["status"] == "completed" and self.task["approval"]["claims"] == claims,
+                "Worker did not finish this approved delivery")
+        delivery = self.task["delivery"]
+        require(delivery["pushed"] and delivery["commit_sha"] and delivery["mr_status"] in {"created", "pending"},
+                "Worker lacks a durable delivery receipt")
+        return {**fields, "delivery": delivery, "approval_artifact_id": claims["approval_artifact_id"]}, {"分支和 MR": delivery}
+
+    def deliver(self):
+        self.checked_tests()
+        delivery = self.task["delivery"]
+        require(self.task["status"] == "completed" and self.task["current_stage"] == "delivered"
+                and delivery == self.source["delivery"] and delivery["pushed"]
+                and self.task["approval"]["claims"]["approval_artifact_id"] == self.source["approval_artifact_id"],
+                "Worker delivery changed before release")
+        if self.task["job_id"] == self.source["job_id"] or not self.resume_receipt({"release"}):
+            require(self.task["lease"], "Worker has already released the slot without a matching receipt")
+            self.job("release", predecessor=self.source["job_id"])
+        self.current("delivered")
+        require(self.task["lease"] is False and self.last_job["stage_result"].get("released") is True,
+                "Worker did not confirm release")
+        return {}, {"验证记录": self.source["verification"], "测试结果与范围": self.source["test_report"],
+                    "分支和 MR": delivery, "槽位归还": {"slot_id": self.task["slot_id"], "released": True,
+                                                     "released_at": self.task.get("released_at")}}
+
+    def run(self):
+        fields, sections = getattr(self, self.node)()
+        record = {**{k: self.ctx[k] for k in (*SCOPE, "node_id", "node_attempt")},
+                  **{k: self.task[k] for k in ASSIGNMENT}, **fields, "job_id": self.last_job["job_id"],
+                  "parent_artifact_id": self.ref["id"] if self.ref else None}
+        references = api.handoff(self.task, self.last_job)["artifact_reference"]
+        record["artifact_reference"] = references
+        name = OUTPUTS[self.node][0]
+        if name:
+            api.save_json(name + ".json", record)
+        write_report(self.node, {**sections, "Worker 任务": self.task_id, "Worker 作业": record["job_id"],
+                                 "Worker 产物": references})
+        return 0
+
+
+def feature_main(argv):
+    actions = ["feature-" + ("delivery" if n == "deliver" else n) for n in OUTPUTS]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=actions)
+    parser.add_argument("--pool", required=True)
+    parser.add_argument("--wait-seconds", type=int, default=int(os.environ.get("UNITY_WORKER_WAIT_SECONDS", "14400")))
+    parser.add_argument("--queue-wait-seconds", type=int)
+    parser.add_argument("--follow", action="store_true")
+    args = parser.parse_args(argv)
+    if args.wait_seconds <= 0 or (args.queue_wait_seconds is not None and
+                                  (args.action != "feature-clarify" or not 1 <= args.queue_wait_seconds <= 86400)):
+        parser.error("Select a positive wait and a clarify queue timeout from 1 to 86400")
+    def interrupt(signum, frame):
+        raise api.Interrupted("Runner stopped the feature stage")
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        context = api.planning_context(args.action)
+        client = api.Client(os.environ.get("UNITY_WORKER_URL", ""), os.environ.get("UNITY_WORKER_TOKEN", ""))
+        return FeatureStage(client, args, context).run()
+    except (OSError, KeyError, TypeError, ValueError, api.ClientError) as error:
+        print("Unity Worker: " + str(error), file=sys.stderr)
+        return 1

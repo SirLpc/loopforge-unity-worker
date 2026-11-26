@@ -86,3 +86,77 @@ class PlanningContextTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 write_context(root, "run-891", {"replaced": True})
             self.assertEqual(json.loads(target.read_text()), record)
+
+class FeatureContextTests(unittest.TestCase):
+    def setUp(self):
+        import hashlib
+        from uuid import uuid4
+        from integrations.loopforge import planning_context
+
+        self.relay = planning_context
+        self.key = "relay-test-key-" * 3
+        self.run_id = "run-890"
+        self.task_id, self.test_job_id = str(uuid4()), str(uuid4())
+        order = ("clarify", "design", "implement", "review", "test", "accept", "mr", "deliver")
+        self.run = {
+            "id": self.run_id, "workflowId": PROJECT + "-feature", "status": "running", "input": "Add a garden",
+            "executionContext": {"projectId": PROJECT}, "workflowSnapshot": {
+                "id": PROJECT + "-feature", "projectId": PROJECT,
+                "nodes": [{"id": n, "type": "approval" if n == "accept" else "script"} for n in order],
+                "edges": [{"source": a, "target": b, "when": "success"} for a, b in zip(order, order[1:])]},
+            "nodes": {n: {"nodeId": n, "attempt": 3, "status": "succeeded", "reworkCount": int(n == "implement")}
+                      for n in order}, "artifacts": []}
+        self.run["nodes"]["mr"]["status"] = "running"
+        self.run["nodes"]["deliver"]["status"] = "pending"
+        self.bodies = {}
+        parent = None
+        for node, name in zip(order, ("unity-scope", "unity-planning", "unity-implementation", "unity-review",
+                                      "unity-verification", "decision")):
+            identifier = "artifact-94-" + node
+            record = dict(node_id=node, node_attempt=3, workflow_project_id=PROJECT, workflow_id=PROJECT + "-feature",
+                          workflow_run_id=self.run_id, task_id=self.task_id, pool_id="garden", slot_id="slot-2",
+                          base_commit="b" * 40, parent_artifact_id=parent, job_id=str(uuid4()))
+            if node != "clarify":
+                record["plan_digest"] = "e" * 64
+            if node in {"implement", "review", "test"}:
+                record.update(revision="f" * 40, implementation_attempt=1)
+            if node == "review":
+                record["review_result"] = {"verdict": "pass", "revision": record["revision"]}
+            if node == "test":
+                record["job_id"] = self.test_job_id
+                record["verification"] = {"revision": record["revision"], "test_job_id": self.test_job_id,
+                                          "implementation_attempt": 1}
+            body = (b"# Approval\n\nApproved by a human gate.\n\nReviewed tests\n" if node == "accept"
+                    else json.dumps(record).encode())
+            self.run["artifacts"].append(dict(id=identifier, runId=self.run_id, nodeId=node, attempt=3,
+                                              name=name, sha256=hashlib.sha256(body).hexdigest()))
+            self.bodies[identifier] = body
+            parent = identifier
+
+    def context(self):
+        return self.relay.feature_context(self.run, self.run_id, PROJECT, self.bodies.__getitem__, self.key, 1000)
+
+    def test_feature_signs_only_current_approval_and_test_artifact(self):
+        from workflow_approval import verify_approval
+        claims = verify_approval(self.context()["approval"], self.key, 1001)
+        self.assertEqual((claims["accept_attempt"], claims["implementation_attempt"]), (3, 1))
+        self.assertEqual((claims["test_job_id"], claims["test_artifact_id"], claims["approval_artifact_id"]),
+                         (self.test_job_id, "artifact-94-test", "artifact-94-accept"))
+        for field, replacement in (("attempt", 2), ("runId", "run-891"), ("sha256", "a" * 64)):
+            with self.subTest(field=field), patch.dict(self.run["artifacts"][4], {field: replacement}):
+                with self.assertRaises(ContextError):
+                    self.context()
+        with patch.dict(self.run["nodes"]["mr"], status="pending"), self.assertRaises(ContextError):
+            self.context()
+
+    def test_feature_rejects_manual_pass_and_cross_assignment_or_old_round(self):
+        import hashlib
+        for node, values in (("accept", None), ("review", {"task_id": "ee"}), ("test", {"node_attempt": 2}),
+                             ("test", {"implementation_attempt": 0}), ("design", {"parent_artifact_id": "old"})):
+            meta = next(a for a in self.run["artifacts"] if a["nodeId"] == node)
+            original = self.bodies[meta["id"]]
+            body = (json.dumps({**json.loads(original), **values}).encode() if values else
+                    b"# Manual pass\n\n# Approval\n\nApproved by a human gate.\n")
+            with (self.subTest(node=node, values=values), patch.dict(self.bodies, {meta["id"]: body}),
+                  patch.dict(meta, sha256=hashlib.sha256(body).hexdigest()), self.assertRaises(ContextError)):
+                self.context()

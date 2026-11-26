@@ -222,3 +222,246 @@ class ScriptTests(unittest.TestCase):
         code, _calls, artifact, _task_id, job_id = self.run_existing_plan("failed", "queue_timeout")
         self.assertEqual(code, 1)
         self.assertEqual(artifact["job_id"], job_id)
+
+class FeatureScriptTests(unittest.TestCase):
+    def test_feature_node_reconnect_uses_existing_job(self):
+        import json
+        from contextlib import chdir
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from support import test_directory
+        from integrations.loopforge import worker_client
+
+        task_id, test_id = str(uuid4()), str(uuid4())
+        base = {"workflow_project_id": "garden", "workflow_run_id": "run-123", "workflow_id": "garden-feature",
+                "task_id": task_id, "slot_id": "one", "pool_id": "pool", "base_commit": "a" * 40,
+                "plan_digest": "c" * 64, "revision": "b" * 40, "implementation_attempt": 0}
+        verification = {"revision": base["revision"], "test_job_id": test_id, "implementation_attempt": 0}
+        report = {"editmode": {"status": "passed", "runs": [{"passed": 8}]},
+                  "playmode": {"status": "not_run", "reason": "No approved scope for this mode"}}
+        task = {**base, "workflow_mode": "staged-feature", "planning_profile": "feature", "status": "awaiting_approval",
+                "current_stage": "tested", "approved_plan_digest": base["plan_digest"], "lease": True,
+                "verification": verification, "test_report": report, "artifacts": [], "job_id": test_id}
+        claims = {"project_id": "garden", **{k: base[k] for k in base if k != "workflow_project_id"},
+                  "test_job_id": test_id, "accept_attempt": 1, "approval_artifact_id": "accept-1",
+                  "approval_digest": "a" * 64, "test_artifact_id": "test-1"}
+        requests, jobs, side_effects = {}, {}, []
+        deny_new_operation = [False]
+        finishing = []
+        finishing_task = {}
+        receipt = {"pushed": True, "mr_status": "failed", "commit_sha": "f" * 40, "task_branch": "task-1",
+                   "base_branch": "main", "remote": "origin"}
+        def request(path, payload=None):
+            if payload is None:
+                if "/jobs/" in path:
+                    result = jobs[path.rsplit("/", 1)[-1]]
+                    if finishing and result["job_id"] == finishing[-1]:
+                        finishing.pop()
+                        task.update(finishing_task)
+                        finishing_task.clear()
+                        return {**result, "status": "running"}
+                    return result
+                return dict(task)
+            action = path.rsplit("/", 1)[-1]
+            if payload["request_id"] in requests:
+                return jobs[requests[payload["request_id"]]]
+            self.assertFalse(deny_new_operation[0], "A completed operation was admitted again after reconnect")
+            if action == "workflow-deliver":
+                self.assertEqual(set(payload), {"request_id", "approval"})
+                self.assertEqual(payload["approval"]["claims"], claims)
+                action = "pr" if task.get("delivery", {}).get("pushed") else "commit"
+            else:
+                self.assertEqual(action, "release")
+            side_effects.append(action)
+            job_id = str(uuid4())
+            if action == "commit":
+                task.update(delivery=dict(receipt), status="failed", current_stage="commit", failure_kind="pr_failed",
+                            pushed=True, approved_revision=base["revision"], approval={"claims": claims})
+            if action == "pr":
+                receipt.update(mr_status="created", pull_request={"url": "https://example.invalid/mr/3"})
+                task.update(delivery=dict(receipt), status="completed", current_stage="delivered", failure_kind=None)
+            if action == "release":
+                task.update(lease=False, released_at="2026-11-26")
+            task["job_id"] = job_id
+            jobs[job_id] = {"task_id": task_id, "job_id": job_id, "action": action,
+                            "status": "failed" if action == "commit" else "succeeded",
+                            "failure_kind": "pr_failed" if action == "commit" else None,
+                            "stage_result": {"released": True} if action == "release" else dict(receipt)}
+            requests[payload["request_id"]] = job_id
+            return jobs[job_id]
+
+        with test_directory() as root, chdir(root):
+            import hashlib
+            mounted = Path(".agentflow/inputs/test")
+            mounted.mkdir(parents=True)
+            src = mounted / "unity-verification.json"
+            record = {**base, "node_id": "test", "node_attempt": 1, "job_id": test_id, "verification": verification,
+                      "test_report": report, "parent_artifact_id": "review-1"}
+            src.write_text(json.dumps(record))
+            claims["test_digest"] = hashlib.sha256(src.read_bytes()).hexdigest()
+            ctx = {**{k: base[k] for k in ("workflow_project_id", "workflow_id", "workflow_run_id")},
+                   "node_id": "mr", "node_attempt": 1, "rework": 0, "feedback": "",
+                   "upstream": {"id": "test-1", "name": "unity-verification", "sha256": claims["test_digest"]},
+                   "approval": {"claims": claims, "issued_at": 1000, "signature": "s" * 64}}
+            with patch.object(worker_client, "planning_context", return_value=ctx), patch.object(
+                    worker_client, "Client", return_value=SimpleNamespace(request=request)):
+                args = ["feature-mr", "--pool", "pool"]
+                self.assertEqual(worker_client.main(args), 1)
+                self.assertEqual(worker_client.main(args), 1)
+                ctx["node_attempt"] = 2
+                self.assertEqual(worker_client.main(args), 0)
+                self.assertEqual(worker_client.main(args), 0)
+                for checkpoint in Path(".").glob(".unity-feature-*.json"):
+                    checkpoint.unlink()
+                deny_new_operation[0] = True
+                finishing.append(task["job_id"])
+                finishing_task.update(status="completed", current_stage="delivered")
+                task.update(status="failed", current_stage="commit")
+                ctx["node_attempt"] = 3
+                self.assertEqual(worker_client.main(args), 0)
+                deny_new_operation[0] = False
+                self.assertEqual(side_effects, ["commit", "pr"])
+                src = Path("unity-delivery.json")
+                final = json.loads(src.read_bytes())
+                self.assertEqual(final["delivery"]["commit_sha"], "f" * 40)
+                (mounted / src.name).write_bytes(src.read_bytes())
+                ctx.update(node_id="deliver", node_attempt=1, upstream={"id": "mr-2", "name": "unity-delivery",
+                           "sha256": hashlib.sha256(src.read_bytes()).hexdigest()})
+                ctx.pop("approval")
+                for _ in range(2):
+                    self.assertEqual(worker_client.main(["feature-delivery", "--pool", "pool"]), 0)
+                for checkpoint in Path(".").glob(".unity-feature-*.json"):
+                    checkpoint.unlink()
+                deny_new_operation[0] = True
+                finishing.append(task["job_id"])
+                finishing_task.update(lease=False)
+                task["lease"] = True
+                ctx["node_attempt"] = 2
+                self.assertEqual(worker_client.main(["feature-delivery", "--pool", "pool"]), 0)
+                self.assertEqual(side_effects, ["commit", "pr", "release"])
+                self.assertIn("8", Path("delivery.md").read_text(encoding="utf-8"))
+                self.assertIn("not_run", Path("delivery.md").read_text(encoding="utf-8"))
+
+    def test_feature_rendered_client_starts_standalone(self):
+        import tempfile
+        script = Path("integrations/loopforge/worker_client.py").resolve()
+        rendered = subprocess.check_output([sys.executable, str(script), "render", "feature-review", "--help"])
+        with tempfile.TemporaryDirectory() as other:
+            result = subprocess.run([sys.executable, "-I", "-"], input=rendered, capture_output=True, cwd=other)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"feature-review", result.stdout)
+
+
+    def test_feature_stages_freeze_then_compile_review_test_and_resume_reserved_rework(self):
+        import hashlib
+        import json
+        from contextlib import chdir
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from support import test_directory
+        from integrations.loopforge import worker_client
+
+        task_id = str(uuid4())
+        scope = {"goal": "Grow", "scope": "Garden", "acceptance_criteria": ["Trees grow"]}
+        planning = {"plan_digest": "a" * 64, "plan": "Use Garden.cs", "requirement_summary": "Grow",
+                    "acceptance_criteria": ["Trees grow"], "test_selection": {"editmode": ["Trees"]},
+                    "source_evidence": [], "baseline": []}
+        task = {"task_id": task_id, "current_stage": "created", "status": "pending", "lease": False,
+                "implementation_attempt": 0, "artifacts": [], "revision": None, "approved_plan_digest": None}
+        ctx = {"workflow_run_id": "run-90", "workflow_project_id": "garden", "workflow_id": "garden-feature",
+               "node_id": "clarify", "node_attempt": 1, "rework": 0, "feedback": "", "requirement": "Grow"}
+        jobs, ids, operations = {}, {}, []
+        def request(path, payload=None):
+            if payload is None:
+                if "/jobs/" in path:
+                    job = jobs[path.rsplit("/", 1)[-1]]
+                    if job["action"] == "accept-plan":
+                        task.update(approved_plan_digest=planning["plan_digest"], current_stage="plan_accepted")
+                        job["status"] = "succeeded"
+                    return job
+                return dict(task)
+            action = path.rsplit("/", 1)[-1]
+            if payload["request_id"] in ids:
+                return jobs[ids[payload["request_id"]]]
+            operations.append(action)
+            job = {"task_id": task_id, "action": action, "job_id": str(uuid4()), "status": "succeeded"}
+            if action == "planning-tasks":
+                self.assertEqual({k: payload[k] for k in ("workflow_mode", "workflow_project_id", "workflow_run_id",
+                                                         "planning_profile", "pool_id", "requirement")},
+                                 {"workflow_mode": "staged-feature", "workflow_project_id": "garden",
+                                  "workflow_run_id": "run-90", "planning_profile": "feature", "pool_id": "pool",
+                                  "requirement": "Grow"})
+                task.update(payload)
+            elif action == "clarify":
+                task.update(clarification=scope, slot_id="s1", lease=True, base_commit="a" * 40, current_stage="clarified")
+            elif action == "plan":
+                task.update(planning=planning, current_stage="plan_ready", status="awaiting_plan_approval")
+            elif action == "accept-plan":
+                job["status"] = "running"
+            elif action == "implement":
+                self.assertEqual(task["current_stage"], "plan_accepted")
+                task.update(current_stage="implemented", revision="b" * 40)
+            elif action == "rework":
+                self.assertEqual(payload["implementation_attempt"], 1)
+                self.assertEqual(payload["feedback"], "Use two trees")
+                task.update(implementation_attempt=1, rework_feedback=payload["feedback"], verification=None)
+                if operations.count("rework") == 1:
+                    job.update(status="failed", failure_kind="timeout")
+                    task.update(status="failed", current_stage="fix", rework_pending=True, failure_kind="timeout")
+                else:
+                    task.update(status="fixing", current_stage="implemented", rework_pending=False, revision="c" * 40)
+            elif action == "compile":
+                task.update(current_stage="compiled", compile_report={"revision": task["revision"]})
+            elif action == "review":
+                task.update(current_stage="reviewed", review_result={"verdict": "pass", "revision": task["revision"]})
+            elif action == "test":
+                task.update(status="awaiting_approval", current_stage="tested", test_report={"editmode": {"status": "passed"}},
+                            verification={"revision": task["revision"], "implementation_attempt": 0, "test_job_id": job["job_id"]})
+            else:
+                self.fail("Unexpected operation " + action)
+            jobs[job["job_id"]] = job
+            ids[payload["request_id"]] = job["job_id"]
+            task["job_id"] = job["job_id"]
+            return dict(job)
+
+        with test_directory() as root, chdir(root), patch.object(worker_client, "planning_context", return_value=ctx), patch.object(
+                worker_client, "Client", return_value=SimpleNamespace(request=request)):
+            mounted = Path(".agentflow/inputs")
+            mounted.mkdir(parents=True)
+            upstream = {}
+            for node, output in (("clarify", "scope"), ("design", "planning"), ("implement", "implementation"),
+                                 ("review", "review"), ("test", "verification")):
+                ctx["node_id"] = node
+                if node in ("review", "test"):
+                    current = task["job_id"]
+                    task["job_id"] = str(uuid4())
+                    with self.subTest(concurrent=node):
+                        self.assertEqual(worker_client.main(["feature-" + node, "--pool", "pool"]), 1)
+                        self.assertNotIn(node, operations)
+                    task["job_id"] = current
+                self.assertEqual(worker_client.main(["feature-" + node, "--pool", "pool"]), 0)
+                source = Path("unity-" + output + ".json")
+                (mounted / source.name).write_bytes(source.read_bytes())
+                upstream[node] = {"id": "artifact-" + node, "name": source.stem,
+                                  "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+                ctx["upstream"] = upstream[node]
+            self.assertEqual(json.loads(source.read_bytes())["verification"], task["verification"])
+            self.assertEqual(operations, ["planning-tasks", "clarify", "plan", "accept-plan", "implement", "compile",
+                                          "review", "test"])
+            ctx.update(node_id="implement", node_attempt=3, rework=1, feedback="Use two trees", upstream=upstream["design"])
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+            ctx.update(node_attempt=4, feedback="Retry after recovering machine")
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
+            self.assertEqual(operations[-3:], ["rework", "rework", "compile"])
+            data = json.loads(Path("unity-implementation.json").read_bytes())
+            self.assertEqual((data["node_attempt"], data["implementation_attempt"], data["revision"]), (4, 1, "c" * 40))
+            # A concurrent Worker operation changed the current job before the node could publish.
+            task["job_id"] = str(uuid4())
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
+
+            # Downstream tree drift invalidates the previous successful compile for this edit.
+            task.update(current_stage="test", status="failed", failure_kind="workspace_changed",
+                        compile_report=None, review_result=None, verification=None)
+            ctx.update(node_attempt=5)
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
+            self.assertEqual(operations.count("compile"), 3)

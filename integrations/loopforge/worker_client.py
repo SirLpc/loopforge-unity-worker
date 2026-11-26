@@ -293,6 +293,7 @@ def wait_job(client, task_path, job_id, wait_seconds, follow, *, queue_wait_seco
         time.sleep(min(3, remaining))
 
 
+# Legacy CLI entry points.
 def run_action(client, args):
     action = args.action
     if action == "health":
@@ -403,8 +404,19 @@ def main(argv=None):
         if len(argv) < 2 or argv[1] == "render":
             raise SystemExit("Usage: worker_client.py render ACTION [arguments]")
         header = "SOP_ARGS = " + repr(argv[1:]) + "\n"
-        sys.stdout.buffer.write(header.encode("utf-8") + Path(__file__).read_bytes())
+        source = Path(__file__).read_bytes()
+        if argv[1].startswith("feature-"):
+            common = source.split(b"# Legacy CLI entry points.", 1)[0]
+            feature = Path(__file__).with_name("feature_client.py").read_bytes()
+            source = common + feature + b"\nraise SystemExit(feature_main(SOP_ARGS))\n"
+        sys.stdout.buffer.write(header.encode("utf-8") + source)
         return 0
+    if argv and argv[0].startswith("feature-"):
+        if __package__:
+            from .feature_client import feature_main
+        else:
+            from feature_client import feature_main
+        return feature_main(argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("health", "plan", "accept-planning", "create", "develop", "prepare", "implement", "compile", "test",
                                           "review", "fix", "run", "status", "failure", "approve", "deliver",
