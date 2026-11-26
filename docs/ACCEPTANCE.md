@@ -27,8 +27,21 @@
 - [ ] 对审批后的任务取消或制造可控超时。状态查询确认进程停下后检查租约及现场。完成或归档后 release，下一任务按基础分支重新准备且看不到前一任务的未提交文件。
 - [ ] 如启用了 PR/MR 适配器，在验收远端显式批准 create_pr，确认链接指向正确任务分支和目标分支。
 
+## 八节点功能 SOP 验收
+
+1. 准备包含定向 EditMode 和 PlayMode 测试的独立 Unity 工程，并配置专用 Runner、Windows Worker 命名池和 Git 验收远端。记录远端基础分支 SHA。按[八节点功能交付接入说明](../integrations/loopforge/README.md#八节点功能交付)配置 Worker、中继和现有项目凭据。用 `--staged-feature --preflight` 核对池和能力，用 `--staged-feature` 预览现有功能 SOP，保留 `base_revision` 和备份。
+2. 在验收项目用 `--publish --expected-revision <base_revision>` 发布。回读发布版本，核对八节点及连线、唯一人工验收、验收打回开发实现、沙箱、两项凭据引用和项目入口。确认发布前的 revision 仍可在版本历史中查阅。
+3. 提交一项可由两个测试模式覆盖的小改动。在 `unity-scope.json` 和 `unity-planning.json` 中核对同一任务、池、槽位及基础 SHA，从该提交核实 `design.md` 引用的文件及行号。检查每轮编译产物和独立评审均对应当前 Git 树。评审通过后，从 `unity-verification.json` 和 `test-report.md` 找到 `verification.test_job_id` 对应的 Worker 产物，打开实际的 EditMode 和 PlayMode XML，核对所选用例的数量和结果。
+4. 到人工验收后，填写可识别的多行修改意见并打回。确认 Worker 收到完整意见且保留原任务、槽位和基础 SHA，重新执行开发、编译、评审和测试。核对本轮 Git 树及验证 Job，再批准该轮验收。检查审批记录只有一次批准，交付记录绑定本轮测试，远端任务分支指向记录的提交 SHA，该提交的 Git 树与通过测试的树一致，基础分支仍指向原 SHA。
+5. 使用未配托管适配器的验收 Worker 时，核对 `unity-delivery.json` 和 `delivery.md` 中的 `mr_status=pending`，以及 Worker 返回的槽位归还结果。核对同一运行的节点状态、审批记录、测试 XML、交付记录和远端引用。将运行证据和回退快照保存在受保护的本地目录。
+
+正式切换前，核对新版 Worker 和中继能继续处理旧任务，等待旧服务的活动 Job 到达终态。使用现有启动脚本切换到已验证的版本，沿用状态和租约。按相同步骤重新预览并发布目标功能 SOP，再比对发布版与候选图，并检查既有运行仍保留启动时的快照。回退所需 revision 取自该次发布前的预览。
+
 ## 本机证据
 
 - Unity 2022.3.62f3 与 Unity Test Framework 1.1.33 已在独立工程实测。通过正常编译、EditMode 1 个测试、PlayMode 1 个测试。故意失败的断言被分类为 tests_failed，故意的 C# 语法错误被分类为 compile_failed。
 - Codex CLI 0.172.0 的 MXC 权限探针已实测，包含工程内写入、Git 元数据写入阻断、工程外读取阻断和独立审查目录只读。该探针不调用模型。elevated 后备模式需在目标账号的预配环境重新验证。
-- Windows 临时 Worker 已通过同一 LoopForge Docker 镜像及 Compose 网络的 /health 调用。SOP 画布、真实模型调用和真实托管远端交付仍需在验收环境走完整流程。
+- Windows 临时 Worker 已通过同一 LoopForge Docker 镜像及 Compose 网络的 `/health` 调用。
+- 隔离功能 SOP 通过 LoopForge Runner、签名中继和原生 Windows Worker 跑完八个节点。设计引用已在同一租约的基础提交核实。第一次人工验收打回后，Worker 收到完整意见。第二轮的真实 Unity EditMode 和 PlayMode XML 各通过一个定向用例。一次批准后，隔离的 bare Git 远端任务分支指向交付记录中的提交，其 Git 树与本轮通过测试的树一致，基础分支 SHA 保持原值，Worker 归还槽位。
+- 在同一隔离项目回读了发布版，已核对节点重试设置和返工设置，并确认发布前版本的历史快照和项目设置保留。
+- 上述功能 SOP 的 Codex 定型、方案、实现和评审输出均来自确定性夹具。Git 推送使用隔离的 bare 远端，交付状态为 `mr_status=pending`。真实模型调用与托管远端的 MR 创建仍待验证。
