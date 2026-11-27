@@ -918,7 +918,14 @@ class DevelopmentWorker:
         except StageError as error:
             if (ctx.task.get("workflow_mode") == "staged-feature"
                     and error.kind not in {"cancelled", "recovery_required", "workspace_in_use"}):
-                self.assert_same_revision(ctx, revision, unity=True)
+                try:
+                    self.assert_same_revision(ctx, revision, unity=True)
+                except StageError as blocker:
+                    blocker.result["unity_failure"] = {
+                        "failure_kind": error.kind, "error_message": str(error),
+                        "exit_code": error.exit_code, "result": error.result,
+                    }
+                    raise blocker from error
             raise
         self.assert_same_revision(ctx, revision, unity=True)
         return result

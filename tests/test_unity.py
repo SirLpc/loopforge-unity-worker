@@ -1,4 +1,6 @@
+import os
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +14,38 @@ def xml_result(failed=0, passed=1):
 
 
 class UnityEvidenceTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows Unity lock semantics")
+    def test_batch_compile_cleans_only_its_unheld_empty_lock(self):
+        from process_runner import StageError
+        from unity_executor import UnityExecutor
+
+        cases = (
+            ("stale", b"", False, False),
+            ("held", b"", True, True),
+            ("nonempty", b"unexpected metadata", False, True),
+        )
+        for name, contents, held, remains in cases:
+            with self.subTest(name=name), test_directory() as project, ExitStack() as handles:
+                lock = project / "Temp/UnityLockfile"
+                lock.parent.mkdir()
+                log = project / "compile.log"
+                cfg = SimpleNamespace(project=project, unity_exe="Unity.exe", unity_version="2022.3.62f3",
+                                      unity_timeout=5)
+
+                def run(argv, mode, **kwargs):
+                    log.write_text("Assets/Test.cs(24,32): error CS0712: Cannot create a static class\n")
+                    lock.write_bytes(contents)
+                    if held:
+                        handles.enter_context(lock.open("rb"))
+                    return SimpleNamespace(exit_code=1)
+
+                ctx = SimpleNamespace(artifact=lambda *args: log, run=run)
+                with patch.object(UnityExecutor, "validate"), self.assertRaises(StageError) as failure:
+                    UnityExecutor(cfg).run(ctx, "compile")
+                self.assertEqual(failure.exception.kind, "compile_failed")
+                self.assertEqual(failure.exception.result["log"], log.name)
+                self.assertEqual(lock.exists(), remains)
+
     def test_scoped_run_uses_literal_filters_and_checks_each_fixture(self):
         from process_runner import StageError
         from unity_executor import UnityExecutor

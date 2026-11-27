@@ -523,6 +523,30 @@ class WorkflowTests(WorkflowFixture):
             self.assertIsNone(current["verification"])
             self.assertIsNone(current["review_result"])
 
+    def test_staged_compile_keeps_compiler_evidence_when_git_check_hits_a_lock(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            self.assertEqual(self.stage(client, task, "implement")["status"], "succeeded")
+            (self.root / "broken_compile").touch()
+            lock = self.project / "Temp/UnityLockfile"
+            lock.parent.mkdir(exist_ok=True)
+            run = self.runner.run
+
+            def block_revision_check(argv, cwd, prefix, **kwargs):
+                result = run(argv, cwd, prefix, **kwargs)
+                if "-batchmode" in argv:
+                    lock.write_bytes(b"not a disposable batch lock")
+                return result
+
+            with patch.object(self.runner, "run", side_effect=block_revision_check):
+                blocked = self.stage(client, task, "compile")
+            self.assertEqual(blocked["failure_kind"], "workspace_in_use", blocked)
+            self.assertEqual(lock.read_bytes(), b"not a disposable batch lock")
+            evidence = blocked["stage_result"]["unity_failure"]
+            self.assertEqual(evidence["failure_kind"], "compile_failed")
+            self.assertTrue(evidence["result"]["log"].endswith("-compile.log"))
+            self.assertIsNone(self.task(client, task)["compile_report"])
+
     def test_staged_unity_retries_need_review_again_when_the_tree_changes(self):
         with self.staged_client() as client:
             task = self.accepted_staged_plan(client)

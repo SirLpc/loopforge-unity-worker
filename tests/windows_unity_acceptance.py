@@ -38,7 +38,8 @@ def main():
     }
     (project / "Packages/manifest.json").write_text(json.dumps({"dependencies": dependencies}), encoding="utf-8")
     source = project / "Assets/AcceptanceSample.cs"
-    source.write_text("internal static class AcceptanceSample { internal static int Answer = 42; }\n", encoding="utf-8")
+    valid_source = "internal static class AcceptanceSample { internal static int Answer = 42; }\n"
+    source.write_text(valid_source, encoding="utf-8")
     for mode in () if args.compile_only else ("EditMode", "PlayMode"):
         directory = project / "Assets" / mode
         directory.mkdir()
@@ -68,6 +69,8 @@ def main():
             expect_failure(unity, ctx, "editmode", "tests_failed")
         source.write_text("public class AcceptanceSample { this is intentionally invalid }\n", encoding="utf-8")
         expect_failure(unity, ctx, "compile", "compile_failed")
+        source.write_text(valid_source, encoding="utf-8")
+        print("compile after correction", unity.run(ctx, "compile"), flush=True)
     except StageError as error:
         print(f"{error.kind}: {error}. Evidence: {error.result}", file=sys.stderr, flush=True)
         return 1

@@ -4,7 +4,8 @@ import ctypes
 import json
 import os
 import re
-from contextlib import nullcontext
+import stat
+from contextlib import nullcontext, suppress
 from xml.etree import ElementTree
 
 from process_runner import StageError
@@ -86,6 +87,45 @@ def unity_product_version(executable):
 def assert_unity_closed(project):
     if any((project / marker).exists() for marker in ("Temp/UnityLockfile", "Library/UnityLockfile")):
         raise StageError("workspace_in_use", "Unity project lock exists. Close the Editor or verify the stale lock.")
+
+
+def clear_exited_batch_lock(project):
+    """Remove an empty Windows Temp marker after our batch process tree has exited."""
+    if os.name != "nt":
+        return
+    import _winapi
+    import msvcrt
+    from ctypes import wintypes as w
+
+    from process_runner import win_function
+
+    marker = project / "Temp/UnityLockfile"
+    delete_access = 0x10000
+    open_reparse_point = 0x200000
+    file_disposition_info = 4
+    with suppress(OSError):
+        if marker.parent.resolve(strict=True) != marker.parent:
+            return
+        # Zero sharing excludes active editors. Validate and unlink through the
+        # same handle so a different editor cannot take the lock between them.
+        handle = _winapi.CreateFile(str(marker), _winapi.GENERIC_READ | delete_access, 0, 0,
+                                   _winapi.OPEN_EXISTING, open_reparse_point, 0)
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        except OSError:
+            _winapi.CloseHandle(handle)
+            raise
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_size or info.st_nlink != 1
+                    or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                return
+            set_info = win_function("SetFileInformationByHandle", w.BOOL, w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD)
+            delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO.DeleteFile
+            if not set_info(handle, file_disposition_info, ctypes.byref(delete), ctypes.sizeof(delete)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            os.close(fd)
 
 
 def has_test_framework(project):
@@ -228,6 +268,8 @@ class UnityExecutor:
         with self.permit(ctx) if self.permit else nullcontext():
             assert_unity_closed(cfg.project)
             process = ctx.run(argv, mode, timeout=cfg.unity_timeout, env=system_env(), publish=True)
+            # ProcessRunner returns only after verifying that its process tree has stopped.
+            clear_exited_batch_lock(cfg.project)
         if mode == "startup_smoke":
             if process.exit_code:
                 raise StageError("startup_failed", "Unity smoke failed", process.exit_code)
