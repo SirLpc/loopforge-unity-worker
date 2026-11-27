@@ -116,6 +116,38 @@ class PlanningTests(unittest.TestCase):
     def run_missing(path, body=b'{"error":"run not found"}'):
         raise HTTPError(path, 404, "Not Found", {}, io.BytesIO(body))
 
+    def test_clarify_blocks_missing_baseline_meta_and_releases_slot(self):
+        assets = self.project / "Assets"
+        assets.mkdir()
+        (assets / "Icon.png").write_bytes(b"image")
+        git(self.project, "add", "Assets/Icon.png")
+        git(self.project, "commit", "-m", "Add icon without metadata")
+        git(self.project, "push", "origin", "main")
+        base = git(self.project, "rev-parse", "HEAD")
+
+        task_id = self.create(workflow_mode="staged-feature", workflow_project_id="game")
+        job = self.wait(self.action(task_id, "clarify"))
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["failure_kind"], "baseline_asset_metadata")
+        self.assertEqual(job["stage_result"]["base_commit"], base)
+        self.assertEqual(job["stage_result"]["missing_meta_paths"], ["Assets/Icon.png.meta"])
+        blocked = self.task(task_id)
+        self.assertFalse(blocked["lease"])
+        self.assertIsNone(blocked.get("clarification"))
+        report = self.client.get(f"/api/v1/tasks/{task_id}/artifacts/{blocked['report']}").json()
+        self.assertFalse(report["lease"])
+        self.assertEqual(report["operation_error"]["result"], job["stage_result"])
+
+        (assets / "Icon.png.meta").write_text("guid: " + "a" * 32 + "\n")
+        git(self.project, "add", "Assets/Icon.png.meta")
+        git(self.project, "commit", "-m", "Add icon metadata")
+        git(self.project, "push", "origin", "main")
+        next_task = self.create(workflow_mode="staged-feature", workflow_project_id="game",
+                                workflow_run_id="run-fixed")
+        job = self.wait(self.action(next_task, "clarify"))
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(self.task(next_task)["base_commit"], git(self.project, "rev-parse", "HEAD"))
+
     def test_deleted_run_releases_clean_slot_and_admits_next_task(self):
         previous = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-1")
         queued = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-2")

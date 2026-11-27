@@ -123,6 +123,38 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(git(project, "branch", "--show-current"), "ai/task-123")
             self.assertEqual((project / "Library/cache").read_text(), "keep")
 
+    def test_preflight_checks_the_fetched_tree_for_missing_asset_and_folder_meta(self):
+        from process_runner import StageError
+
+        with test_directory() as root:
+            workspace, ctx, remote, project = self.workspace(root)
+            author = root / "author"
+            git(root, "clone", str(remote), str(author))
+            for name in ("Art/Icon.png", "Art/Other Icon.png", "Art/Other Icon.png.meta",
+                         "Plugin.bundle/Contents/Info.plist", "Plugin.bundle.meta",
+                         "Media.androidpack/src/main/assets/audio.bin", "Media.androidpack.meta",
+                         ".hidden/note.txt", "Samples~/sample.txt", "cvs/file.txt", "scratch.tmp"):
+                file = author / "Assets" / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text("fixture\n")
+            (author / "Packages/unity-package.json").write_text("{}")
+            git(author, "add", "Assets", "Packages/unity-package.json")
+            git(author, "-c", "protocol.file.allow=always", "submodule", "add", str(remote), "Assets/Content")
+            git(author, "commit", "-m", "Import game assets")
+            git(author, "push", "origin", "main")
+            base = git(remote, "rev-parse", "main")
+
+            with self.assertRaises(StageError) as error:
+                workspace.prepare(ctx, "ai/task-123")
+            self.assertEqual(error.exception.kind, "baseline_asset_metadata")
+            self.assertEqual(error.exception.result, {
+                "base_commit": base,
+                "missing_meta_paths": ["Assets/Art.meta", "Assets/Art/Icon.png.meta", "Assets/Content.meta"],
+                "missing_meta_count": 3,
+            })
+            self.assertEqual(git(project, "branch", "--show-current"), "main")
+            self.assertFalse((project / "Assets").exists())
+
     def test_unknown_untracked_and_ignored_files_block_and_survive(self):
         from process_runner import StageError
 

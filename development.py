@@ -751,6 +751,9 @@ class DevelopmentWorker:
                 if not preserve_task or kind == "recovery_required":
                     task.update(status=state, finished_at=timestamp, failure_kind=kind, error_message=message,
                                 stage_result=job["stage_result"], exit_code=error.exit_code)
+                if kind == "baseline_asset_metadata":
+                    # The preflight runs before creating a task branch.
+                    task.update(lease=False, released_at=timestamp)
                 if action == "commit" and kind in {"workspace_changed", "dirty_workspace", "unsafe_change", "asset_metadata"}:
                     task.update(approved_revision=None, approval=None)
                 if (task.get("workflow_mode") == "staged-feature" and kind in {"workspace_changed", "unity_changed"}
@@ -1093,6 +1096,8 @@ class DevelopmentWorker:
             if ctx.job["action"] not in {"recover", "pr"}:
                 data.update(status=error.kind if error.kind in {"cancelled", "recovery_required"} else "failed",
                             failure_kind=error.kind, error_message=str(error), finished_at=now(), exit_code=error.exit_code)
+                if error.kind == "baseline_asset_metadata":
+                    data.update(lease=False, released_at=data["finished_at"])
         path = ctx.artifact("development-report", ".json", "report")
         path.write_text(json.dumps(self.clean_output(data), ensure_ascii=False, indent=2), encoding="utf-8")
         ctx.save(report=path.name)

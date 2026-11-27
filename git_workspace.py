@@ -24,6 +24,7 @@ BUILD_SUFFIXES = {".apk", ".aab", ".ipa", ".exe", ".appx", ".msix"}
 SECRET_PATTERN = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:gh[pousr]_[A-Za-z0-9]{30,}|AKIA[A-Z0-9]{16})")
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 GUID = re.compile(rb"^guid: [a-fA-F0-9]{32}[ \t]*\r?$", re.M)
+ASSET_CONTAINER_SUFFIXES = {".androidlib", ".androidpack", ".bundle", ".framework", ".plugin"}
 
 
 def has_hidden_index_entries(path):
@@ -305,6 +306,45 @@ class GitWorkspace:
             raise StageError("push_conflict", "Push target returned an unexpected task reference")
         return commit
 
+    def assert_baseline_asset_meta(self, ctx, commit):
+        asset_root = self.asset_prefix.as_posix()
+        _, raw = self.git(ctx, "--literal-pathspecs", "ls-tree", "-r", "-t", "-z", commit,
+                          "--", asset_root, limit=None)
+        files, directories = set(), set()
+        for row in raw.decode("utf-8").split("\0"):
+            if not row:
+                continue
+            entry, path = row.split("\t", 1)
+            if not path.startswith(asset_root + "/"):
+                continue
+            mode = entry.split(" ", 1)[0]
+            if mode in {"100644", "100755"}:
+                files.add(path)
+            elif mode in {"040000", "160000"}:
+                directories.add(path)
+
+        containers = {path for path in directories if PurePosixPath(path).suffix.lower() in ASSET_CONTAINER_SUFFIXES}
+        missing = []
+        for path in sorted(files | directories):
+            meta = path + ".meta"
+            if path.endswith(".meta") or meta in files:
+                continue
+            asset = PurePosixPath(path)
+            relative = asset.relative_to(self.asset_prefix)
+            if any(part.startswith(".") or part.endswith("~") or part.lower() == "cvs" for part in relative.parts):
+                continue
+            if path in files and asset.suffix.lower() == ".tmp":
+                continue
+            if any(parent.as_posix() in containers for parent in asset.parents):
+                continue
+            missing.append(meta)
+
+        if missing:
+            raise StageError("baseline_asset_metadata",
+                             "Missing .meta files in the Unity Git baseline. Commit the missing files, then start a new task.",
+                             result={"base_commit": commit, "missing_meta_paths": missing[:30],
+                                     "missing_meta_count": len(missing)})
+
     def uses_lfs(self, ctx, revision):
         code, _ = self.git(ctx, "grep", "-I", "-l", "-F", "filter=lfs", revision,
                            "--", ".gitattributes", ":(glob)**/.gitattributes", allowed=(0, 1))
@@ -326,6 +366,7 @@ class GitWorkspace:
         version = self.text(ctx, "show", f"{commit}:{self.unity_prefix / PROJECT_VERSION}", limit=32_768)
         if f"m_EditorVersion: {cfg.unity_version}" not in version.splitlines():
             raise StageError("unsupported", "The target branch requires a different Unity Editor version")
+        self.assert_baseline_asset_meta(ctx, commit)
         lfs = self.uses_lfs(ctx, commit)
         if lfs:
             self.git(ctx, "lfs", "version")
