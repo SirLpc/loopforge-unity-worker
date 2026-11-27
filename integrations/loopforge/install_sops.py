@@ -370,6 +370,8 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
         node = script_node(node_id, label, render(action, "--pool", pool_id, "--follow", *args))
         node.update(artifactOutputs=[artifact(report, report + ".md")], metricStage=metric_stage,
                     maxAttempts=2, maxReworks=0)
+        if node_id in {"review", "test"}:
+            node.update(onFailure="fail", maxReworks=1 if node_id == "review" else 2)
         if evidence:
             node["artifactOutputs"].append(artifact(evidence, evidence + ".json", "application/json"))
         nodes.append(node)

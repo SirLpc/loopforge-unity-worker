@@ -235,3 +235,83 @@ class FeatureContextTests(unittest.TestCase):
             with (self.subTest(invalid=invalid), patch.dict(self.bodies, {meta["id"]: raw}),
                   patch.dict(meta, sha256=hashlib.sha256(raw).hexdigest()), self.assertRaises(ContextError)):
                 self.context()
+
+    def test_auto_rework_uses_the_frozen_acceptance_target_for_current_review_only(self):
+        self.check_auto_rework("review", "review_changes", {"verdict": "request_changes", "summary": "Dispose SerializedObject."},
+                               "独立评审要求修改：Dispose SerializedObject.")
+
+    def test_auto_rework_requests_fix_for_named_tests_on_the_current_revision(self):
+        self.check_auto_rework("test", "tests_failed", {"mode": "playmode", "failed_tests": [
+            {"name": "Game.DragTests.Drag", "message": "Expected rotation."}]},
+            "测试验证未通过：Game.DragTests.Drag")
+
+    def check_auto_rework(self, stage, failure, result, reason):
+        import hashlib
+        from uuid import uuid4
+
+        workflow = self.run["workflowSnapshot"]
+        definitions = {node["id"]: node for node in workflow["nodes"]}
+        target = "configured-repair"
+        definitions["implement"]["id"] = target
+        definitions["accept"]["rejectTo"] = target
+        definitions[stage].update(maxReworks=2, onFailure="fail")
+        nodes = self.run["nodes"]
+        nodes[target] = {**nodes.pop("implement"), "nodeId": target}
+        nodes[stage]["status"] = "failed"
+        self.run["status"] = "failed"
+        artifact = self.run["artifacts"][2]
+        evidence = json.loads(self.bodies[artifact["id"]])
+        evidence["node_id"] = target
+        raw = json.dumps(evidence).encode()
+        self.bodies[artifact["id"]] = raw
+        artifact.update(nodeId=target, sha256=hashlib.sha256(raw).hexdigest())
+
+        job_id = str(uuid4())
+        worker_task = {**evidence, "job_id": job_id, "rework_job_id": job_id, "workflow_mode": "staged-feature", "lease": True,
+                       "status": "failed", "current_stage": stage, "failure_kind": failure}
+        if stage == "review":
+            result["revision"] = evidence["revision"]
+            revision_evidence = result
+        else:
+            revision_evidence = {"status": failure, "revision": evidence["revision"]}
+            worker_task["test_report"] = {result["mode"]: revision_evidence}
+        job = {"task_id": self.task_id, "job_id": job_id, "action": stage, "status": "failed",
+               "failure_kind": failure, "stage_result": result}
+        task = {"run_id": self.run_id, "task_id": self.task_id, "job_id": job_id, "status": "failed",
+                "job_status": "failed", "job_action": stage, "lease": True, "cancel_requested": False}
+        path = "/api/runs/" + self.run_id
+        writes = []
+
+        def platform_call(request, payload=None):
+            if request == path + "/reject":
+                writes.append(payload)
+                return {}
+            return {path: self.run, path + "/wait?timeoutSec=0": {},
+                    path + "/artifacts/" + artifact["id"]: raw}[request]
+
+        def worker_call(request):
+            return {"/api/v1/workflow-tasks?project_id=" + PROJECT: {"tasks": [task]},
+                    "/api/v1/tasks/" + self.task_id + "?include_implementation_correction=true": worker_task,
+                    "/api/v1/jobs/" + job_id: job}[request]
+
+        self.relay.reconcile_worker_tasks(platform_call, worker_call, PROJECT)
+        self.assertEqual(writes, [{"nodeId": stage, "targetId": target, "reason": reason,
+                                  "expected": {"status": "failed", "attempt": 3, "reworkCount": 0}}])
+        for config, changes in (
+            (job, {"failure_kind": "timeout"}),
+            (job, {"failure_kind": "test_execution_failed"}),
+            (revision_evidence, {"revision": "d" * 40}),
+            (worker_task, {"job_id": str(uuid4())}),
+            (worker_task, {"rework_job_id": None}),
+            (definitions[stage], {"maxReworks": 0}),
+            (nodes[target], {"reworkCount": 2}),
+            (definitions["accept"], {"rejectTo": "design"}),
+            (self.run, {"status": "running"}),
+        ):
+            with self.subTest(changes=changes), patch.dict(config, changes):
+                self.relay.reconcile_worker_tasks(platform_call, worker_call, PROJECT)
+                self.assertEqual(len(writes), 1)
+        if stage == "test":
+            with patch.dict(result, failed_tests=[{"name": "", "message": "Missing case identity"}]):
+                self.relay.reconcile_worker_tasks(platform_call, worker_call, PROJECT)
+                self.assertEqual(len(writes), 1)

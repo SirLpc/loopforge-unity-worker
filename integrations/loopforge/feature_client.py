@@ -33,6 +33,12 @@ def require(condition, message):
         raise api.ClientError(message)
 
 
+def review_feedback(review):
+    findings = [f"{issue['file']}:{issue['line']} — {issue['description']} {issue['suggestion']}"
+                for issue in review["issues"]]
+    return "\n".join([review["summary"], *findings])[:4000]
+
+
 def mounted_evidence(ref):
     require(re.fullmatch(r"unity-[a-z]+", ref["name"]), "Invalid upstream artifact name")
     for path in Path(".agentflow/inputs").glob("**/" + ref["name"] + ".json"):
@@ -145,9 +151,10 @@ class FeatureStage:
             require(job["job_id"] == current, "Another Worker job is active")
         if job and generation < self.attempt:
             recovered = receipt.get("recovered_by")
-            # A review verdict requesting changes needs a new implementation before another review.
-            rejected_review = action == "review" and job.get("failure_kind") == "review_changes"
-            if (job["status"] == "failed" and current == job["job_id"] and not rejected_review
+            # A failed check that requires edits cannot rerun on the same implementation.
+            needs_rework = (action, job.get("failure_kind")) in {
+                ("review", "review_changes"), ("test", "tests_failed")}
+            if (job["status"] == "failed" and current == job["job_id"] and not needs_rework
                     or job["status"] == "recovery_required" and recovered and current == recovered
                     and self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"):
                 job = None
@@ -229,13 +236,33 @@ class FeatureStage:
                     and failed["action"] == self.task["current_stage"] and failed["status"] == "failed"
                     and failed.get("failure_kind") == failure, "Worker correction has no matching failed phase")
         if target:
+            predecessor = (self.task.get("verification") or {}).get("test_job_id", "")
             if worker_round == target:
                 feedback = self.task["rework_feedback"]
+            elif self.task["status"] == "failed" and self.task["current_stage"] == "review" and failure == "review_changes":
+                review = self.task.get("review_result") or {}
+                revision = self.task["revision"]
+                require(review.get("verdict") == "request_changes" and revision and review.get("revision") == revision,
+                        "Worker lacks a change request for the current revision")
+                feedback = review_feedback(review)
+                predecessor = self.task["job_id"]
+            elif self.task["status"] == "failed" and self.task["current_stage"] == "test" and failure == "tests_failed":
+                result = self.task.get("stage_result") or {}
+                report = (self.task.get("test_report") or {}).get(result.get("mode")) or {}
+                cases = [case for case in result.get("failed_tests") or ()
+                         if isinstance(case, dict) and isinstance(case.get("name"), str) and case["name"].strip()]
+                require(self.task.get("rework_job_id") == self.task["job_id"]
+                        and cases and report.get("status") == "tests_failed" and self.task["revision"]
+                        and report.get("revision") == self.task["revision"],
+                        "Worker lacks named failed tests for the current revision")
+                feedback = "\n\n".join("\n".join(filter(None, (case["name"], case.get("message"), case.get("stack"))))
+                                       for case in cases)[:4000]
+                predecessor = self.task["job_id"]
             else:
                 require(not self.ctx.get("feedback_error"), self.ctx.get("feedback_error"))
                 feedback = self.ctx["feedback"]
             self.job("rework", {"workflow_run_id": self.ctx["workflow_run_id"], "implementation_attempt": target,
-                                "feedback": feedback}, predecessor=(self.task.get("verification") or {}).get("test_job_id", ""))
+                                "feedback": feedback}, predecessor=predecessor)
         else:
             # A new initial edit follows the accepted plan. Existing edits use their admitted request.
             accepted = self.task["job_id"] if self.task["current_stage"] == "plan_accepted" else ""

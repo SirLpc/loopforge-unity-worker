@@ -499,9 +499,16 @@ class FeatureScriptTests(unittest.TestCase):
                 self.assertEqual(task["current_stage"], "plan_accepted")
                 task.update(current_stage="implemented", revision="b" * 40)
             elif action == "rework":
-                self.assertEqual(payload["implementation_attempt"], 1)
-                self.assertEqual(payload["feedback"], "Use two trees")
-                task.update(implementation_attempt=1, rework_feedback=payload["feedback"], verification=None)
+                rework_round = payload["implementation_attempt"]
+                if rework_round == 3:
+                    self.assertEqual(payload["feedback"], "Game.DragTests.Drag\nExpected rotation.\nDragTests.cs:42")
+                elif rework_round == 2:
+                    self.assertEqual(payload["feedback"],
+                                     "Dispose the test wrapper.\nPrefabTests.cs:38 — Wrapper leaks. Use using var.")
+                else:
+                    self.assertEqual(rework_round, 1)
+                    self.assertEqual(payload["feedback"], "Use two trees")
+                task.update(implementation_attempt=rework_round, rework_feedback=payload["feedback"], verification=None)
                 if operations.count("rework") == 1:
                     job.update(status="failed", failure_kind="timeout")
                     task.update(status="failed", current_stage="fix", rework_pending=True, failure_kind="timeout")
@@ -636,3 +643,32 @@ class FeatureScriptTests(unittest.TestCase):
             before = len(operations)
             self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 1)
             self.assertEqual(len(operations), before)
+
+            # A configured review rejection opens the next round before there is test evidence.
+            stopped = str(uuid4())
+            review = {"verdict": "request_changes", "revision": task["revision"],
+                      "summary": "Dispose the test wrapper.",
+                      "issues": [{"file": "PrefabTests.cs", "line": 38, "description": "Wrapper leaks.",
+                                  "suggestion": "Use using var."}]}
+            jobs[stopped] = {"job_id": stopped, "task_id": task_id, "action": "review", "status": "failed",
+                             "failure_kind": "review_changes", "stage_result": review}
+            task.update(job_id=stopped, status="failed", current_stage="review", failure_kind="review_changes",
+                        review_result=review, verification=None)
+            ctx.update(node_attempt=attempt + 1, rework=2, feedback="", feedback_error="No human acceptance rejection")
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
+            self.assertEqual(operations[before:], ["rework", "compile"])
+            self.assertEqual(json.loads(Path("unity-implementation.json").read_bytes())["implementation_attempt"], 2)
+
+            stopped = str(uuid4())
+            report = {"mode": "playmode", "failed_tests": [{"name": "Game.DragTests.Drag",
+                      "message": "Expected rotation.", "stack": "DragTests.cs:42"}]}
+            jobs[stopped] = {"job_id": stopped, "task_id": task_id, "action": "test", "status": "failed",
+                             "failure_kind": "tests_failed", "stage_result": report}
+            task.update(job_id=stopped, status="failed", current_stage="test", failure_kind="tests_failed",
+                        rework_job_id=stopped, stage_result=report, test_report={"playmode": {"status": "tests_failed",
+                        "revision": task["revision"]}}, verification=None)
+            ctx.update(node_attempt=attempt + 2, rework=3)
+            before = len(operations)
+            self.assertEqual(worker_client.main(["feature-implement", "--pool", "pool"]), 0)
+            self.assertEqual(operations[before:], ["rework", "compile"])
+            self.assertEqual(json.loads(Path("unity-implementation.json").read_bytes())["implementation_attempt"], 3)

@@ -430,6 +430,88 @@ class WorkflowTests(WorkflowFixture):
             self.assertEqual(self.agent.implementation_briefs[-1]["previous_failure"]["feedback"], payload["feedback"])
             self.assertIsNone(current["verification"])
 
+    def test_rework_accepts_current_review_changes_before_tests(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for action in ("implement", "compile"):
+                self.assertEqual(self.stage(client, task, action)["status"], "succeeded")
+            result = {"verdict": "request_changes", "summary": "Dispose the test wrapper.", "issues": []}
+            with patch.object(self.agent, "execute", return_value=result):
+                reviewed = self.stage(client, task, "review")
+            self.assertEqual(reviewed["failure_kind"], "review_changes")
+            self.assertIsNone(self.task(client, task)["verification"])
+
+            payload = {"request_id": str(uuid4()), "workflow_run_id": "run-feature-41",
+                       "implementation_attempt": 1, "feedback": result["summary"]}
+            path = f"/api/v1/tasks/{task}/rework"
+            self.assertEqual(client.post(path, json=payload).status_code, 409)
+            self.assertEqual(client.post(path, params={"after_job": str(uuid4())}, json=payload).status_code, 409)
+            worker = client.app.state.worker
+            # A failed release leaves the review verdict intact but changes the current job.
+            release = {**reviewed, "job_id": str(uuid4()), "action": "release",
+                       "failure_kind": "workspace_in_use", "request_id": str(uuid4()), "signature": "test"}
+            with worker.store.connect(write=True) as db:
+                current = worker.store.task(db, task)
+                worker.store.save_job(db, release)
+                worker.store.save_task(db, {**current, "job_id": release["job_id"]})
+            self.assertEqual(client.post(path, params={"after_job": release["job_id"]}, json=payload).status_code, 409)
+            with worker.store.connect(write=True) as db:
+                worker.store.save_task(db, current)
+            response = client.post(path, params={"after_job": reviewed["job_id"]}, json=payload)
+            self.assertEqual(response.status_code, 202, response.text)
+            self.assertEqual(self.wait(client, response.json()["job_id"])["status"], "succeeded")
+            self.assertEqual(self.task(client, task)["implementation_attempt"], 1)
+            self.assertEqual(self.agent.implementation_briefs[-1]["previous_failure"]["feedback"], result["summary"])
+            for action in ("compile", "review", "test"):
+                self.assertEqual(self.stage(client, task, action)["status"], "succeeded")
+
+    def test_rework_accepts_failed_test_for_the_reviewed_revision(self):
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for action in ("implement", "compile", "review"):
+                job = self.stage(client, task, action)
+                self.assertEqual(job["status"], "succeeded", job)
+            path = f"/api/v1/tasks/{task}/rework"
+            task_path = f"/api/v1/tasks/{task}?include_implementation_correction=true"
+            payload = {"request_id": str(uuid4()), "workflow_run_id": "run-feature-41",
+                       "implementation_attempt": 1, "feedback": "Game.UnitTests.Runs failed."}
+            license_marker = self.root / "license_fail"
+            license_marker.touch()
+            unavailable = self.stage(client, task, "test")
+            self.assertEqual(unavailable["failure_kind"], "license_failed")
+            self.assertEqual(client.post(path, params={"after_job": unavailable["job_id"]}, json=payload).status_code, 409)
+            self.assertNotIn("rework_job_id", client.get(task_path).json())
+            license_marker.unlink()
+            marker = self.root / "broken_tests"
+            marker.touch()
+            failed = self.stage(client, task, "test")
+            self.assertEqual(failed["failure_kind"], "tests_failed")
+            revision = self.task(client, task)["revision"]
+            self.assertEqual(self.task(client, task)["test_report"]["editmode"]["revision"], revision)
+            self.assertEqual(failed["stage_result"]["failed_tests"][0]["name"], "Game.UnitTests.Runs")
+            self.assertEqual(client.get(task_path).json()["rework_job_id"], failed["job_id"])
+            worker = client.app.state.worker
+            with worker.store.connect(write=True) as db:
+                current = worker.store.task(db, task)
+                worker.store.save_task(db, {**current, "retry_count": 1})
+            self.assertNotIn("rework_job_id", client.get(task_path).json())
+            with worker.store.connect(write=True) as db:
+                worker.store.save_task(db, current)
+
+            self.assertEqual(client.post(path, json=payload).status_code, 409)
+            response = client.post(path, params={"after_job": failed["job_id"]}, json=payload)
+            self.assertEqual(response.status_code, 202, response.text)
+            self.assertEqual(self.wait(client, response.json()["job_id"])["status"], "succeeded")
+            current = self.task(client, task)
+            self.assertEqual(current["implementation_attempt"], 1)
+            self.assertTrue(all(current[key] is None for key in ("compile_report", "review_result", "test_report", "verification")))
+            self.assertEqual(self.agent.implementation_briefs[-1]["previous_failure"]["feedback"], payload["feedback"])
+            marker.unlink()
+            for action in ("compile", "review", "test"):
+                job = self.stage(client, task, action)
+                self.assertEqual(job["status"], "succeeded", job)
+            self.assertEqual(self.task(client, task)["verification"]["implementation_attempt"], 1)
+
     def test_staged_review_precedes_tests_and_rework_invalidates_evidence(self):
         with self.staged_client() as client:
             task = self.accepted_staged_plan(client)

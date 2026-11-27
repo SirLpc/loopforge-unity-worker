@@ -187,6 +187,15 @@ class DevelopmentWorker:
             task = self.require_task(db, task_id)
             if include_implementation_correction and task.get("workflow_mode") == "staged-feature":
                 task["implementation_correction"] = self.implementation_correction(db, task)
+                if task["status"] == "failed" and task.get("failure_kind") in {"review_changes", "tests_failed"}:
+                    request = {"workflow_run_id": task["workflow_run_id"],
+                               "implementation_attempt": task["implementation_attempt"] + 1, "feedback": ""}
+                    try:
+                        self.check_action(db, task, "rework", request, after_job=task["job_id"])
+                    except RequestConflict:
+                        pass
+                    else:
+                        task["rework_job_id"] = task["job_id"]
             return task
 
     def implementation_correction(self, db, task):
@@ -435,7 +444,7 @@ class DevelopmentWorker:
             return None
         return (STAGED_FEATURE_NEXT_STAGE if staged_feature else NEXT_STAGE).get(stage)
 
-    def check_action(self, db, task, action, payload):
+    def check_action(self, db, task, action, payload, *, after_job=None):
         status, stage = task["status"], task["current_stage"]
         staged_feature = task.get("workflow_mode") == "staged-feature"
         if self.stopping:
@@ -480,7 +489,36 @@ class DevelopmentWorker:
                 if (payload["implementation_attempt"] != attempt or payload["feedback"] != task["rework_feedback"]):
                     raise RequestConflict("Use the same implementation attempt and feedback to resume rework")
                 return
-            if status == "awaiting_approval" and stage in {"tested", "approved"} and task.get("verification"):
+            review = task.get("review_result") or {}
+            review_changes = (status == "failed" and stage == "review" and task.get("failure_kind") == "review_changes"
+                              and review.get("verdict") == "request_changes" and task.get("revision")
+                              and review.get("revision") == task["revision"])
+            tests_failed = (status == "failed" and stage == "test" and task.get("failure_kind") == "tests_failed"
+                            and review.get("verdict") == "pass" and task.get("revision")
+                            and review.get("revision") == task["revision"])
+            accepted = status == "awaiting_approval" and stage in {"tested", "approved"} and task.get("verification")
+            if review_changes or tests_failed or accepted:
+                if review_changes or tests_failed:
+                    job = self.store.job(db, str(after_job)) if after_job is not None else None
+                    verdict = (job or {}).get("stage_result") or {}
+                    if (not job or job["task_id"] != task["task_id"] or job["action"] != stage
+                            or job["status"] != "failed" or job.get("failure_kind") != task["failure_kind"]):
+                        raise RequestConflict("Rework requires the current failed review or test job")
+                    if review_changes and (verdict.get("verdict") != "request_changes"
+                                           or verdict.get("revision") != task["revision"]):
+                        raise RequestConflict("Rework requires a change request for the current revision")
+                    if tests_failed:
+                        report = (task.get("test_report") or {}).get(verdict.get("mode")) or {}
+                        runs = report.get("runs") or []
+                        tested = runs[-1] if runs else {}
+                        cases = verdict.get("failed_tests") or ()
+                        if (report.get("status") != "tests_failed" or report.get("revision") != task["revision"]
+                                or tested.get("status") != "tests_failed" or not verdict.get("test_results")
+                                or tested.get("test_results") != verdict["test_results"]
+                                or tested.get("failed_tests") != cases
+                                or not any(isinstance(case, dict) and isinstance(case.get("name"), str)
+                                           and case["name"].strip() for case in cases)):
+                            raise RequestConflict("Rework requires named failed tests for the current revision")
                 if payload["implementation_attempt"] != attempt + 1:
                     raise RequestConflict("Rework does not match the next implementation attempt")
                 if task["retry_count"] >= self.cfg.pools[task["pool_id"]].policy.max_fixes:
@@ -587,7 +625,7 @@ class DevelopmentWorker:
                 if task is None:
                     raise TaskNotFound
                 check_predecessor(task, after_job)
-                self.check_action(db, task, action, payload)
+                self.check_action(db, task, action, payload, after_job=after_job)
                 job = self.new_job(task_id, request_id, action, payload)
                 inline_accept = action == "accept-plan" and task.get("workflow_mode") != "staged-feature"
                 if inline_accept or action in {"approve", "cancel"}:

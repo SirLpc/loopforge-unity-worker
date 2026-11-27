@@ -103,6 +103,7 @@ FEATURE_NODES = {
 ASSIGNMENT = ("task_id", "pool_id", "slot_id", "base_commit")
 HUMAN_APPROVAL = b"# Approval\n\nApproved by a human gate.\n"
 ARTIFACT_LIMIT = 8 * 1024 * 1024
+REWORK_FAILURES = {"review": "review_changes", "test": "tests_failed"}
 
 
 def feature_artifact(run, node_id, reader, *, name=None):
@@ -322,6 +323,74 @@ def run_was_deleted(platform_call, run_id):
     return False
 
 
+def reject_failed_feature_check(platform_call, worker_call, project_id, listed_task):
+    stage = listed_task["job_action"]
+    failure = REWORK_FAILURES[stage]
+    run_id = listed_task["run_id"]
+    path = "/api/runs/" + run_id
+    run = platform_call(path)
+    workflow = run.get("workflowSnapshot", {})
+    workflow_id = project_id + "-feature"
+    if (run.get("id") != run_id or run.get("workflowId") != workflow_id or workflow.get("id") != workflow_id
+            or workflow.get("projectId") != project_id or run.get("executionContext", {}).get("projectId") != project_id
+            or run.get("status") != "failed" or run.get("cancelRequested") or run.get("pauseRequested")):
+        return
+
+    definitions = {node["id"]: node for node in workflow.get("nodes", [])}
+    check = definitions.get(stage, {})
+    accept = definitions.get("accept", {})
+    budget = check.get("maxReworks", 0)
+    # The same configured edge supplies the repair target for automatic and manual feedback.
+    target_id = accept.get("rejectTo")
+    check_run = run["nodes"].get(stage, {})
+    target = run["nodes"].get(target_id, {})
+    if (check.get("type") != "script" or check.get("rejectTo") or accept.get("type") != "approval"
+            or type(budget) is not int or budget < 1 or check_run.get("status") != "failed"
+            or target.get("status") != "succeeded" or target.get("reworkCount", 0) >= budget):
+        return
+
+    task_id, job_id = (str(UUID(listed_task[key])) for key in ("task_id", "job_id"))
+    job = worker_call("/api/v1/jobs/" + job_id)
+    verdict = job.get("stage_result") or {}
+    if (job.get("task_id") != task_id or job.get("job_id") != job_id or job.get("action") != stage
+            or job.get("status") != "failed" or job.get("failure_kind") != failure or not isinstance(verdict, dict)):
+        return
+    task = worker_call("/api/v1/tasks/" + task_id + "?include_implementation_correction=true")
+    if task.get("rework_job_id") != job_id:
+        return
+    if stage == "review":
+        if verdict.get("verdict") != "request_changes":
+            return
+        revision = verdict.get("revision")
+        reason = "独立评审要求修改：" + str(verdict.get("summary") or "").strip()[:400]
+    else:
+        report = (task.get("test_report") or {}).get(verdict.get("mode")) or {}
+        names = [case["name"] for case in verdict.get("failed_tests") or ()
+                 if isinstance(case, dict) and isinstance(case.get("name"), str) and case["name"].strip()]
+        if report.get("status") != "tests_failed" or not names:
+            return
+        revision = report.get("revision")
+        reason = "测试验证未通过：" + "、".join(names)[:400]
+    if not revision:
+        return
+    _, raw = feature_artifact(run, target_id, lambda identifier: platform_call(path + "/artifacts/" + identifier),
+                              name="unity-implementation")
+    compiled = json.loads(raw)
+    binding = {"task_id": task_id, "workflow_project_id": project_id, "workflow_run_id": run_id,
+               "implementation_attempt": target.get("reworkCount", 0), "revision": revision}
+    if (task.get("workflow_mode") != "staged-feature" or not task.get("lease") or task.get("job_id") != job_id
+            or task.get("status") != "failed" or task.get("current_stage") != stage
+            or task.get("failure_kind") != failure or task.get("cancel_requested")
+            or not isinstance(compiled, dict) or compiled.get("workflow_id") != workflow_id
+            or compiled.get("node_id") != target_id
+            or compiled.get("node_attempt") != target["attempt"]
+            or any(task.get(key) != value or compiled.get(key) != value for key, value in binding.items())):
+        return
+    platform_call(path + "/reject", {"nodeId": stage, "targetId": target_id, "reason": reason,
+                                     "expected": {"status": "failed", "attempt": check_run["attempt"],
+                                                  "reworkCount": check_run.get("reworkCount", 0)}})
+
+
 def reconcile_worker_tasks(platform_call, worker_call, project_id):
     logger = logging.getLogger(__name__)
     tasks = worker_call("/api/v1/workflow-tasks?" + urlencode({"project_id": project_id}))["tasks"]
@@ -346,12 +415,15 @@ def reconcile_worker_tasks(platform_call, worker_call, project_id):
                 request_id = str(uuid5(NAMESPACE_URL, f"unity-worker:deleted-run:{task_id}:{job_id}:{action}"))
                 worker_call(f"/api/v1/tasks/{task_id}/{action}?after_job={job_id}", {"request_id": request_id})
                 logger.info("Requested Worker %s for task %s after deletion of %s", action, task_id, run_id)
+            elif (task["job_action"] in REWORK_FAILURES and task["job_status"] == task["status"] == "failed"
+                  and task["lease"] and not task["cancel_requested"]):
+                reject_failed_feature_check(platform_call, worker_call, project_id, task)
         except HTTPError as error:
             # The task can advance between listing it and submitting an action.
             error.close()
             if error.code != 409:
                 logger.warning("Could not reconcile Worker task for %s (HTTP %s)", run_id, error.code)
-        except (OSError, ValueError):
+        except (ContextError, KeyError, OSError, TypeError, ValueError):
             logger.warning("Could not reconcile Worker task for %s", run_id)
 
 
@@ -446,7 +518,7 @@ def main():
     parser.add_argument("--approval-key-file", type=Path, help="Protected staged delivery signing key")
     parser.add_argument("--runner-workspaces", type=Path, required=True)
     parser.add_argument("--worker-url", help="Worker URL reachable from the Runner host")
-    parser.add_argument("--worker-token-file", type=Path, help="Protected Worker token for deleted run cleanup")
+    parser.add_argument("--worker-token-file", type=Path, help="Protected Worker token for review rework and deleted run cleanup")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.project_id):
         parser.error("Provide the LoopForge project ID")
