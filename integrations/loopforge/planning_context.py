@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -12,7 +13,11 @@ import time
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
+from threading import Event, Thread
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from uuid import UUID, NAMESPACE_URL, uuid5
 
 
 PLANNING_PROFILES = ("feature", "ui", "issue-fix")
@@ -304,6 +309,61 @@ def service_client(base_url, secret):
     return call
 
 
+def run_was_deleted(platform_call, run_id):
+    # The wait endpoint distinguishes a missing row from a storage failure.
+    # The detail endpoint can return 404 when it fails to load related data.
+    try:
+        platform_call(f"/api/runs/{run_id}/wait?timeoutSec=0")
+    except HTTPError as error:
+        if error.code != 404:
+            raise
+        with error:
+            return json.loads(error.read(256)) == {"error": "run not found"}
+    return False
+
+
+def reconcile_worker_tasks(platform_call, worker_call, project_id):
+    logger = logging.getLogger(__name__)
+    tasks = worker_call("/api/v1/workflow-tasks?" + urlencode({"project_id": project_id}))["tasks"]
+    for task in tasks:
+        run_id = task["run_id"]
+        if not isinstance(run_id, str) or not re.fullmatch(r"run-[A-Za-z0-9_-]{1,120}", run_id):
+            continue
+        # Failed releases and uncertain process exits require inspection.
+        if task["status"] == "recovery_required" or task["job_action"] == "release":
+            continue
+        if task["job_status"] in {"queued", "running"}:
+            if task["cancel_requested"] or task["job_action"] == "recover":
+                continue
+            action = "cancel"
+        elif task["status"] in {"cancelled", "failed", "completed"} and task["lease"]:
+            action = "release"
+        else:
+            action = "cancel"
+        try:
+            if run_was_deleted(platform_call, run_id):
+                task_id, job_id = str(UUID(task["task_id"])), str(UUID(task["job_id"]))
+                request_id = str(uuid5(NAMESPACE_URL, f"unity-worker:deleted-run:{task_id}:{job_id}:{action}"))
+                worker_call(f"/api/v1/tasks/{task_id}/{action}?after_job={job_id}", {"request_id": request_id})
+                logger.info("Requested Worker %s for task %s after deletion of %s", action, task_id, run_id)
+        except HTTPError as error:
+            # The task can advance between listing it and submitting an action.
+            error.close()
+            if error.code != 409:
+                logger.warning("Could not reconcile Worker task for %s (HTTP %s)", run_id, error.code)
+        except (OSError, ValueError):
+            logger.warning("Could not reconcile Worker task for %s", run_id)
+
+
+def watch_worker_tasks(stopping, platform_call, worker_call, project_id):
+    while not stopping.is_set():
+        try:
+            reconcile_worker_tasks(platform_call, worker_call, project_id)
+        except (OSError, ValueError, KeyError, TypeError):
+            logging.getLogger(__name__).warning("Could not read Worker tasks for project %s", project_id)
+        stopping.wait(5)
+
+
 def signed_context(secret, sandboxes, issued):
     payload = {"issued_at": issued, "expires_at": issued + 10, "sandboxes": sandboxes}
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -385,6 +445,8 @@ def main():
     parser.add_argument("--context-token-file", type=Path, required=True)
     parser.add_argument("--approval-key-file", type=Path, help="Protected staged delivery signing key")
     parser.add_argument("--runner-workspaces", type=Path, required=True)
+    parser.add_argument("--worker-url", help="Worker URL reachable from the Runner host")
+    parser.add_argument("--worker-token-file", type=Path, help="Protected Worker token for deleted run cleanup")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.project_id):
         parser.error("Provide the LoopForge project ID")
@@ -398,8 +460,22 @@ def main():
         if (len(approval_key) < 32 or not approval_key.isprintable() or " " in approval_key
                 or approval_key in {context_secret, platform_secret}):
             raise SystemExit("Configure an independent protected workflow approval key")
+    if bool(args.worker_url) != bool(args.worker_token_file):
+        parser.error("Supply --worker-url and --worker-token-file together")
     platform_call = service_client(args.platform_url.rstrip("/"), platform_secret)
     workspace_root = args.runner_workspaces.resolve(strict=True)
+    stopping = Event()
+    if args.worker_url:
+        endpoint = urlsplit(args.worker_url)
+        if (endpoint.scheme not in {"http", "https"} or not endpoint.hostname or endpoint.username is not None
+                or endpoint.query or endpoint.fragment):
+            parser.error("Provide a Worker HTTP(S) URL without embedded credentials")
+        worker_token = args.worker_token_file.read_text(encoding="utf-8").strip()
+        if not worker_token:
+            parser.error("The Worker token file is empty")
+        worker_call = service_client(args.worker_url.rstrip("/"), worker_token)
+        Thread(target=watch_worker_tasks, args=(stopping, platform_call, worker_call, args.project_id),
+               name="unity-worker-run-cleanup", daemon=True).start()
     try:
         while True:
             try:
@@ -409,6 +485,8 @@ def main():
             time.sleep(2)
     except KeyboardInterrupt:
         return
+    finally:
+        stopping.set()
 
 
 if __name__ == "__main__":

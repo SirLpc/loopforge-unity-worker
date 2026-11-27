@@ -1,11 +1,14 @@
+import io
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -85,7 +88,9 @@ class PlanningTests(unittest.TestCase):
 
     def wait(self, action):
         self.assertEqual(action.status_code, 202, action.text)
-        job = action.json()['job_id']
+        return self.wait_job(action.json()['job_id'])
+
+    def wait_job(self, job):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             response = self.client.get(f'/api/v1/jobs/{job}').json()
@@ -96,6 +101,106 @@ class PlanningTests(unittest.TestCase):
 
     def task(self, task):
         return self.client.get(f'/api/v1/tasks/{task}').json()
+
+    def reconcile(self, platform_call):
+        def worker_call(path, payload=None):
+            response = self.client.get(path) if payload is None else self.client.post(path, json=payload)
+            self.assertIn(response.status_code, (200, 202), response.text)
+            return response.json()
+
+        from integrations.loopforge.planning_context import reconcile_worker_tasks
+
+        reconcile_worker_tasks(platform_call, worker_call, "game")
+
+    @staticmethod
+    def run_missing(path, body=b'{"error":"run not found"}'):
+        raise HTTPError(path, 404, "Not Found", {}, io.BytesIO(body))
+
+    def test_deleted_run_releases_clean_slot_and_admits_next_task(self):
+        previous = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-1")
+        queued = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-2")
+        deleted = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-3")
+        foreign = self.create(workflow_mode="staged-feature", workflow_project_id="other", workflow_run_id="run-4")
+        self.assertEqual(self.wait(self.action(previous, "clarify"))["status"], "succeeded")
+        self.assertEqual(self.wait(self.action(previous, "cancel"))["status"], "succeeded")
+        ghost_job = self.action(deleted, "clarify", queue_wait_seconds=30)
+        pending = self.action(queued, "clarify", queue_wait_seconds=30)
+        foreign_job = self.action(foreign, "clarify", queue_wait_seconds=30)
+        for response in (ghost_job, pending, foreign_job):
+            self.assertEqual(response.status_code, 202, response.text)
+            self.assertEqual(response.json()["status"], "queued")
+        self.assertEqual(self.task(previous)["status"], "cancelled")
+        self.assertTrue(self.task(previous)["lease"])
+        candidates = self.client.get("/api/v1/workflow-tasks", params={"project_id": "game"})
+        self.assertEqual(candidates.status_code, 200, candidates.text)
+
+        def platform_call(path):
+            if path in {"/api/runs/run-1/wait?timeoutSec=0", "/api/runs/run-3/wait?timeoutSec=0"}:
+                self.run_missing(path)
+            self.assertEqual(path, "/api/runs/run-2/wait?timeoutSec=0")
+            return {"runId": "run-2", "projectId": "game", "status": "running", "terminal": False, "timedOut": True}
+
+        self.reconcile(platform_call)
+        self.assertEqual(self.wait(ghost_job)["status"], "cancelled")
+        self.assertIsNone(self.task(deleted)["slot_id"])
+        self.assertEqual(self.wait(pending)["status"], "succeeded")
+        self.assertEqual(self.task(foreign)["status"], "queued")
+        old_task, next_task = self.task(previous), self.task(queued)
+        self.assertFalse(old_task["lease"])
+        self.assertTrue(next_task["lease"])
+        self.assertEqual(next_task["slot_id"], old_task["slot_id"])
+
+    def test_deleted_run_waits_for_its_running_job_to_stop_before_release(self):
+        task_id = self.create(workflow_mode="staged-feature", workflow_project_id="game")
+        started = threading.Event()
+        finish = threading.Event()
+        self.addCleanup(finish.set)
+
+        def blocked_clarification(ctx, _):
+            started.set()
+            finish.wait(30)
+            ctx.check_cancelled()
+            self.fail("The deleted task did not receive cancellation")
+
+        with patch.object(self.agent, "clarify", blocked_clarification):
+            original = self.action(task_id, "clarify")
+            self.assertTrue(started.wait(30))
+            try:
+                self.reconcile(self.run_missing)
+                task = self.task(task_id)
+                self.assertTrue(task["cancel_requested"])
+                self.assertTrue(task["lease"])
+                self.assertEqual(task["job_id"], original.json()["job_id"])
+            finally:
+                finish.set()
+            self.assertEqual(self.wait(original)["status"], "cancelled")
+            self.reconcile(self.run_missing)
+            released = self.task(task_id)
+            self.assertEqual(self.wait_job(released["job_id"])["status"], "succeeded")
+            self.assertFalse(self.task(task_id)["lease"])
+
+    def test_uncertain_run_lookup_and_dirty_workspace_keep_the_lease(self):
+        task_id = self.create(workflow_mode="staged-feature", workflow_project_id="game")
+        self.assertEqual(self.wait(self.action(task_id, "clarify"))["status"], "succeeded")
+        current = self.task(task_id)["job_id"]
+        for lookup in (
+            lambda path: self.run_missing(path, b"404 page not found"),
+            lambda path: {"runId": "run-123", "projectId": "game", "status": "waiting", "terminal": False, "timedOut": False},
+        ):
+            self.reconcile(lookup)
+            self.assertEqual(self.task(task_id)["job_id"], current)
+        changed = self.project / "hello.txt"
+        changed.write_text("preserve this edit\n")
+        self.reconcile(self.run_missing)
+        self.assertEqual(self.task(task_id)["status"], "cancelled")
+        self.reconcile(self.run_missing)
+        job_id = self.task(task_id)["job_id"]
+        job = self.wait_job(job_id)
+        self.assertEqual(job["failure_kind"], "dirty_workspace")
+        self.assertTrue(self.task(task_id)["lease"])
+        self.assertEqual(changed.read_text(), "preserve this edit\n")
+        self.reconcile(self.run_missing)
+        self.assertEqual(self.task(task_id)["job_id"], job_id)
 
     def test_staged_planning_task_requires_a_valid_project_id(self):
         for project_id in (None, '', '-game', 'a/b', 'a b', 'a' * 65):

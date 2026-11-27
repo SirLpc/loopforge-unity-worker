@@ -23,6 +23,7 @@ from workspace_storage import CacheName
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
 Criterion = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2_000)]
 WorkflowRunId = Annotated[str, Field(pattern=r"^run-[A-Za-z0-9_-]{1,120}$")]
+WorkflowProjectId = Annotated[str, Field(max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")]
 Action = Literal["clarify", "prepare", "implement", "compile", "test", "review", "fix", "run", "cancel", "release", "pr"]
 
 
@@ -66,7 +67,7 @@ class PlanningTaskRequest(OperationRequest):
     pool_id: str | None = Field(default=None, pattern=rf"^{REMOTE_PATTERN}$")
     workflow_run_id: WorkflowRunId
     workflow_mode: Literal["staged-feature"] | None = None
-    workflow_project_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    workflow_project_id: WorkflowProjectId | None = None
     requirement: Text
     planning_profile: Literal["feature", "ui", "issue-fix"]
 
@@ -275,6 +276,10 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
             return worker().create(str(request.request_id), payload)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
+
+    @app.get("/api/v1/workflow-tasks")
+    def workflow_tasks(project_id: WorkflowProjectId):
+        return {"tasks": worker().store.workflow_tasks(project_id)}
 
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: UUID, include_implementation_correction: bool = False):

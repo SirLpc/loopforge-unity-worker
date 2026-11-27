@@ -42,6 +42,14 @@ python3 -m integrations.loopforge.planning_context \
 让中继随 Runner 常驻，项目 ID 与安装器保持一致。在运行安装器的进程里通过 `UNITY_PLANNING_CONTEXT_TOKEN` 注入同一签名密钥，再追加 `--windows-planning`。中继向当前容器的工作目录写入短时有效的签名记录，用于绑定需求、审批状态和当前计划产物的摘要。用测试 SOP 验证规划、打回重做和审批后交接，再更新正式项目。
 
 
+### 删除运行后回收槽位
+
+在中继的启动参数中同时加入 `--worker-url` 和 `--worker-token-file`，使用中继主机可访问的 Worker 地址和保存普通 Worker Token 的受保护文件。更新并重启 Worker 与中继后，现有已发布的 LOOP 即可使用回收流程。
+
+中继检查当前项目下已绑定 LoopForge 项目和运行 ID 的 Worker 任务，包括已经遗留的租约及排队作业。LoopForge 确认运行记录已删除后，中继取消对应作业，等它退出后通过 Worker 的 `release` 验证并归还槽位。运行仍存在时保留租约，便于审批或重试。权限或网络出错时，中继保留租约并在后续轮询重试。
+
+如果槽位仍有 Unity 锁、未归档的 Git 修改，或 Worker 状态为 `recovery_required`，请先检查进程和工作区，按下文的维护流程归档并释放。历史上未绑定项目 ID 的任务仍可按任务 ID 手动释放。
+
 ### 八节点功能交付
 
 1. 升级 Windows Worker。为运行 Worker 的 Windows 账号在 `start_worker.ps1 -CredentialDirectory` 指定的目录配置 `UNITY_WORKER_WORKFLOW_APPROVAL_KEY.dpapi`。它对应一份独立的交付签名密钥。Runner 主机上为中继准备同一密钥的受保护文件，通过 `--approval-key-file` 传入。从项目凭据和沙箱配置中隔离该密钥。

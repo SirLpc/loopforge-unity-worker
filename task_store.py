@@ -170,6 +170,27 @@ class Store:
     def slot_lease(self, db, slot_id):
         return self._one(db.execute("SELECT data FROM tasks WHERE slot_id = ? AND lease = 1", (slot_id,)))
 
+    def workflow_tasks(self, project_id):
+        with self.connect() as db:
+            rows = db.execute("""
+                WITH candidates AS (
+                    SELECT id FROM tasks WHERE lease = 1
+                    UNION
+                    SELECT task_id FROM jobs WHERE status = 'queued'
+                )
+                SELECT tasks.id, tasks.lease, json_extract(tasks.data, '$.workflow_run_id'),
+                       json_extract(tasks.data, '$.status'), json_extract(tasks.data, '$.cancel_requested'),
+                       jobs.id, jobs.status, json_extract(jobs.data, '$.action')
+                FROM candidates JOIN tasks USING (id)
+                JOIN jobs ON jobs.id = json_extract(tasks.data, '$.job_id')
+                WHERE json_extract(tasks.data, '$.workflow_project_id') = ?
+                ORDER BY jobs.status != 'queued'
+            """, (project_id,))
+            return [{"task_id": task_id, "lease": bool(lease), "run_id": run_id, "status": status,
+                     "cancel_requested": bool(cancel), "job_id": job_id, "job_status": job_status,
+                     "job_action": action}
+                    for task_id, lease, run_id, status, cancel, job_id, job_status, action in rows]
+
     @staticmethod
     def has_queued(db, pool_id=None):
         query = "SELECT 1 FROM jobs WHERE status = 'queued'"
