@@ -224,6 +224,53 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(artifact["job_id"], job_id)
 
 class FeatureScriptTests(unittest.TestCase):
+    def test_staged_review_reuses_rejected_job_without_resubmission(self):
+        import json
+        from contextlib import chdir
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from support import test_directory
+        from integrations.loopforge import feature_client, worker_client
+
+        task_id, review_id, compile_id = (str(uuid4()) for _ in range(3))
+        context = {"workflow_project_id": "garden", "workflow_id": "garden-feature",
+                   "workflow_run_id": "run-123", "node_id": "review", "node_attempt": 2, "rework": 0,
+                   "upstream": {"id": "compile-artifact"}}
+        revision = "b" * 40
+        evidence = {**{key: context[key] for key in feature_client.SCOPE},
+                    "task_id": task_id, "pool_id": "pool", "slot_id": "slot", "base_commit": "a" * 40,
+                    "implementation_attempt": 0, "plan_digest": "c" * 64, "revision": revision,
+                    "compile_report": {"revision": revision}, "job_id": compile_id}
+        task = {**evidence, "workflow_mode": "staged-feature", "planning_profile": "feature",
+                "status": "failed", "current_stage": "review", "job_id": review_id,
+                "failure_kind": "review_changes", "approved_plan_digest": evidence["plan_digest"], "artifacts": []}
+        job = {"task_id": task_id, "job_id": review_id, "action": "review", "status": "failed",
+               "failure_kind": "review_changes", "error_message": "Review did not pass",
+               "stage_result": {"verdict": "request_changes", "summary": "Address a concrete defect."}}
+        scope = f"{task_id}:review:compile-artifact:0"
+        original = worker_client.operation_id(scope, "review:", 1)
+
+        def request(path, payload=None):
+            if payload is not None:
+                self.fail(f"Rejected review was resubmitted: {path}")
+            if "/operations/" in path:
+                return {"job": job if path.endswith("/" + original) else None, "recovered_by": None}
+            if path == f"/api/v1/jobs/{review_id}":
+                return job
+            self.assertEqual(path, f"/api/v1/tasks/{task_id}")
+            return task
+
+        args = SimpleNamespace(action="feature-review", pool="pool", wait_seconds=3, queue_wait_seconds=None,
+                               follow=False)
+        with test_directory() as root, chdir(root), patch.object(feature_client, "mounted_evidence", return_value=evidence):
+            with self.assertRaisesRegex(worker_client.ClientError, "review_changes"):
+                feature_client.FeatureStage(SimpleNamespace(request=request), args, context).review()
+            report = Path("review.md").read_text(encoding="utf-8")
+            result = json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0])
+            self.assertEqual(result["job_id"], review_id)
+            self.assertEqual(result["stage_result"], job["stage_result"])
+            self.assertFalse(Path("unity-review.json").exists())
+
     def test_feature_node_reconnect_uses_existing_job(self):
         import json
         from contextlib import chdir

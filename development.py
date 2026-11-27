@@ -12,7 +12,7 @@ from typing import get_args
 from uuid import uuid4
 
 from artifacts import RunContext, log_page, redact_text, safe_child
-from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, AgentExecutor, CodexExecutor
+from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, STAGED_FEATURE_REVIEW_RULES, AgentExecutor, CodexExecutor
 from git_workspace import GitWorkspace
 from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
@@ -991,10 +991,14 @@ class DevelopmentWorker:
             **self.brief(task), "revision": snapshot.tree, "changed_files": snapshot.changes, "diff": diff,
             "compile_report": task["compile_report"], "test_report": task["test_report"],
         }
+        rules = REVIEW_RULES
+        if staged_feature:
+            rules += "\n\n" + STAGED_FEATURE_REVIEW_RULES
+            inputs.update(review_phase="before_tests", test_selection=task.get("test_selection"))
         review_input = ctx.artifact("review-input", ".json", "review_input")
         review_input.write_text(json.dumps(inputs, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
-            review = ctx.workspace.agent.execute(ctx, REVIEW_RULES + "\n\n" + json.dumps(inputs, ensure_ascii=False), review=True)
+            review = ctx.workspace.agent.execute(ctx, rules + "\n\n" + json.dumps(inputs, ensure_ascii=False), review=True)
         except StageError as error:
             ctx.save(review_result={"verdict": "blocked", "summary": str(error), "issues": [], **error.result})
             raise

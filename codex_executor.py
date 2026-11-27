@@ -69,6 +69,15 @@ hot paths and allocations, async/main thread, subscriptions, resource disposal, 
 Return blocked if the supplied material does not permit a meaningful decision."""
 
 
+STAGED_FEATURE_REVIEW_RULES = """This is a static review after compilation and before testing.
+Assess the implementation and test design against the approved plan and acceptance criteria.
+Test execution results on this revision and live acceptance evidence are due in later stages.
+Their absence alone must not block this review or be reported as a defect. Record the pending
+checks in the summary without claiming they passed. Request changes for concrete defects in
+the implementation or test design, including missing coverage required by the approved plan.
+Use blocked if missing static evidence prevents a meaningful review of the change."""
+
+
 def session_id(path):
     with path.open("rb") as stream:
         for _ in range(200):

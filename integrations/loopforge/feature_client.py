@@ -145,7 +145,9 @@ class FeatureStage:
             require(job["job_id"] == current, "Another Worker job is active")
         if job and generation < self.attempt:
             recovered = receipt.get("recovered_by")
-            if (job["status"] == "failed" and current == job["job_id"]
+            # A review verdict requesting changes needs a new implementation before another review.
+            rejected_review = action == "review" and job.get("failure_kind") == "review_changes"
+            if (job["status"] == "failed" and current == job["job_id"] and not rejected_review
                     or job["status"] == "recovery_required" and recovered and current == recovered
                     and self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"):
                 job = None

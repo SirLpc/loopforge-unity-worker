@@ -230,6 +230,24 @@ class WorkflowTests(WorkflowFixture):
             self.assertEqual(blocked["failure_kind"], "dirty_workspace", blocked)
             self.assertEqual(greeting.read_text(), "unconfirmed work")
 
+    def test_staged_review_marks_runtime_evidence_as_pending_until_testing(self):
+        import json
+
+        with self.staged_client() as client:
+            task = self.accepted_staged_plan(client)
+            for stage in ("implement", "compile"):
+                self.assertEqual(self.stage(client, task, stage)["status"], "succeeded")
+            with patch.object(self.agent, "execute", wraps=self.agent.execute) as agent:
+                self.assertEqual(self.stage(client, task, "review")["status"], "succeeded")
+            prompt, evidence = agent.call_args.args[1].rsplit("\n\n", 1)
+            evidence = json.loads(evidence)
+            self.assertEqual(evidence["review_phase"], "before_tests")
+            self.assertEqual(evidence["test_selection"], self.task(client, task)["test_selection"])
+            self.assertIsNone(evidence["test_report"])
+            self.assertIn("absence alone must not block this review", prompt)
+            self.assertIn("concrete defects", prompt)
+            self.assertEqual(self.stage(client, task, "test")["status"], "succeeded")
+
     def test_staged_standalone_compile_review_retry_report_io_and_interruption(self):
         with self.staged_client() as client:
             task = self.accepted_staged_plan(client)
