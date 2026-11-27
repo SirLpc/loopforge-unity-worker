@@ -32,7 +32,7 @@
 1. 准备包含定向 EditMode 和 PlayMode 测试的独立 Unity 工程，并配置专用 Runner、Windows Worker 命名池和 Git 验收远端。记录远端基础分支 SHA。按[八节点功能交付接入说明](../integrations/loopforge/README.md#八节点功能交付)配置 Worker、中继和现有项目凭据。用 `--staged-feature --preflight` 核对池和能力，用 `--staged-feature` 预览现有功能 SOP，保留 `base_revision` 和备份。
 2. 在验收项目用 `--publish --expected-revision <base_revision>` 发布。回读发布版本，核对八节点及连线、唯一人工验收、验收打回开发实现、沙箱、两项凭据引用和项目入口。确认发布前的 revision 仍可在版本历史中查阅。
 3. 提交一项可由两个测试模式覆盖的小改动。在 `unity-scope.json` 和 `unity-planning.json` 中核对同一任务、池、槽位及基础 SHA，从该提交核实 `design.md` 引用的文件及行号。检查每轮编译产物和独立评审均对应当前 Git 树。评审通过后，从 `unity-verification.json` 和 `test-report.md` 找到 `verification.test_job_id` 对应的 Worker 产物，打开实际的 EditMode 和 PlayMode XML，核对所选用例的数量和结果。
-4. 到人工验收后，填写可识别的多行修改意见并打回。确认 Worker 收到完整意见且保留原任务、槽位和基础 SHA，重新执行开发、编译、评审和测试。核对本轮 Git 树及验证 Job，再批准该轮验收。检查审批记录只有一次批准，交付记录绑定本轮测试，远端任务分支指向记录的提交 SHA，该提交的 Git 树与通过测试的树一致，基础分支仍指向原 SHA。
+4. 到人工验收后，打开「待审交付物」里的测试报告，核对报告开头的任务分支、完整 SHA、远端分支头和测试 Git 树。填写多行意见并打回，确认 Worker 保留原任务、槽位和基础 SHA，并在同一任务分支追加下一轮编译提交。核对新一轮测试和 SHA，再批准验收。确认交付记录引用已验收的提交，基础分支保持原 SHA。
 5. 使用未配托管适配器的验收 Worker 时，核对 `unity-delivery.json` 和 `delivery.md` 中的 `mr_status=pending`，以及 Worker 返回的槽位归还结果。核对同一运行的节点状态、审批记录、测试 XML、交付记录和远端引用。将运行证据和回退快照保存在受保护的本地目录。
 
 正式切换前，核对新版 Worker 和中继能继续处理旧任务，等待旧服务的活动 Job 到达终态。使用现有启动脚本切换到已验证的版本，沿用状态和租约。按相同步骤重新预览并发布目标功能 SOP，再比对发布版与候选图，并检查既有运行仍保留启动时的快照。回退所需 revision 取自该次发布前的预览。

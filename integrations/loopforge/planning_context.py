@@ -206,7 +206,7 @@ def full_rejection_feedback(run, feedback, reader, telemetry_reader):
 
 
 def feature_context(run, run_id, project_id, artifact_reader, approval_key, now, *, telemetry_reader=None):
-    from workflow_approval import sign_approval
+    from workflow_approval import GIT_ID, sign_approval
 
     workflow_id = project_id + "-feature"
     wf = run.get("workflowSnapshot", {})
@@ -247,7 +247,7 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
         return context
 
     binding = dict(scope)
-    previous = approval_meta = None
+    previous = approval_meta = checkout = None
     for upstream in order[:order.index(node)]:
         prior = nodes[upstream]
         if prior.get("status") != "succeeded" or type(prior.get("attempt")) is not int or prior["attempt"] < 1:
@@ -274,12 +274,22 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
             if record.get("implementation_attempt") != rework:
                 raise ContextError("Stale implementation round")
             binding.update(revision=record["revision"], implementation_attempt=rework)
+            checkout = (record.get("compile_report") or {}).get("checkout")
+            if checkout is not None:
+                branch = "ai/task-" + binding["task_id"].replace("-", "")
+                if (not isinstance(checkout, dict) or checkout.keys() != {"branch", "commit_sha"}
+                        or checkout["branch"] != branch or not isinstance(checkout["commit_sha"], str)
+                        or not re.fullmatch(GIT_ID, checkout["commit_sha"])):
+                    raise ContextError("Invalid checkout for the current implementation")
         if upstream == "review":
             review = record.get("review_result") or {}
-            if not isinstance(review, dict) or review.get("verdict") != "pass" or review.get("revision") != binding["revision"]:
+            if (not isinstance(review, dict) or review.get("verdict") != "pass"
+                    or review.get("revision") != binding["revision"] or review.get("checkout") != checkout):
                 raise ContextError("Missing current passing review")
         if upstream == "test":
             checked = {"revision": binding["revision"], "test_job_id": record["job_id"], "implementation_attempt": rework}
+            if checkout is not None:
+                checked["checkout"] = checkout
             if record.get("verification") != checked:
                 raise ContextError("Missing current successful test job")
             test_job_id = checked["test_job_id"]
@@ -292,6 +302,8 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
         claims.update(project_id=project_id, accept_attempt=nodes["accept"]["attempt"], test_job_id=test_job_id,
                       approval_artifact_id=approval_meta["id"], approval_digest=approval_meta["sha256"],
                       test_artifact_id=previous["id"], test_digest=previous["sha256"])
+        if checkout is not None:
+            claims["commit_sha"] = checkout["commit_sha"]
         context["approval"] = sign_approval(claims, approval_key, now)
     return context
 

@@ -90,6 +90,7 @@ class FeatureStage:
             task_id = self.source["task_id"]
         else:
             payload = {"workflow_mode": "staged-feature", "planning_profile": "feature", "pool_id": args.pool,
+                       "publish_checkpoints": True,
                        "workflow_project_id": context["workflow_project_id"], "workflow_run_id": context["workflow_run_id"],
                        "requirement": context["requirement"],
                        "request_id": api.operation_id(context["workflow_run_id"], "feature-create", 0)}
@@ -315,7 +316,8 @@ class FeatureStage:
         self.current("reviewed")
         self.validated_tree()
         result = self.task["review_result"]
-        require(result["revision"] == fields["revision"] and result["verdict"] == "pass", "Review did not pass")
+        require(result["revision"] == fields["revision"] and result["verdict"] == "pass"
+                and result.get("checkout") == self.source["compile_report"].get("checkout"), "Review did not pass")
         return {**fields, "review_result": result}, {"独立评审": result}
 
     def test(self):
@@ -327,10 +329,19 @@ class FeatureStage:
         self.current("tested")
         self.validated_tree()
         verification = self.task.get("verification")
-        require(verification == {"revision": fields["revision"], "implementation_attempt": fields["implementation_attempt"],
-                                 "test_job_id": self.last_job["job_id"]}, "Missing successful current test verification")
+        expected = {"revision": fields["revision"], "implementation_attempt": fields["implementation_attempt"],
+                    "test_job_id": self.last_job["job_id"]}
+        sections = {}
+        if self.task.get("publish_checkpoints"):
+            checkout = review.get("checkout")
+            require(isinstance(checkout, dict) and checkout == self.task["compile_report"].get("checkout"),
+                    "Missing checkout for the reviewed revision")
+            expected["checkout"] = checkout
+            sections["待验收版本"] = f"- 分支 `{checkout['branch']}`\n- 提交 SHA `{checkout['commit_sha']}`"
+        require(verification == expected, "Missing successful current test verification")
         report = self.task["test_report"]
-        return {**fields, "verification": verification, "test_report": report}, {"验证记录": verification, "测试结果与范围": report}
+        sections.update({"验证记录": verification, "测试结果与范围": report})
+        return {**fields, "verification": verification, "test_report": report}, sections
 
     def checked_tests(self):
         fields = self.validated_tree()
@@ -347,7 +358,10 @@ class FeatureStage:
                                                    "revision", "implementation_attempt")},
                     "project_id": self.ctx["workflow_project_id"], "test_job_id": self.source["job_id"],
                     "test_artifact_id": self.ref["id"], "test_digest": self.ref["sha256"]}
-        require(all(claims[k] == v for k, v in expected.items()), "Delivery approval differs from the tested assignment")
+        checkout = fields["verification"].get("checkout")
+        if checkout is not None:
+            expected["commit_sha"] = checkout["commit_sha"]
+        require(all(claims.get(k) == v for k, v in expected.items()), "Delivery approval differs from the tested assignment")
         previous = self.task.get("approval")
         if previous:
             require(previous.get("claims") == claims, "Worker is delivering a different approval")
@@ -360,6 +374,9 @@ class FeatureStage:
         delivery = self.task["delivery"]
         require(delivery["pushed"] and delivery["commit_sha"] and delivery["mr_status"] in {"created", "pending"},
                 "Worker lacks a durable delivery receipt")
+        if checkout is not None:
+            require(checkout == {"branch": delivery["task_branch"], "commit_sha": delivery["commit_sha"]},
+                    "Delivered commit differs from the tested checkout")
         return {**fields, "delivery": delivery, "approval_artifact_id": claims["approval_artifact_id"]}, {"分支和 MR": delivery}
 
     def deliver(self):

@@ -40,7 +40,8 @@ STAGED_FEATURE_NEXT_STAGE = {**NEXT_STAGE, "compiled": "review", "reviewed": "te
 FIXABLE = {"compile_failed", "tests_failed", "review_changes", "asset_metadata"}
 TERMINAL = {"completed", "cancelled", "failed"}
 RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "license_failed", "package_failed",
-             "startup_failed", "test_execution_failed", "not_run", "unsupported", "review_blocked", "dirty_workspace"}
+             "startup_failed", "test_execution_failed", "not_run", "unsupported", "review_blocked", "dirty_workspace",
+             "push_conflict"}
 REWORK_RETRYABLE = {"git_failed", "timeout", "workspace_in_use", "dirty_workspace", "workspace_changed",
                     "unsupported", "recovered", "report_io_failed"}
 
@@ -332,7 +333,8 @@ class DevelopmentWorker:
         current = leased[0] if len(leased) == 1 else {}
         return {"worker_id": self.cfg.worker_id, "status": status, "task_id": current.get("task_id"),
                 "current_stage": current.get("current_stage"),
-                **({"capabilities": ["staged-feature"]} if self.cfg.legacy.workflow_approval_key and not legacy else {})}
+                **({"capabilities": ["staged-feature", "staged-feature-checkpoints"]}
+                   if self.cfg.legacy.workflow_approval_key and not legacy else {})}
 
     def require_task(self, db, task_id):
         if task := self.store.task(db, task_id):
@@ -559,8 +561,10 @@ class DevelopmentWorker:
             "slot_id": task["slot_id"], "base_commit": task["base_commit"], "plan_digest": task.get("approved_plan_digest"),
             "revision": task["revision"], "implementation_attempt": task["implementation_attempt"],
             "test_job_id": verification.get("test_job_id"),
+            "commit_sha": (verification.get("checkout") or {}).get("commit_sha"),
         }
-        if (any(claims[key] != value for key, value in expected.items())
+        if ((task.get("publish_checkpoints") and not expected["commit_sha"])
+                or any(claims.get(key) != value for key, value in expected.items())
                 or any(verification.get(key) != claims[key] for key in ("revision", "implementation_attempt"))
                 or (task.get("planning") or {}).get("plan_digest") != claims["plan_digest"]):
             raise RequestConflict("Approval does not match the verified task, plan and assignment")
@@ -821,6 +825,8 @@ class DevelopmentWorker:
                 if finished == "tested":
                     task["verification"] = {"revision": task["revision"], "test_job_id": job["job_id"],
                                             "implementation_attempt": task.get("implementation_attempt", 0)}
+                    if task.get("publish_checkpoints"):
+                        task["verification"]["checkout"] = task["compile_report"]["checkout"]
                 elif action == "rework":
                     task.pop("rework_pending", None)
             if action == "pr" and task.get("workflow_mode") == "staged-feature":
@@ -939,6 +945,7 @@ class DevelopmentWorker:
         return self.agent_implementation(ctx, diagnostics)
 
     def stage_compile(self, ctx):
+        publish = bool(ctx.task.get("publish_checkpoints"))
         before = ctx.workspace.git.snapshot(ctx, ctx.task)
         if not before.changes:
             raise StageError("no_changes", "No Git differences to validate")
@@ -946,7 +953,40 @@ class DevelopmentWorker:
         result = self.run_unity_for_revision(ctx, "compile", before.tree)
         result["revision"] = before.tree
         ctx.save(compile_report=result)
+        if publish:
+            ctx.workspace.git.check_meta(before.changes)
+            result["checkout"] = self.publish_compile_checkpoint(ctx, before)
+            ctx.save(compile_report=result)
         return result
+
+    def publish_compile_checkpoint(self, ctx, snapshot):
+        task, git = ctx.task, ctx.workspace.git
+        checkpoint = task.get("compile_checkpoint")
+        attempt = task["implementation_attempt"]
+        if not checkpoint or (snapshot.tree, attempt) != (checkpoint["revision"], checkpoint["implementation_attempt"]):
+            if checkpoint and not checkpoint["confirmed"]:
+                git.confirm_checkpoint(ctx, task, checkpoint)
+                ctx.save(compile_checkpoint={**checkpoint, "confirmed": True})
+            parent = checkpoint["commit_sha"] if checkpoint else task["base_commit"]
+            message = f"Unity task {task['task_id']} implementation round {attempt + 1}"
+            commit = git.checkpoint_commit(ctx, snapshot, parent, message)
+            checkpoint = {"commit_sha": commit, "revision": snapshot.tree, "parent": parent,
+                          "implementation_attempt": attempt, "confirmed": False}
+            ctx.save(compile_checkpoint=checkpoint)
+        git.confirm_checkpoint(ctx, task, checkpoint)
+        ctx.save(compile_checkpoint={**checkpoint, "confirmed": True})
+        return {"branch": task["task_branch"], "commit_sha": checkpoint["commit_sha"]}
+
+    def verified_checkout(self, ctx, checkout):
+        task = ctx.task
+        checkpoint = task.get("compile_checkpoint") or {}
+        if (not checkpoint.get("confirmed") or checkpoint["revision"] != task["revision"]
+                or checkpoint["implementation_attempt"] != task["implementation_attempt"]
+                or checkout != {"branch": task["task_branch"], "commit_sha": checkpoint["commit_sha"]}):
+            raise StageError("workspace_changed", "The compiled checkpoint no longer matches the verified revision")
+        if ctx.workspace.git.remote_task_tip(ctx, task) != checkout["commit_sha"]:
+            raise StageError("push_conflict", "Remote task branch does not point to the compiled commit")
+        return checkout["commit_sha"]
 
     def assert_same_revision(self, ctx, revision, *, unity=False):
         if ctx.workspace.git.snapshot(ctx, ctx.task).tree != revision:
@@ -1016,6 +1056,8 @@ class DevelopmentWorker:
                 raise
             ctx.save(test_report=reports)
 
+        if ctx.task.get("publish_checkpoints"):
+            self.verified_checkout(ctx, ctx.task["compile_report"]["checkout"])
         return reports
 
     def stage_review(self, ctx):
@@ -1048,6 +1090,8 @@ class DevelopmentWorker:
         self.assert_same_revision(ctx, snapshot.tree)
         if staged_feature:
             review["revision"] = snapshot.tree
+            if checkout := task["compile_report"].get("checkout"):
+                review["checkout"] = checkout
         ctx.save(review_result=review)
         if review["verdict"] != "pass":
             kind = "review_changes" if review["verdict"] == "request_changes" else "review_blocked"
@@ -1059,22 +1103,13 @@ class DevelopmentWorker:
         staged = task.get("workflow_mode") == "staged-feature"
         if staged and task["pushed"]:
             return task["delivery"]
-        if not task["commit_sha"]:
-            snapshot = ctx.workspace.git.snapshot(ctx, task, check_meta=True)
-            if snapshot.tree != task["approved_revision"]:
-                raise StageError("workspace_changed", "Reviewed files changed after approval. Revalidate and obtain a new approval.")
-            commit = ctx.workspace.git.commit(ctx, task, snapshot, task["approval"]["commit_message"] or f"AI task {task['task_id']}")
-            ctx.save(commit_sha=commit, **({"push_state": "ready"} if staged else {}))
-        if staged and task.get("push_state") != "ready":
-            # A pre-journal staged task with a saved SHA has the same uncertainty as an interrupted push.
-            tip = ctx.workspace.git.remote_task_tip(ctx, task)
-            if tip is None:
-                raise StageError("push_ambiguous", "A previous push may have completed. The task branch is absent. "
-                                 "An operator must reconcile it against the recorded commit.")
-            if tip != task["commit_sha"]:
-                raise StageError("push_conflict", "The remote task branch references a different commit")
+        if task.get("publish_checkpoints"):
+            checkout = task["verification"].get("checkout")
+            commit = self.verified_checkout(ctx, checkout)
+            ctx.workspace.git.adopt_checkpoint(ctx, task, commit)
+            ctx.save(commit_sha=commit, push_state="confirmed")
         else:
-            ctx.workspace.git.push(ctx, task)
+            self.push_approved_changes(ctx, staged)
         delivery = {
             "task_branch": task["task_branch"], "base_branch": task["base_branch"], "commit_sha": task["commit_sha"],
             "remote": ctx.settings.git_remote, "pushed": True,
@@ -1096,6 +1131,25 @@ class DevelopmentWorker:
                 ctx.save(pr_error=delivery["pr_error"])
         ctx.save(delivery=delivery)
         return delivery
+
+    def push_approved_changes(self, ctx, staged):
+        task = ctx.task
+        if not task["commit_sha"]:
+            snapshot = ctx.workspace.git.snapshot(ctx, task, check_meta=True)
+            if snapshot.tree != task["approved_revision"]:
+                raise StageError("workspace_changed", "Reviewed files changed after approval. Revalidate and obtain a new approval.")
+            commit = ctx.workspace.git.commit(ctx, task, snapshot, task["approval"]["commit_message"] or f"AI task {task['task_id']}")
+            ctx.save(commit_sha=commit, **({"push_state": "ready"} if staged else {}))
+        if staged and task.get("push_state") != "ready":
+            # A pre-journal staged task with a saved SHA has the same uncertainty as an interrupted push.
+            tip = ctx.workspace.git.remote_task_tip(ctx, task)
+            if tip is None:
+                raise StageError("push_ambiguous", "A previous push may have completed. The task branch is absent. "
+                                 "An operator must reconcile it against the recorded commit.")
+            if tip != task["commit_sha"]:
+                raise StageError("push_conflict", "The remote task branch references a different commit")
+        else:
+            ctx.workspace.git.push(ctx, task)
 
     def publish_pr(self, ctx):
         ctx.check_cancelled()

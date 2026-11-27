@@ -183,10 +183,11 @@ class WorkflowFixture(unittest.TestCase):
         return TestClient(create_app(cfg, runner=self.runner, agent=self.agent, pr_adapter=pr_adapter),
                           headers={"Authorization": f"Bearer {TOKEN}"})
 
-    def accepted_staged_plan(self, client):
+    def accepted_staged_plan(self, client, **options):
         response = client.post("/api/v1/planning-tasks", json={
             "request_id": str(uuid4()), "workflow_run_id": "run-feature-41", "workflow_mode": "staged-feature",
             "workflow_project_id": "Game-1", "planning_profile": "feature", "requirement": "Change the greeting",
+            **options,
         })
         self.assertEqual(response.status_code, 202, response.text)
         task = response.json()["task_id"]

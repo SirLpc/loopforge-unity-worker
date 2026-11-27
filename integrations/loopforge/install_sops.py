@@ -376,7 +376,8 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
             node["artifactOutputs"].append(artifact(evidence, evidence + ".json", "application/json"))
         nodes.append(node)
     gate = approval("accept", "人工验收",
-                    "核对需求和方案、实现、独立评审与 Unity 测试报告，确认本轮验证证据和未覆盖项。"
+                    "打开待审交付物中的测试报告，使用报告开头的任务分支和提交 SHA 验收。"
+                    "核对需求、独立评审、Unity 测试和未覆盖项。"
                     "批准后发起 MR；需要修改时填写完整意见并打回开发实现。", "implement")
     gate["maxReworks"] = 0
     nodes.insert(5, gate)
@@ -500,8 +501,8 @@ def preflight_worker(api, settings, pool_id, *, staged_feature=False):
     if len(workers) != 1 or workers[0]["worker_id"] != worker_id:
         raise RuntimeError(f"Worker endpoint does not match configured worker {worker_id}")
     worker = workers[0]
-    if staged_feature and "staged-feature" not in worker.get("capabilities", []):
-        raise RuntimeError("Worker does not advertise the staged-feature capability")
+    if staged_feature and "staged-feature-checkpoints" not in worker.get("capabilities", []):
+        raise RuntimeError("Worker does not advertise the staged-feature-checkpoints capability")
     if pool is None:
         if worker["status"] != "idle":
             raise RuntimeError(f"Worker {worker_id} is not ready: {worker['status']}")

@@ -149,6 +149,29 @@ class FeatureContextTests(unittest.TestCase):
         with patch.dict(self.run["nodes"]["mr"], status="pending"), self.assertRaises(ContextError):
             self.context()
 
+    def test_feature_approval_binds_the_checkout_in_the_current_test_artifact(self):
+        import hashlib
+        from workflow_approval import verify_approval
+
+        checkout = {"branch": "ai/task-" + self.task_id.replace("-", ""), "commit_sha": "d" * 40}
+        for node, key in (("implement", "compile_report"), ("review", "review_result"), ("test", "verification")):
+            meta = next(a for a in self.run["artifacts"] if a["nodeId"] == node)
+            record = json.loads(self.bodies[meta["id"]])
+            record.setdefault(key, {})["checkout"] = checkout
+            body = json.dumps(record).encode()
+            self.bodies[meta["id"]] = body
+            meta["sha256"] = hashlib.sha256(body).hexdigest()
+        claims = verify_approval(self.context()["approval"], self.key, 1001)
+        self.assertEqual(claims["test_digest"], meta["sha256"])
+        self.assertEqual(claims["commit_sha"], checkout["commit_sha"])
+
+        record["verification"]["checkout"] = {**checkout, "commit_sha": "c" * 40}
+        body = json.dumps(record).encode()
+        self.bodies[meta["id"]] = body
+        meta["sha256"] = hashlib.sha256(body).hexdigest()
+        with self.assertRaisesRegex(ContextError, "successful test job"):
+            self.context()
+
     def test_feature_rejects_manual_pass_and_cross_assignment_or_old_round(self):
         import hashlib
         for node, values in (("accept", None), ("review", {"task_id": "ee"}), ("test", {"node_attempt": 2}),

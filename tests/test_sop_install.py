@@ -239,7 +239,7 @@ class InstallSopsTests(unittest.TestCase):
         if outcome == "wrong-credentials":
             credentials[0]["variables"] = ["UNITY_WORKER_TOKEN"]
         self.responses["/api/v1/workers"]["workers"][0]["capabilities"] = (
-            [] if outcome == "no-capability" else ["staged-feature"])
+            ["staged-feature"] if outcome == "no-capability" else ["staged-feature", "staged-feature-checkpoints"])
         self.responses["/api/v1/pools"]["pools"][0]["slots"][0]["status"] = "leased"
 
         def api(method, path, value=None, *, missing=False):

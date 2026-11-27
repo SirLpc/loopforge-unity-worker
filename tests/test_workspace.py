@@ -239,7 +239,7 @@ class WorkspaceTests(unittest.TestCase):
     @unittest.skipUnless(subprocess.run(["git", "lfs", "version"], capture_output=True).returncode == 0, "Git LFS")
     def test_prepares_lfs_checkout_in_place(self):
         with test_directory() as root:
-            workspace, ctx, _, project = self.workspace(root)
+            workspace, ctx, remote, project = self.workspace(root)
             git(project, "lfs", "install", "--local", "--skip-repo")
             git(project, "lfs", "track", "*.asset")
             payload = b"binary lfs data\x00" * 25
@@ -248,7 +248,21 @@ class WorkspaceTests(unittest.TestCase):
             git(project, "commit", "-m", "Add LFS data")
             git(project, "lfs", "push", "origin", "main")
             git(project, "push", "origin", "main")
-            task = workspace.prepare(ctx, "ai/task-123")
+            branch = "ai/task-" + "1" * 32
+            task = workspace.prepare(ctx, branch)
             self.assertTrue(task["lfs"])
             self.assertTrue((project / ".git/lfs/objects").is_dir())
             self.assertEqual((project / "Large.asset").read_bytes(), payload)
+
+            updated = payload + b"checkpoint"
+            (project / "Large.asset").write_bytes(updated)
+            snapshot = workspace.snapshot(ctx, task)
+            commit = workspace.checkpoint_commit(ctx, snapshot, task["base_commit"], "LFS checkpoint")
+            workspace.confirm_checkpoint(ctx, task, {"commit_sha": commit, "parent": task["base_commit"],
+                                                      "confirmed": False})
+            self.assertEqual(git(remote, "rev-parse", branch), commit)
+            fetched = root / "downloaded"
+            git(root, "clone", "--no-checkout", "--branch", branch, str(remote), str(fetched))
+            git(fetched, "lfs", "install", "--local", "--skip-repo")
+            git(fetched, "checkout", branch)
+            self.assertEqual((fetched / "Large.asset").read_bytes(), updated)

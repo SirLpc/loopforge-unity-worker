@@ -25,9 +25,12 @@ class ApprovalError(ValueError):
 
 
 def validate_claims(claims):
-    if not isinstance(claims, dict) or claims.keys() != FIELDS.keys() | ATTEMPTS.keys():
+    if not isinstance(claims, dict):
         raise ApprovalError("Invalid approval claim fields")
-    for name, pattern in FIELDS.items():
+    fields = FIELDS | {"commit_sha": GIT_ID} if "commit_sha" in claims else FIELDS
+    if claims.keys() != fields.keys() | ATTEMPTS.keys():
+        raise ApprovalError("Invalid approval claim fields")
+    for name, pattern in fields.items():
         if not isinstance(claims[name], str) or not re.fullmatch(pattern, claims[name]):
             raise ApprovalError("Invalid approval identifier or digest")
     for name, minimum in ATTEMPTS.items():

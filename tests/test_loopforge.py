@@ -446,6 +446,7 @@ class FeatureScriptTests(unittest.TestCase):
         from integrations.loopforge import worker_client
 
         task_id = str(uuid4())
+        checkout = {"branch": "ai/task-" + task_id.replace("-", ""), "commit_sha": "e" * 40}
         scope = {"goal": "Grow", "scope": "Garden", "acceptance_criteria": ["Trees grow"]}
         planning = {"plan_digest": "a" * 64, "plan": "Use Garden.cs", "requirement_summary": "Grow",
                     "acceptance_criteria": ["Trees grow"], "test_selection": {"editmode": ["Trees"]},
@@ -488,6 +489,7 @@ class FeatureScriptTests(unittest.TestCase):
                                  {"workflow_mode": "staged-feature", "workflow_project_id": "garden",
                                   "workflow_run_id": "run-90", "planning_profile": "feature", "pool_id": "pool",
                                   "requirement": "Grow"})
+                self.assertIs(payload["publish_checkpoints"], True)
                 task.update(payload)
             elif action == "clarify":
                 task.update(clarification=scope, slot_id="s1", lease=True, base_commit="a" * 40, current_stage="clarified")
@@ -524,14 +526,16 @@ class FeatureScriptTests(unittest.TestCase):
                         "recompile": check}
                 task["implementation_correction"]["compile_job_id"] = job["job_id"]
                 task.update(current_stage="compiled", status="compiling", failure_kind=None,
-                            compile_report={"revision": task["revision"]})
+                            compile_report={"revision": task["revision"], "checkout": checkout})
             elif action == "review":
-                task.update(current_stage="reviewed", review_result={"verdict": "pass", "revision": task["revision"]})
+                task.update(current_stage="reviewed", review_result={"verdict": "pass", "revision": task["revision"],
+                                                                      "checkout": checkout})
             elif action == "test":
                 if operations.count("test") == 1:
                     job.update(status="recovery_required", failure_kind="recovery_required")
                 task.update(status="awaiting_approval", current_stage="tested", test_report={"editmode": {"status": "passed"}},
-                            verification={"revision": task["revision"], "implementation_attempt": 0, "test_job_id": job["job_id"]})
+                            verification={"revision": task["revision"], "implementation_attempt": 0,
+                                          "test_job_id": job["job_id"], "checkout": checkout})
                 if job["status"] == "recovery_required":
                     task.update(status="recovery_required", current_stage="test", failure_kind="recovery_required", verification=None)
             else:
@@ -581,6 +585,9 @@ class FeatureScriptTests(unittest.TestCase):
                                   "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
                 ctx["upstream"] = upstream[node]
             self.assertEqual(json.loads(source.read_bytes())["verification"], task["verification"])
+            report = Path("test-report.md").read_text(encoding="utf-8").splitlines()[:8]
+            self.assertIn("- 分支 `" + checkout["branch"] + "`", report)
+            self.assertIn("- 提交 SHA `" + checkout["commit_sha"] + "`", report)
             self.assertEqual(operations, ["planning-tasks", "clarify", "plan", "accept-plan", "implement", "compile",
                                           "review", "test", "test"])
             ctx.update(node_id="implement", node_attempt=3, rework=1, feedback="Use two trees", upstream=upstream["design"])

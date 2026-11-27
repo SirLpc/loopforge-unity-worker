@@ -519,22 +519,87 @@ class GitWorkspace:
             raise StageError("workspace_changed", "Local commit failed verification")
         return commit
 
-    def push(self, ctx, task):
-        cfg, branch = self.cfg, task["task_branch"]
+    def checkpoint_commit(self, ctx, snapshot, parent, message):
+        # The resident worktree remains based on the frozen base while the
+        # remote task branch accumulates the compiled rounds.
+        signing = self.text(ctx, "config", "--bool", "--get", "commit.gpgSign", allowed=(0, 1))
+        options = ("-S",) if signing == "true" else ()
+        commit = self.text(ctx, "commit-tree", snapshot.tree, "-p", parent, *options, "-F", "-",
+                           data=(message + "\n").encode("utf-8"))
+        if not SHA.fullmatch(commit):
+            raise StageError("git_failed", "Git returned an invalid checkpoint commit")
+        # Keep the latest checkpoint reachable even with a narrow fetch refspec.
+        self.git(ctx, "update-ref", "refs/unity-worker/compile-checkpoint", commit)
+        return commit
+
+    def confirm_checkpoint(self, ctx, task, checkpoint):
+        self.assert_task_push_target(ctx, task)
+        commit = checkpoint["commit_sha"]
+        tip = self.remote_task_tip(ctx, task)
+        if tip == commit:
+            return
+        expected = None if checkpoint["parent"] == task["base_commit"] else checkpoint["parent"]
+        if checkpoint["confirmed"] or tip != expected:
+            raise StageError("push_conflict", "Remote task branch no longer matches the recorded checkpoint")
+        if self.text(ctx, "rev-parse", commit + "^") != checkpoint["parent"]:
+            raise StageError("push_conflict", "Checkpoint is not a child of the recorded parent")
+        self.push_task_ref(ctx, task, commit, expected=expected or "")
+        if self.remote_task_tip(ctx, task) != commit:
+            raise StageError("push_conflict", "Remote task branch did not confirm the compiled commit")
+
+    def adopt_checkpoint(self, ctx, task, commit):
+        revision = task["approved_revision"]
+        if self.text(ctx, "rev-parse", commit + "^{tree}") != revision:
+            raise StageError("workspace_changed", "Checkpoint tree no longer matches approval")
+        if self.text(ctx, "rev-parse", "HEAD") != commit:
+            base = task["base_commit"]
+            self.checkout_is(ctx, task, base)
+            index_status, _ = self.git(ctx, "diff-index", "--cached", "--quiet", revision, "--", allowed=(0, 1))
+            if index_status == 0:
+                # A mixed reset can stop after writing the index and before moving HEAD.
+                if any(state[1] != " " for state, _ in self.status(ctx)):
+                    raise StageError("workspace_changed", "Working files no longer match the approved index")
+                self.assert_submodules_clean(ctx)
+                self.git(ctx, "update-ref", "HEAD", commit, base)
+            else:
+                snapshot = self.snapshot(ctx, task, check_meta=True)
+                if snapshot.tree != revision:
+                    raise StageError("workspace_changed", "Reviewed files changed after approval. Revalidate before delivery.")
+                self.git(ctx, "reset", "--mixed", "--no-refresh", commit)
+        self.checkout_is(ctx, task, commit)
+        self.assert_clean(ctx)
+
+    def assert_task_push_target(self, ctx, task):
+        branch = task["task_branch"]
         if (not re.fullmatch(r"ai/task-[0-9a-f]{32}", branch)
-                or branch.casefold() in PROTECTED | {cfg.base_branch.casefold()}):
+                or branch.casefold() in PROTECTED | {self.cfg.base_branch.casefold()}):
             raise StageError("unsafe_change", "Only the generated task branch can be pushed")
+        if self.remote_identity(ctx) != task["remote_identity"]:
+            raise StageError("workspace_changed", "Configured Git remote changed after preparation")
+
+    def push_task_ref(self, ctx, task, commit, *, expected=None):
+        remote, branch = self.cfg.git_remote, task["task_branch"]
+        ref = "refs/heads/" + branch
+        if task["lfs"]:
+            if expected is None:
+                self.git(ctx, "lfs", "push", remote, branch)
+            else:
+                _, push_url = self.remote_binding(ctx)
+                # Send the destination ref for servers that authorize LFS per branch.
+                previous = expected or "0" * len(commit)
+                data = f"{ref} {commit} {ref} {previous}\n".encode("utf-8")
+                self.git(ctx, "lfs", "pre-push", remote, push_url, data=data)
+        update = "--no-force" if expected is None else f"--force-with-lease={ref}:{expected}"
+        self.git(ctx, "push", "--porcelain", update, "--no-follow-tags", "--recurse-submodules=no",
+                 "--", remote, f"{commit}:{ref}")
+
+    def push(self, ctx, task):
         commit = task["commit_sha"]
         self.checkout_is(ctx, task, commit)
         self.assert_clean(ctx)
         if self.text(ctx, "rev-parse", "HEAD^{tree}") != task["approved_revision"]:
             raise StageError("workspace_changed", "Committed tree no longer matches approval")
-        if self.remote_identity(ctx) != task["remote_identity"]:
-            raise StageError("workspace_changed", "Configured Git remote changed after preparation")
+        self.assert_task_push_target(ctx, task)
         if task.get("workflow_mode") == "staged-feature":
             ctx.save(push_state="in_flight")
-        if task["lfs"]:
-            self.git(ctx, "lfs", "push", cfg.git_remote, branch)
-        ref = f"refs/heads/{branch}"
-        self.git(ctx, "push", "--porcelain", "--no-force", "--no-follow-tags", "--recurse-submodules=no",
-                 "--", cfg.git_remote, f"{commit}:{ref}")
+        self.push_task_ref(ctx, task, commit)

@@ -28,6 +28,8 @@ def claims_for(task):
         "revision": task["revision"], "plan_digest": task["approved_plan_digest"],
         "test_job_id": task["verification"]["test_job_id"], "approval_artifact_id": "artifact-approval",
         "approval_digest": "7" * 64, "test_artifact_id": "artifact-test", "test_digest": "8" * 64,
+        **({"commit_sha": task["verification"]["checkout"]["commit_sha"]}
+           if "checkout" in task["verification"] else {}),
     }
 
 
@@ -118,6 +120,124 @@ class WorkflowDeliveryTests(WorkflowFixture):
     def deliver(self, client, task, proof, request_id=None):
         return client.post(f"/api/v1/tasks/{task['task_id']}/workflow-deliver",
                            json={"approval": proof, "request_id": request_id or str(uuid4())})
+
+    def test_compiled_rounds_extend_one_branch_and_deliver_the_tested_commit(self):
+        from git_workspace import GitWorkspace
+
+        with self.delivery_client() as client:
+            task_id = self.accepted_staged_plan(client, publish_checkpoints=True)
+            for stage in ("implement", "compile"):
+                result = self.stage(client, task_id, stage)
+                self.assertEqual(result["status"], "succeeded", result)
+            first = self.task(client, task_id)
+            branch = first["task_branch"]
+            first_sha = git(self.remote, "rev-parse", branch)
+            self.assertEqual(first["compile_report"]["checkout"], {"branch": branch, "commit_sha": first_sha})
+            self.assertEqual(git(self.project, "rev-parse", "HEAD"), first["base_commit"])
+            for stage in ("review", "test"):
+                result = self.stage(client, task_id, stage)
+                self.assertEqual(result["status"], "succeeded", result)
+            first = self.task(client, task_id)
+            self.assertEqual(first["verification"]["checkout"], first["compile_report"]["checkout"])
+            first_claims = claims_for(first)
+
+            execute = self.agent.execute
+
+            def revise(ctx, prompt, *, review=False):
+                result = execute(ctx, prompt, review=review)
+                if not review:
+                    (self.project / "hello.txt").write_text("revised greeting\n")
+                return result
+
+            with patch.object(self.agent, "execute", side_effect=revise):
+                revised = self.stage(client, task_id, "rework", workflow_run_id=first["workflow_run_id"],
+                                     implementation_attempt=1, feedback="Revise the greeting")
+            self.assertEqual(revised["status"], "succeeded", revised)
+            for stage in ("compile", "review", "test"):
+                result = self.stage(client, task_id, stage)
+                self.assertEqual(result["status"], "succeeded", result)
+            task = self.task(client, task_id)
+            sha = git(self.remote, "rev-parse", branch)
+            self.assertNotEqual(sha, first_sha)
+            self.assertEqual(git(self.remote, "rev-parse", sha + "^"), first_sha)
+            self.assertEqual(git(self.remote, "rev-parse", sha + "^{tree}"), task["revision"])
+            self.assertEqual(task["verification"]["checkout"], {"branch": branch, "commit_sha": sha})
+            self.assertIsNone(task["commit_sha"])
+            stale = envelope(first_claims, self.key, int(time.time()))
+            self.assertEqual(self.deliver(client, task, stale).status_code, 409)
+
+            claims = claims_for(task)
+            self.assertEqual(self.deliver(client, task, envelope({**claims, "commit_sha": first_sha},
+                                                                self.key, int(time.time()))).status_code, 409)
+            run_git = GitWorkspace.git
+
+            def interrupt_reset(workspace, ctx, *args, **kwargs):
+                if args[:2] == ("reset", "--mixed"):
+                    run_git(workspace, ctx, "read-tree", sha)
+                    raise StageError("git_failed", "Interrupted after writing the index")
+                return run_git(workspace, ctx, *args, **kwargs)
+
+            with patch.object(GitWorkspace, "git", interrupt_reset):
+                response = self.deliver(client, task, envelope(claims, self.key, int(time.time())))
+                self.assertEqual(response.status_code, 202, response.text)
+                self.assertEqual(self.wait(client, response.json()["job_id"])["failure_kind"], "git_failed")
+            self.assertEqual(git(self.project, "rev-parse", "HEAD"), task["base_commit"])
+
+            response = self.deliver(client, task, envelope(claims, self.key, int(time.time())))
+            self.assertEqual(response.status_code, 202, response.text)
+            result = self.wait(client, response.json()["job_id"])
+            self.assertEqual(result["status"], "succeeded", result)
+            self.assertEqual(result["stage_result"]["commit_sha"], sha)
+            self.assertEqual(git(self.remote, "rev-parse", branch), sha)
+            self.assertEqual(git(self.remote, "rev-parse", "main"), task["base_commit"])
+            result = self.stage(client, task_id, "release")
+            self.assertEqual(result["status"], "succeeded", result)
+
+    def test_checkpoint_retry_reuses_the_sha_after_push_reply_is_lost(self):
+        from git_workspace import GitWorkspace
+
+        with self.delivery_client() as client:
+            task_id = self.accepted_staged_plan(client, publish_checkpoints=True)
+            result = self.stage(client, task_id, "implement")
+            self.assertEqual(result["status"], "succeeded", result)
+            run_git = GitWorkspace.git
+
+            def lose_push_reply(workspace, ctx, *args, **kwargs):
+                result = run_git(workspace, ctx, *args, **kwargs)
+                if args[0] == "push":
+                    raise StageError("git_failed", "Lost push reply")
+                return result
+
+            with patch.object(GitWorkspace, "git", lose_push_reply):
+                result = self.stage(client, task_id, "compile")
+            self.assertEqual(result["failure_kind"], "git_failed", result)
+            branch = self.task(client, task_id)["task_branch"]
+            sha = git(self.remote, "rev-parse", branch)
+            result = self.stage(client, task_id, "compile")
+            self.assertEqual(result["status"], "succeeded", result)
+            self.assertEqual(result["stage_result"]["checkout"], {"branch": branch, "commit_sha": sha})
+            self.assertEqual(git(self.remote, "rev-parse", branch), sha)
+
+    def test_checkpoint_does_not_overwrite_a_concurrently_created_task_branch(self):
+        from git_workspace import GitWorkspace
+
+        with self.delivery_client() as client:
+            task_id = self.accepted_staged_plan(client, publish_checkpoints=True)
+            result = self.stage(client, task_id, "implement")
+            self.assertEqual(result["status"], "succeeded", result)
+            task = self.task(client, task_id)
+            branch = task["task_branch"]
+            run_git = GitWorkspace.git
+
+            def race_push(workspace, ctx, *args, **kwargs):
+                if args[0] == "push":
+                    git(self.remote, "update-ref", "refs/heads/" + branch, task["base_commit"])
+                return run_git(workspace, ctx, *args, **kwargs)
+
+            with patch.object(GitWorkspace, "git", race_push):
+                result = self.stage(client, task_id, "compile")
+            self.assertEqual(result["status"], "failed", result)
+            self.assertEqual(git(self.remote, "rev-parse", branch), task["base_commit"])
 
     def test_delivery_requires_current_loopforge_approval(self):
         with self.delivery_client() as client:
