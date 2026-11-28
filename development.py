@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from artifacts import RunContext, log_page, redact_text, safe_child
 from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, STAGED_FEATURE_REVIEW_RULES, AgentExecutor, CodexExecutor
-from direct_merge import DirectMergeGit, land_approved, recover_merge_checkout
+from direct_merge import DirectMergeGit, can_abandon_merge, land_approved, recover_merge_checkout
 from git_workspace import GitWorkspace
 from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
@@ -499,11 +499,11 @@ class DevelopmentWorker:
         elif active_job:
             raise RequestConflict("The task already has an active job")
         elif task.get("delivery_mode") == "direct-merge" and task.get("approval"):
-            if (action == "release" and task.get("delivery") and stage == "delivered" and task["lease"]
-                    and (status == "completed" or self.recovered_delivery_release(db, task))
-                    and not self.store.has_task_permit(db, task["task_id"])):
-                return
-            raise RequestConflict("Direct delivery requires a confirmed merge and restored checkout before release")
+            if action == "release" and task["lease"] and not self.store.has_task_permit(db, task["task_id"]):
+                if can_abandon_merge(task) or (task.get("delivery") and stage == "delivered"
+                        and (status == "completed" or self.recovered_delivery_release(db, task))):
+                    return
+            raise RequestConflict("Resolve the direct delivery and restore the task checkout before release")
         elif action == "clarify" and staged_feature:
             if (status in {"pending", "failed"} and stage in {"created", "clarify"}
                     and (task["lease"] or task["slot_id"] is None)):
@@ -604,7 +604,8 @@ class DevelopmentWorker:
             "commit_sha": (verification.get("checkout") or {}).get("commit_sha"),
         }
         direct = task.get("delivery_mode") == "direct-merge"
-        if direct and not self.cfg.pools[task["pool_id"]].direct_merge:
+        pool = self.cfg.pools.get(task["pool_id"])
+        if direct and (not pool or not pool.direct_merge):
             raise RequestConflict("Direct merge is disabled for this workspace pool")
         if ((task.get("publish_checkpoints") and not expected["commit_sha"])
                 or any(claims.get(key) != value for key, value in expected.items())
@@ -632,10 +633,13 @@ class DevelopmentWorker:
         failure = task.get("failure_kind")
         if direct:
             journal = task.get("merge_journal") or {}
+            if stage == "merge" and journal.get("status") == "confirmed":
+                # land_approved rechecks remote history and resumes only local restoration and receipt storage.
+                return "merge"
             prior_check = journal.get("verification_failure") or {}
             if prior_check and prior_check["kind"] not in MERGE_RETRYABLE | {"recovery_required", "cancelled"}:
                 raise RequestConflict("The recorded candidate verification requires operator inspection")
-            reconcile = failure == "worker_error" and journal.get("status") in {"confirmed", "in_flight"}
+            reconcile = failure == "worker_error" and journal.get("status") == "in_flight"
             if stage == "merge" and (failure in MERGE_RETRYABLE or reconcile):
                 return "merge"
             raise RequestConflict("The merge requires operator inspection or a new approved revision")

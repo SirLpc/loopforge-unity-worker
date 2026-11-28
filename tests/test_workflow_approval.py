@@ -628,7 +628,10 @@ class WorkflowDeliveryTests(WorkflowFixture):
             self.assertEqual(git(self.remote, "rev-parse", "main"), base)
             for key in ("verification", "test_report", "compile_report", "review_result"):
                 self.assertEqual(self.task(client, task["task_id"])[key], task[key])
-            for action in ("release", "run", "fix"):
+            release = self.stage(client, task["task_id"], "release")
+            self.assertEqual(release["status"], "failed", release)
+            self.assertTrue(self.task(client, task["task_id"])["lease"])
+            for action in ("run", "fix"):
                 response = client.post(f"/api/v1/tasks/{task['task_id']}/{action}", json={"request_id": str(uuid4())})
                 self.assertEqual(response.status_code, 409)
             self.assertEqual(self.deliver(client, task, self.direct_proof(task)).status_code, 409)
@@ -726,6 +729,8 @@ class WorkflowDeliveryTests(WorkflowFixture):
             self.assertEqual(journal["status"], "in_flight")
             self.assertEqual(git(self.remote, "rev-parse", "main"), journal["merge_sha"])
             self.recover(client, task["task_id"])
+            release = client.post(f"/api/v1/tasks/{task['task_id']}/release", json={"request_id": str(uuid4())})
+            self.assertEqual(release.status_code, 409)
             save = worker.save
 
             def lose_receipt(job, **change):
@@ -773,3 +778,79 @@ class WorkflowDeliveryTests(WorkflowFixture):
                 delivered = self.merge_job(client, task)
             self.assertEqual(delivered["status"], "succeeded", delivered)
             self.assertEqual(git(self.remote, "rev-parse", "main"), candidate)
+
+    def test_operator_restored_unlanded_conflict_can_release_failed_task(self):
+        with self.direct_client() as client:
+            task = self.direct_task(client)
+            task_id = task["task_id"]
+            source = task["verification"]["checkout"]["commit_sha"]
+            other = self.root / "other"
+            git(self.root, "clone", str(self.remote), str(other))
+            (other / "hello.txt").write_text("concurrent greeting\n")
+            git(other, "commit", "-am", "independent main greeting")
+            git(other, "push", "origin", "main")
+            base = git(self.remote, "rev-parse", "main")
+            failed = self.merge_job(client, task)
+            self.assertEqual(failed["failure_kind"], "merge_conflict", failed)
+            self.assertTrue((self.project / ".git/MERGE_HEAD").is_file())
+            release = self.stage(client, task_id, "release")
+            self.assertEqual(release["status"], "failed", release)
+            self.assertTrue(self.task(client, task_id)["lease"])
+            self.assertTrue((self.project / ".git/MERGE_HEAD").is_file())
+            # The operator archives the conflict and restores the source independently.
+            (self.root / "archived-hello.txt").write_bytes((self.project / "hello.txt").read_bytes())
+            git(self.project, "merge", "--abort")
+            git(self.project, "switch", task["task_branch"])
+            self.assertEqual(git(self.project, "rev-parse", "HEAD"), source)
+            (self.project / "extra.meta").touch()
+            dirty = self.stage(client, task_id, "release")
+            self.assertEqual(dirty["failure_kind"], "dirty_workspace")
+            self.assertTrue((self.project / "extra.meta").exists())
+            (self.project / "extra.meta").rename(self.root / "archived-extra.meta")
+            pin_ref = "refs/unity-worker/direct-merge/" + task["task_branch"].split("/")[-1]
+            git(self.project, "update-ref", pin_ref, source, base)
+            wrong_pin = self.stage(client, task_id, "release")
+            self.assertEqual(wrong_pin["failure_kind"], "workspace_changed")
+            self.assertEqual(git(self.project, "rev-parse", pin_ref), source)
+            git(self.project, "update-ref", pin_ref, base, source)
+            release = self.stage(client, task_id, "release")
+            self.assertEqual(release["stage_result"], {"released": True}, release)
+            current = self.task(client, task_id)
+            self.assertFalse(current["lease"])
+            self.assertEqual((current["status"], current["failure_kind"]), ("failed", "merge_conflict"))
+            self.assertFalse(current.get("delivery"))
+            self.assertFalse(current["pushed"])
+            self.assertEqual(git(self.remote, "rev-parse", "main"), base)
+
+    def test_confirmed_merge_retries_restore_after_operator_archives_dirty_file(self):
+        from direct_merge import DirectMergeGit
+
+        with self.direct_client() as client:
+            task = self.direct_task(client)
+            task_id = task["task_id"]
+            restore = DirectMergeGit.restore
+            dirty = self.project / "after-push.meta"
+
+            def dirty_on_restore(git_merge, ctx, record, source):
+                if record["merge_journal"]["status"] == "confirmed":
+                    dirty.write_text("operator evidence\n")
+                return restore(git_merge, ctx, record, source)
+
+            with patch.object(DirectMergeGit, "restore", dirty_on_restore):
+                failed = self.merge_job(client, task)
+            self.assertEqual(failed["failure_kind"], "dirty_workspace", failed)
+            journal = self.task(client, task_id)["merge_journal"]
+            self.assertEqual(journal["status"], "confirmed")
+            self.assertEqual(git(self.remote, "rev-parse", "main"), journal["receipt"]["merge_sha"])
+            release = client.post(f"/api/v1/tasks/{task_id}/release", json={"request_id": str(uuid4())})
+            self.assertEqual(release.status_code, 409)
+            with patch.object(DirectMergeGit, "push", side_effect=AssertionError("unexpected second push")):
+                again = self.merge_job(client, task)
+                self.assertEqual(again["failure_kind"], "dirty_workspace", again)
+                self.assertTrue(dirty.exists())
+                dirty.rename(self.root / "archived-after-push.meta")
+                merged = self.merge_job(client, task)
+            self.assertEqual(merged["status"], "succeeded", merged)
+            self.assertEqual(merged["stage_result"], journal["receipt"])
+            self.assertEqual(git(self.project, "branch", "--show-current"), task["task_branch"])
+            self.assertEqual(self.stage(client, task_id, "release")["status"], "succeeded")
