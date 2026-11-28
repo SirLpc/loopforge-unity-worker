@@ -23,7 +23,8 @@ SECRET_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".jks", ".keystore", ".kdbx"}
 BUILD_SUFFIXES = {".apk", ".aab", ".ipa", ".exe", ".appx", ".msix"}
 SECRET_PATTERN = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:gh[pousr]_[A-Za-z0-9]{30,}|AKIA[A-Z0-9]{16})")
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-GUID = re.compile(rb"^guid: [a-fA-F0-9]{32}[ \t]*\r?$", re.M)
+GUID_LINE = "^guid: [a-fA-F0-9]{32}[ \t]*\r?$"
+GUID = re.compile(GUID_LINE.encode("ascii"), re.M)
 ASSET_CONTAINER_SUFFIXES = {".androidlib", ".androidpack", ".bundle", ".framework", ".plugin"}
 
 
@@ -333,9 +334,10 @@ class GitWorkspace:
 
         containers = {path for path in directories if PurePosixPath(path).suffix.lower() in ASSET_CONTAINER_SUFFIXES}
         missing = []
+        paired = set()
         for path in sorted(files | directories):
             meta = path + ".meta"
-            if path.endswith(".meta") or meta in files:
+            if path.endswith(".meta"):
                 continue
             asset = PurePosixPath(path)
             relative = asset.relative_to(self.asset_prefix)
@@ -345,13 +347,31 @@ class GitWorkspace:
                 continue
             if any(parent.as_posix() in containers for parent in asset.parents):
                 continue
-            missing.append(meta)
+            if meta in files:
+                paired.add(meta)
+            else:
+                missing.append(meta)
 
-        if missing:
-            raise StageError("baseline_asset_metadata",
-                             "Missing .meta files in the Unity Git baseline. Commit the missing files, then start a new task.",
-                             result={"base_commit": commit, "missing_meta_paths": missing[:30],
-                                     "missing_meta_count": len(missing)})
+        invalid = []
+        if paired:
+            # Read the fetched blobs before checkout, without opening Unity or running Git per asset.
+            _, raw = self.git(ctx, "grep", "-L", "-z", "-a", "--no-textconv", "-E", GUID_LINE,
+                              commit, "--", f":(glob){asset_root}/**/*.meta", allowed=(0, 1), limit=None)
+            without_guid = {row.decode("utf-8").split(":", 1)[1] for row in raw.split(b"\0") if row}
+            invalid = sorted(paired & without_guid)
+
+        if missing or invalid:
+            result = {"base_commit": commit}
+            if missing:
+                result.update(missing_meta_paths=missing[:30], missing_meta_count=len(missing))
+            if invalid:
+                result.update(invalid_meta_paths=invalid[:30], invalid_meta_count=len(invalid))
+                message = (f"Unity Git baseline {commit} has {len(invalid)} .meta file(s) with an invalid GUID "
+                           f"(expected 32 hexadecimal characters), including {invalid[0]}. "
+                           "Commit the corrected metadata, then start a new task.")
+            else:
+                message = "Missing .meta files in the Unity Git baseline. Commit the missing files, then start a new task."
+            raise StageError("baseline_asset_metadata", message, result=result)
 
     def uses_lfs(self, ctx, revision):
         code, _ = self.git(ctx, "grep", "-I", "-l", "-F", "filter=lfs", revision,

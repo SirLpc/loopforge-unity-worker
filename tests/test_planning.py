@@ -148,6 +148,37 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded")
         self.assertEqual(self.task(next_task)["base_commit"], git(self.project, "rev-parse", "HEAD"))
 
+    def test_clarify_blocks_invalid_baseline_meta_guid_and_releases_slot(self):
+        assets = self.project / "Assets"
+        assets.mkdir()
+        (assets / "Preview Tests.cs").write_text("class PreviewTests {}\n")
+        meta = assets / "Preview Tests.cs.meta"
+        meta.write_text("fileFormatVersion: 2\nguid: ee327c2166d446418fdae39cdc67b1515\n")
+        git(self.project, "add", "Assets")
+        git(self.project, "commit", "-m", "Add fixture with malformed metadata")
+        git(self.project, "push", "origin", "main")
+        base = git(self.project, "rev-parse", "HEAD")
+
+        task_id = self.create(workflow_mode="staged-feature", workflow_project_id="game")
+        job = self.wait(self.action(task_id, "clarify"))
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["failure_kind"], "baseline_asset_metadata")
+        self.assertEqual(job["stage_result"]["base_commit"], base)
+        self.assertEqual(job["stage_result"]["invalid_meta_paths"], ["Assets/Preview Tests.cs.meta"])
+        self.assertIn("invalid GUID", job["error_message"])
+        self.assertIn("Assets/Preview Tests.cs.meta", job["error_message"])
+        blocked = self.task(task_id)
+        self.assertFalse(blocked["lease"])
+        self.assertIsNone(blocked.get("clarification"))
+
+        meta.write_bytes(b"fileFormatVersion: 2\r\nguid: EE327C2166D446418FDAE39CDC67B151\r\n")
+        git(self.project, "add", "Assets")
+        git(self.project, "commit", "-m", "Repair fixture metadata")
+        git(self.project, "push", "origin", "main")
+        next_task = self.create(workflow_mode="staged-feature", workflow_project_id="game",
+                                workflow_run_id="run-fixed")
+        self.assertEqual(self.wait(self.action(next_task, "clarify"))["status"], "succeeded")
+
     def test_deleted_run_releases_clean_slot_and_admits_next_task(self):
         previous = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-1")
         queued = self.create(workflow_mode="staged-feature", workflow_project_id="game", workflow_run_id="run-2")

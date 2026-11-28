@@ -136,7 +136,7 @@ class WorkspaceTests(unittest.TestCase):
                          ".hidden/note.txt", "Samples~/sample.txt", "cvs/file.txt", "scratch.tmp"):
                 file = author / "Assets" / name
                 file.parent.mkdir(parents=True, exist_ok=True)
-                file.write_text("fixture\n")
+                file.write_text("guid: " + "a" * 32 + "\n" if file.suffix == ".meta" else "fixture\n")
             (author / "Packages/unity-package.json").write_text("{}")
             git(author, "add", "Assets", "Packages/unity-package.json")
             git(author, "-c", "protocol.file.allow=always", "submodule", "add", str(remote), "Assets/Content")
