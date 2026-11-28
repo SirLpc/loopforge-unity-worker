@@ -74,13 +74,15 @@ class GitWorkspace:
         self.ignored_cache_paths = tuple(PurePosixPath(path.lower())
                                          for path in getattr(settings, "ignored_cache_paths", ()))
 
-    def git(self, ctx, *args, allowed=(0,), data=None, index=None, limit=8_000_000, read=None):
+    def git(self, ctx, *args, allowed=(0,), data=None, index=None, limit=8_000_000, read=None, reflog_action=None):
         env = {
             **system_env(), "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
             "GIT_LFS_SKIP_SMUDGE": "1", "GIT_LITERAL_PATHSPECS": "0",
         }
         if index:
             env["GIT_INDEX_FILE"] = str(index)
+        if reflog_action:
+            env["GIT_REFLOG_ACTION"] = reflog_action
         # Git LFS may install hooks. Keep them outside the checkout and isolate
         # each command from hooks installed by earlier calls.
         with TemporaryDirectory(prefix="git-hooks-", dir=ctx.directory) as hooks:
@@ -241,15 +243,21 @@ class GitWorkspace:
                              result={"dirty_paths": [path for _, path in rows[:30]]})
         self.assert_submodules_clean(ctx)
 
-    def assert_submodules_clean(self, ctx):
+    def assert_submodules_clean(self, ctx, *, ignore_submodule_heads=False):
         if not (self.root / ".gitmodules").is_file():
             return
         scopes = ("submodule", "foreach", "--quiet", "--recursive")
+        submodules = "all" if ignore_submodule_heads else "none"
+        check_index = (
+            'git diff-index --cached --quiet --ignore-submodules=none HEAD -- '
+            '|| { printf "staged changes"; exit 0; }; '
+        ) if ignore_submodule_heads else ""
         status = (
             'for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START index.lock; '
             'do if test -e "$(git rev-parse --git-path "$marker")"; then printf "operation in progress"; exit 0; fi; done; '
+            f"{check_index}"
             "git -c core.fsmonitor=false -c core.ignoreStat=false status --porcelain=v1 -z "
-            "--no-renames --untracked-files=all --ignored=matching --ignore-submodules=none"
+            f"--no-renames --untracked-files=all --ignored=matching --ignore-submodules={submodules}"
         )
         _, changes = self.git(ctx, *scopes, status)
         _, hidden = self.git(ctx, *scopes, "git ls-files -v -z", limit=None, read=has_hidden_index_entries)

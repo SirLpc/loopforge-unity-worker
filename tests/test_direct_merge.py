@@ -1,5 +1,6 @@
 import subprocess
 import unittest
+from unittest.mock import patch
 
 from process_runner import StageError
 from support import test_directory
@@ -155,7 +156,7 @@ class DirectMergeTests(unittest.TestCase):
                 merge.assert_clean_candidate(ctx, candidate)
             self.assert_remote_refs(remote, base, source)
 
-    def test_candidate_updates_and_restores_initialized_submodule(self):
+    def test_review_restore_retries_owned_submodule_hydration_after_switch(self):
         with test_directory() as root:
             module_remote, module_author = root / "module-remote", root / "module-author"
             git(root, "init", "--bare", "--initial-branch=main", str(module_remote))
@@ -183,10 +184,78 @@ class DirectMergeTests(unittest.TestCase):
             checked_out = checkout / "Packages/Fixture"
             self.assertEqual(git(checked_out, "rev-parse", "HEAD"), new_module)
             self.assertEqual((checked_out / "version.txt").read_bytes(), b"advanced module\n")
-            merge.restore(ctx, task, source)
+            git(checkout, "switch", "--no-recurse-submodules", TASK_BRANCH)
+            with self.assertRaises(StageError):
+                merge.restore(ctx, task, source)
+            self.assertEqual(git(checked_out, "rev-parse", "HEAD"), new_module)
+            git(checkout, "switch", "--detach", "--no-recurse-submodules", candidate.commit_sha)
+
+            with patch.object(workspace, "hydrate_checkout", side_effect=StageError("git_failed", "connection lost")):
+                with self.assertRaisesRegex(StageError, "connection lost"):
+                    merge.restore(ctx, task, source)
+            self.assertEqual(git(checkout, "branch", "--show-current"), TASK_BRANCH)
+            self.assertEqual(git(checked_out, "rev-parse", "HEAD"), new_module)
+
+            write(checked_out, "version.txt", b"operator changes\n")
+            with self.assertRaises(StageError):
+                DirectMergeGit(workspace).restore(ctx, task, source)
+            self.assertEqual((checked_out / "version.txt").read_bytes(), b"operator changes\n")
+            git(checked_out, "restore", "--", "version.txt")
+            git(checked_out, "commit", "--allow-empty", "-m", "Operator dependency commit")
+            external = git(checked_out, "rev-parse", "HEAD")
+            with self.assertRaises(StageError):
+                DirectMergeGit(workspace).restore(ctx, task, source)
+            self.assertEqual(git(checked_out, "rev-parse", "HEAD"), external)
+            git(checked_out, "switch", "--detach", new_module)
+
+            DirectMergeGit(workspace).restore(ctx, task, source)
             self.assertEqual(git(checked_out, "rev-parse", "HEAD"), old_module)
             self.assertEqual((checked_out / "version.txt").read_bytes(), b"original module\n")
             self.assert_remote_refs(remote, base, source)
+
+    def review_conflict(self, root, *, seed=None):
+        from direct_merge import DirectMergeGit
+
+        workspace, ctx, remote, checkout, author, task = self.repository(root, path=SCRIPT, seed=seed)
+        write(checkout, SCRIPT, SOURCE)
+        source = self.publish(checkout, TASK_BRANCH)
+        write(author, SCRIPT, TARGET)
+        base = self.publish(author, "main")
+        merge = DirectMergeGit(workspace)
+        candidate = merge.begin(ctx, task, source, merge.read_target(ctx, task))
+        self.assertEqual(candidate.conflict_paths, (SCRIPT,))
+        return merge, ctx, candidate, remote, checkout, base, source
+
+    def test_review_resolution_rejects_raw_changes_hidden_by_git_normalization(self):
+        def seed(checkout):
+            write(checkout, ".gitattributes", b"hello.txt text eol=lf\n")
+            write(checkout, "hello.txt", b"old\n")
+            git(checkout, "config", "core.autocrlf", "false")
+
+        with test_directory() as root:
+            merge, ctx, candidate, remote, checkout, base, source = self.review_conflict(root, seed=seed)
+            self.assertEqual((checkout / "hello.txt").read_bytes(), b"old\n")
+            write(checkout, "hello.txt", b"old\r\n")
+            # A clean conversion refreshes index stat data without changing the staged blob.
+            git(checkout, "add", "--", "hello.txt")
+            self.assertNotIn("hello.txt", git(checkout, "status", "--porcelain"))
+            write(checkout, SCRIPT, b"class Item { int both = 3; }\n")
+            with self.assertRaises(StageError) as rejected:
+                merge.resolve(ctx, candidate)
+            self.assertEqual(rejected.exception.kind, "merge_resolution_scope")
+            self.assertEqual((checkout / "hello.txt").read_bytes(), b"old\r\n")
+            self.assert_remote_refs(remote, base, source)
+
+    def test_review_resolution_rejects_markers_after_bom_or_bare_cr(self):
+        for prefix in (b"\xef\xbb\xbf", b"class Item {}\r"):
+            with self.subTest(prefix=prefix), test_directory() as root:
+                merge, ctx, candidate, remote, checkout, base, source = self.review_conflict(root)
+                write(checkout, SCRIPT, prefix + b"<<<<<<< leftover marker\n")
+                with self.assertRaises(StageError) as rejected:
+                    merge.resolve(ctx, candidate)
+                self.assertEqual(rejected.exception.kind, "merge_resolution_scope")
+                self.assertTrue((checkout / ".git/MERGE_HEAD").is_file())
+                self.assert_remote_refs(remote, base, source)
 
     def test_content_conflict_accepts_exact_csharp_paths(self):
         with test_directory() as root:

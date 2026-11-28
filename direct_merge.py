@@ -1,16 +1,20 @@
 """Build and verify a disposable merge candidate in the resident Unity checkout."""
 
 import json
+import os
 import re
 import stat
 from dataclasses import dataclass, field, replace
+from hashlib import file_digest, sha256
 from pathlib import PurePosixPath
 
 from git_workspace import SHA, GitWorkspace
 from process_runner import StageError
 
 
-CONFLICT_MARKERS = re.compile(rb"^(?:<{7,}|={7,}|>{7,}|\|{7,})", re.MULTILINE)
+CONFLICT_MARKERS = re.compile(
+    rb"(?:\A(?:\xef\xbb\xbf)?|[\r\n]|\xc2\x85|\xe2\x80[\xa8\xa9])(?:<{7,}|={7,}|>{7,}|\|{7,})"
+)
 LFS_POINTER = re.compile(rb"^(?:\xef\xbb\xbf)?version https?://(?:git-lfs.github.com/spec/v1|hawser.github.com/spec/v1)(?:\r?\n|$)")
 MAX_CONFLICT_BYTES = 8_000_000
 
@@ -31,6 +35,7 @@ class MergeCandidate:
     commit_sha: str | None = None
     tree_sha: str | None = None
     index_entries: tuple[IndexEntry, ...] = field(default=(), repr=False, compare=False)
+    outside_fingerprints: tuple[tuple[str, bytes], ...] = field(default=(), repr=False, compare=False)
     task_branch: str | None = field(default=None, repr=False, compare=False)
     remote_identity: str | None = field(default=None, repr=False, compare=False)
 
@@ -109,7 +114,7 @@ class DirectMergeGit:
             workspace.assert_submodules_clean(ctx)
             workspace.hydrate_submodules(ctx)
             self._assert_working_scope(ctx, conflicted=paths)
-            return candidate
+            return replace(candidate, outside_fingerprints=self._worktree_fingerprints(ctx, entries))
         return self._finish(ctx, task, candidate, url)
 
     def resolve(self, ctx, candidate: MergeCandidate) -> MergeCandidate:
@@ -123,6 +128,12 @@ class DirectMergeGit:
         if not paths or self._index_entries(ctx) != entries:
             raise StageError("merge_resolution_scope", "The merge index changed outside Worker staging")
         self._assert_working_scope(ctx, conflicted=paths)
+        actual_fingerprints = dict(self._worktree_fingerprints(ctx, entries))
+        raw_edits = [path for path, original in candidate.outside_fingerprints
+                     if actual_fingerprints.pop(path, None) != original]
+        if raw_edits or actual_fingerprints:
+            raise StageError("merge_resolution_scope", "Tracked files outside the conflict paths changed on disk",
+                             result={"dirty_paths": (raw_edits + list(actual_fingerprints))[:30]})
         for path in paths:
             workspace.check_path(path)
             local = workspace.root / path
@@ -165,7 +176,7 @@ class DirectMergeGit:
     def restore(self, ctx, task: dict, source_sha: str) -> None:
         workspace = self.workspace
         self._require_sha(source_sha)
-        workspace.clean(ctx)
+        workspace.validate(ctx)
         self._assert_no_merge_markers()
         url = self._push_url(ctx, task)
         pin = self._pin_ref(task)
@@ -176,17 +187,67 @@ class DirectMergeGit:
         head = workspace.text(ctx, "rev-parse", "HEAD")
         if source_ref != source_sha or (branch and (branch != task_ref or head != source_sha)):
             raise StageError("workspace_changed", "The original task branch changed outside the Worker")
+        reflog = f"unity-worker restore {owned} {task_ref}"
         if not branch:
             if head != owned:
                 raise StageError("workspace_changed", "The detached checkout does not match the Worker merge operation")
+            workspace.assert_clean(ctx)
+            workspace.validate_unity_revision(ctx, source_sha)
+            workspace.validate_lfs_filters(ctx, source_sha)
+            workspace.git(ctx, "-c", "core.logAllRefUpdates=true", "switch", "--no-overwrite-ignore",
+                          "--no-recurse-submodules", task["task_branch"], reflog_action=reflog)
+
+        workspace.checkout_is(ctx, task, source_sha)
+        if owned and workspace.text(ctx, "reflog", "-1", "--format=%H%x09%gs", "HEAD") == f"{source_sha}\t{reflog}":
+            self._assert_restore_scope(ctx, owned)
             workspace.validate_unity_revision(ctx, source_sha)
             lfs = workspace.validate_lfs_filters(ctx, source_sha)
-            workspace.git(ctx, "switch", "--no-overwrite-ignore", "--no-recurse-submodules", task["task_branch"])
             workspace.hydrate_checkout(ctx, lfs=lfs, lfs_remote=workspace.cfg.git_remote, lfs_url=url)
-        workspace.checkout_is(ctx, task, source_sha)
         self._assert_checkout_contents(ctx, source_sha)
         if owned:
             workspace.git(ctx, "update-ref", "-d", pin, owned)
+
+    def _assert_restore_scope(self, ctx, owned):
+        workspace = self.workspace
+        rows = workspace.status(ctx)
+        workspace.assert_submodules_clean(ctx, ignore_submodule_heads=True)
+        moving = self._moving_submodules(ctx, owned) if (workspace.root / ".gitmodules").is_file() else set()
+        dirty = [path for state, path in rows if state != " M" or path not in moving]
+        if dirty:
+            raise StageError("dirty_workspace", "The restored task branch has local changes",
+                             result={"dirty_paths": dirty[:30]})
+
+    def _moving_submodules(self, ctx, owned):
+        workspace = self.workspace
+        _, output = workspace.git(
+            ctx, "submodule", "foreach", "--quiet", "--recursive",
+            'actual=$(git rev-parse HEAD) && printf "%s\\000%s\\000%s\\000" "$displaypath" "$sha1" "$actual"',
+        )
+        paths = output.decode("utf-8").split("\0")
+        checkout_links = {PurePosixPath(): self._gitlinks(ctx, workspace.root, owned)}
+        roots = {}
+        moving = set()
+        for raw_path, expected, actual in zip(paths[0:-1:3], paths[1::3], paths[2::3]):
+            path = PurePosixPath(raw_path)
+            parent = next(parent for parent in path.parents if parent in checkout_links)
+            previous = checkout_links[parent].get(path.relative_to(parent).as_posix())
+            roots[path] = roots.get(parent, raw_path)
+            if actual != expected:
+                if actual != previous:
+                    raise StageError("dirty_workspace", "A submodule checkout changed outside the merge operation",
+                                     result={"dirty_paths": [raw_path]})
+                moving.add(roots[path])
+            checkout_links[path] = self._gitlinks(ctx, workspace.root / raw_path, previous) if previous else {}
+        return moving
+
+    def _gitlinks(self, ctx, checkout, revision):
+        _, output = self.workspace.git(ctx, "-C", str(checkout), "ls-tree", "-r", "-z", revision, limit=None)
+        links = {}
+        for raw in output.split(b"\0"):
+            if raw.startswith(b"160000 commit "):
+                entry, path = raw.decode("utf-8").split("\t", 1)
+                links[path] = entry.rsplit(" ", 1)[1]
+        return links
 
     @staticmethod
     def _require_sha(sha):
@@ -225,14 +286,55 @@ class DirectMergeGit:
             raise StageError("workspace_changed", "The in-progress Git merge changed outside the Worker")
 
     def _index_entries(self, ctx):
-        entries = []
-        _, output = self.workspace.git(ctx, "ls-files", "--stage", "-z", limit=None)
+        output = self.workspace.git(ctx, "ls-files", "--stage", "-z", limit=None)[1]
+        return tuple(self._parse_index_entries(output))
+
+    @staticmethod
+    def _parse_index_entries(output):
         for row in output.decode("utf-8").split("\0"):
             if row:
                 header, path = row.split("\t", 1)
                 mode, blob, stage = header.split()
-                entries.append(IndexEntry(path, mode, blob, int(stage)))
-        return tuple(entries)
+                yield IndexEntry(path, mode, blob, int(stage))
+
+    def _worktree_fingerprints(self, ctx, entries):
+        workspace = self.workspace
+        paths = [entry.path for entry in entries if entry.stage == 0 and entry.mode != "160000"]
+        if (workspace.root / ".gitmodules").is_file():
+            _, output = workspace.git(
+                ctx, "submodule", "foreach", "--quiet", "--recursive",
+                'printf "%s\\000" "$displaypath" && git ls-files --stage -z && printf "\\000"',
+                limit=None,
+            )
+            for module in output.split(b"\0\0"):
+                if module:
+                    directory, _, index = module.partition(b"\0")
+                    prefix = directory.decode("utf-8")
+                    paths.extend(prefix + "/" + entry.path for entry in self._parse_index_entries(index)
+                                 if entry.mode != "160000")
+
+        fingerprints = []
+        checked_directories = set()
+        for path in paths:
+            local = workspace.root / path
+            try:
+                if local.parent not in checked_directories:
+                    if local.parent.resolve(strict=True) != local.parent:
+                        raise OSError("linked directory")
+                    checked_directories.add(local.parent)
+                mode = local.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    digest = b"L" + sha256(os.fsencode(os.readlink(local))).digest()
+                elif stat.S_ISREG(mode):
+                    with local.open("rb") as stream:
+                        digest = b"F" + file_digest(stream, "sha256").digest()
+                else:
+                    raise OSError("unsupported tracked file type")
+            except (OSError, RuntimeError) as error:
+                raise StageError("merge_resolution_scope", "Cannot verify a tracked file outside the conflict paths",
+                                 result={"dirty_paths": [path]}) from error
+            fingerprints.append((path, digest))
+        return tuple(fingerprints)
 
     def _blob(self, ctx, sha):
         return self.workspace.git(ctx, "cat-file", "blob", sha, limit=MAX_CONFLICT_BYTES)[1]
@@ -339,7 +441,7 @@ class DirectMergeGit:
         options = ("-S",) if signing == "true" else ()
         sha = workspace.text(ctx, "commit-tree", tree, "-p", candidate.base_sha, "-p", candidate.source_sha,
                              *options, "-F", "-", data=b"Merge approved Unity task\n")
-        candidate = replace(candidate, commit_sha=sha, tree_sha=tree, index_entries=(),
+        candidate = replace(candidate, commit_sha=sha, tree_sha=tree, index_entries=(), outside_fingerprints=(),
                             task_branch=None, remote_identity=None)
         self._assert_candidate_identity(ctx, candidate)
         workspace.git(ctx, "update-ref", self._pin_ref(task), sha, candidate.base_sha)
