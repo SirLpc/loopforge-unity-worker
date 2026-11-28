@@ -186,12 +186,12 @@ class GitWorkspace:
             except FileNotFoundError:
                 continue
 
-    def validate(self, ctx):
+    def validate(self, ctx, *, allow_merge=False):
         assert_unity_closed(self.project)
         self.validate_checkout_identity(ctx)
         for path in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply",
                      "sequencer", "BISECT_START", "index.lock", "shallow.lock", "config.lock"):
-            if (self.root / ".git" / path).exists():
+            if not (allow_merge and path == "MERGE_HEAD") and (self.root / ".git" / path).exists():
                 raise StageError("dirty_workspace", f"Unfinished Git operation ({path}). Resolve it manually.")
         if self.text(ctx, "config", "--bool", "--get", "core.sparseCheckout", allowed=(0, 1)) == "true":
             raise StageError("unsupported", "Sparse checkout is not supported for a resident Unity project")
@@ -350,6 +350,51 @@ class GitWorkspace:
                            "--", ".gitattributes", ":(glob)**/.gitattributes", allowed=(0, 1))
         return code == 0
 
+    def validate_unity_revision(self, ctx, commit):
+        self.assert_safe_tree(ctx, commit)
+        version = self.text(ctx, "show", f"{commit}:{self.unity_prefix / PROJECT_VERSION}", limit=32_768)
+        if f"m_EditorVersion: {self.cfg.unity_version}" not in version.splitlines():
+            raise StageError("unsupported", "The target branch requires a different Unity Editor version")
+
+    def validate_lfs_filters(self, ctx, commit):
+        lfs = self.uses_lfs(ctx, commit)
+        if lfs:
+            self.git(ctx, "lfs", "version")
+            if not self.text(ctx, "config", "--get", "filter.lfs.process", allowed=(0, 1)):
+                raise StageError("unsupported", "Install Git LFS filters in the dedicated checkout")
+        return lfs
+
+    def assert_submodules_current(self, ctx):
+        submodules = self.git(ctx, "submodule", "status", "--recursive")[1].decode("utf-8")
+        if any(line.startswith(("-", "+", "U")) for line in submodules.splitlines()):
+            raise StageError("unsupported", "Submodule checkout incomplete. Initialize the configured submodules.")
+
+    def hydrate_submodules(self, ctx):
+        if (self.root / ".gitmodules").is_file():
+            if self.cfg.init_submodules:
+                self.git(ctx, "submodule", "sync", "--recursive")
+                self.git(ctx, "submodule", "update", "--init", "--recursive", "--checkout")
+            else:
+                self.git(ctx, "submodule", "update", "--recursive", "--checkout")
+            self.assert_submodules_current(ctx)
+            self.git(ctx, "submodule", "foreach", "--quiet", "--recursive",
+                     "if git grep -I -q -F filter=lfs HEAD -- .gitattributes ':(glob)**/.gitattributes'; "
+                     'then test -n "$(git config --get filter.lfs.process)" && git lfs pull; '
+                     'else test "$?" -eq 1; fi')
+
+    def hydrate_checkout(self, ctx, *, lfs, lfs_remote, lfs_url=None):
+        self.hydrate_submodules(ctx)
+        if lfs:
+            self.hydrate_lfs(ctx, lfs_remote, lfs_url=lfs_url)
+
+    def hydrate_lfs(self, ctx, remote, *, lfs_url=None):
+        if lfs_url is not None and self.text(ctx, "remote", "get-url", "--", remote) != lfs_url:
+            # Git LFS's standalone file adapter requires a named remote.
+            alias = "unity-worker-" + uuid4().hex
+            self.git(ctx, "-c", f"remote.{alias}.url={lfs_url}", "lfs", "pull", alias)
+        else:
+            self.git(ctx, "lfs", "pull", remote)
+
     def prepare(self, ctx, branch):
         self.clean(ctx)
         self.assert_safe_tree(ctx, "HEAD")
@@ -362,37 +407,16 @@ class GitWorkspace:
         self.git(ctx, "fetch", "--no-tags", "--no-recurse-submodules", "--", cfg.git_remote,
                  f"refs/heads/{cfg.base_branch}")
         commit = self.text(ctx, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
-        self.assert_safe_tree(ctx, commit)
-        version = self.text(ctx, "show", f"{commit}:{self.unity_prefix / PROJECT_VERSION}", limit=32_768)
-        if f"m_EditorVersion: {cfg.unity_version}" not in version.splitlines():
-            raise StageError("unsupported", "The target branch requires a different Unity Editor version")
+        self.validate_unity_revision(ctx, commit)
         self.assert_baseline_asset_meta(ctx, commit)
-        lfs = self.uses_lfs(ctx, commit)
-        if lfs:
-            self.git(ctx, "lfs", "version")
-            if not self.text(ctx, "config", "--get", "filter.lfs.process", allowed=(0, 1)):
-                raise StageError("unsupported", "Install Git LFS filters in the dedicated checkout")
+        lfs = self.validate_lfs_filters(ctx, commit)
         current = self.text(ctx, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1))
         if current == branch:
             if self.text(ctx, "rev-parse", "HEAD") != commit:
                 raise StageError("workspace_changed", "Partially prepared task branch no longer matches the fetched base")
         else:
             self.git(ctx, "switch", "--no-overwrite-ignore", "--no-recurse-submodules", "-c", branch, commit)
-        if (self.root / ".gitmodules").is_file():
-            if cfg.init_submodules:
-                self.git(ctx, "submodule", "sync", "--recursive")
-                self.git(ctx, "submodule", "update", "--init", "--recursive", "--checkout")
-            else:
-                self.git(ctx, "submodule", "update", "--recursive", "--checkout")
-            submodules = self.git(ctx, "submodule", "status", "--recursive")[1].decode("utf-8")
-            if any(line.startswith(("-", "+", "U")) for line in submodules.splitlines()):
-                raise StageError("unsupported", "Submodule checkout incomplete. Initialize the configured submodules.")
-            self.git(ctx, "submodule", "foreach", "--quiet", "--recursive",
-                     "if git grep -I -q -F filter=lfs HEAD -- .gitattributes ':(glob)**/.gitattributes'; "
-                     'then test -n "$(git config --get filter.lfs.process)" && git lfs pull; '
-                     'else test "$?" -eq 1; fi')
-        if lfs:
-            self.git(ctx, "lfs", "pull", cfg.git_remote)
+        self.hydrate_checkout(ctx, lfs=lfs, lfs_remote=cfg.git_remote)
         self.assert_clean(ctx)
         return {"base_commit": commit, "task_branch": branch, "remote_identity": remote_identity, "lfs": lfs}
 
