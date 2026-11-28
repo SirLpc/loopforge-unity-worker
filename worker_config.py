@@ -11,6 +11,10 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 
+# Staged feature reworks are separate from the pool's local correction budget.
+FEATURE_AUTO_REWORK_LIMITS = {"review": 5, "test": 3}
+FEATURE_TOTAL_REWORK_LIMIT = 10
+
 PROJECT_VERSION = "ProjectSettings/ProjectVersion.txt"
 VERSION_PATTERN = r"\d+\.\d+\.\d+[abfp]\d+(?:c\d+)?"
 REMOTE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"

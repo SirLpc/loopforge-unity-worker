@@ -185,7 +185,7 @@ class InstallSopsTests(unittest.TestCase):
             with self.subTest(node=node_id):
                 self.assertEqual(node["name"], title)
                 self.assertEqual(node["maxAttempts"], 1 if node_id == "accept" else 2)
-                self.assertEqual(node["maxReworks"], {"review": 1, "test": 2}.get(node_id, 0))
+                self.assertEqual(node["maxReworks"], (10 if node_id in {"review", "test", "accept"} else 0))
                 if node_id in {"review", "test"}:
                     self.assertEqual(node["onFailure"], "fail")
                     self.assertNotIn("rejectTo", node)

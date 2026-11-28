@@ -20,7 +20,9 @@ from planning import assert_baseline, clarify_requirements, investigate
 from pull_requests import HostedPullRequests
 from task_store import Store, now, signature
 from unity_executor import UnityExecutor, assert_unity_closed
-from worker_config import Settings, check_slot, legacy_service, validate_test_selection
+from worker_config import (
+    FEATURE_AUTO_REWORK_LIMITS, FEATURE_TOTAL_REWORK_LIMIT, Settings, check_slot, legacy_service, validate_test_selection,
+)
 from workflow_approval import authenticate_approval, check_freshness
 from workspace_storage import CacheName, clean_cache, cleanup_remnants, measure_directory, volume_usage
 
@@ -101,6 +103,12 @@ def stage_finalizes_with_job(task, action):
         (action == "rework" and stage == "fix") or (action in {"run", "test"} and stage == "test")
         or (action == stage and stage in {"compile", "review"})
     )
+
+
+def local_fix_count(task):
+    # The stored total includes one correction for each admitted workflow rework.
+    workflow_reworks = task.get("implementation_attempt", 0) if task.get("workflow_mode") == "staged-feature" else 0
+    return task["retry_count"] - workflow_reworks
 
 
 class DevelopmentWorker:
@@ -434,7 +442,7 @@ class DevelopmentWorker:
                 return stage
             if staged_feature and failure == "recovered" and stage in {"reviewed", "tested"} and not task.get("verification"):
                 return "test"
-            if failure in FIXABLE and task["retry_count"] < self.cfg.pools[task["pool_id"]].policy.max_fixes:
+            if failure in FIXABLE and local_fix_count(task) < self.cfg.pools[task["pool_id"]].policy.max_fixes:
                 return "fix"
             if failure == "unity_changed" and stage in {"compile", "test"}:
                 return "compile"
@@ -445,6 +453,27 @@ class DevelopmentWorker:
                 return "compile"
             return None
         return (STAGED_FEATURE_NEXT_STAGE if staged_feature else NEXT_STAGE).get(stage)
+
+    def check_workflow_rework_budget(self, db, task, stage):
+        rounds = task["implementation_attempt"]
+        if rounds >= FEATURE_TOTAL_REWORK_LIMIT:
+            raise RequestConflict(f"Total workflow rework limit reached ({rounds}/{FEATURE_TOTAL_REWORK_LIMIT})")
+        limit = FEATURE_AUTO_REWORK_LIMITS.get(stage)
+        if limit is None:
+            return
+        # A failed review or test must be the predecessor of a new automatic rework.
+        # Recovery/release jobs do not spend a round, and resuming a rework keeps its round.
+        predecessor = (stage, "failed", task["failure_kind"])
+        previous = None
+        used = 0
+        for _, action, status, failure in reversed(list(self.store.staged_job_history(db, task["task_id"]))):
+            if action in {"recover", "release"}:
+                continue
+            if action == "rework" and previous == predecessor:
+                used += 1
+            previous = (action, status, failure)
+        if used >= limit:
+            raise RequestConflict(f"{stage} rework limit reached ({used}/{limit})")
 
     def check_action(self, db, task, action, payload, *, after_job=None):
         status, stage = task["status"], task["current_stage"]
@@ -523,8 +552,7 @@ class DevelopmentWorker:
                             raise RequestConflict("Rework requires named failed tests for the current revision")
                 if payload["implementation_attempt"] != attempt + 1:
                     raise RequestConflict("Rework does not match the next implementation attempt")
-                if task["retry_count"] >= self.cfg.pools[task["pool_id"]].policy.max_fixes:
-                    raise RequestConflict("The task has reached its correction limit")
+                self.check_workflow_rework_budget(db, task, stage if review_changes or tests_failed else None)
                 return
         elif action == "approve":
             if status == "awaiting_approval" and stage == "reviewed" and task["lease"]:
@@ -847,7 +875,7 @@ class DevelopmentWorker:
             try:
                 result = self.run_stage(ctx, action)
             except StageError as error:
-                if error.kind not in FIXABLE or ctx.task["retry_count"] >= ctx.settings.max_fixes:
+                if error.kind not in FIXABLE or local_fix_count(ctx.task) >= ctx.settings.max_fixes:
                     raise
                 ctx.save(status="failed", failure_kind=error.kind, error_message=str(error), stage_result=error.result)
                 action = "fix"

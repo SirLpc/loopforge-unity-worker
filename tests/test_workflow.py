@@ -20,6 +20,75 @@ from worker import create_app
 APPROVER = "human-approval-" + "z" * 32
 
 
+class StagedReworkBudgetTests(unittest.TestCase):
+    def test_existing_mixed_history_uses_separate_review_and_test_budgets(self):
+        import re
+        from types import SimpleNamespace
+
+        from development import DevelopmentWorker, RequestConflict
+        from task_store import Store
+
+        cases = [
+            ("review", 2, 1, 0, None),
+            ("review", 5, 1, 0, "review rework limit reached (5/5)"),
+            ("test", 5, 2, 0, None),
+            ("test", 1, 3, 0, "test rework limit reached (3/3)"),
+            ("review", 2, 1, 7, "Total workflow rework limit reached (10/10)"),
+        ]
+        for stage, reviews, tests, manual, expected in cases:
+            with self.subTest(stage=stage, reviews=reviews, tests=tests, manual=manual), test_directory() as root:
+                worker = DevelopmentWorker.__new__(DevelopmentWorker)
+                worker.store = Store(root / "worker.sqlite3", "worker", root)
+                worker.stopping = False
+                worker.scheduler = SimpleNamespace(slot_blocked=lambda _: False)
+                worker.cfg = SimpleNamespace(pools={"worker": SimpleNamespace(policy=SimpleNamespace(max_fixes=3))})
+                task_id = str(uuid4())
+                revision = "a" * 40
+                failures = {"review": "review_changes", "test": "tests_failed"}
+                cases_failed = [{"name": "Game.Tests.Drag"}]
+                test_result = {"status": "tests_failed", "revision": revision,
+                               "test_results": "report.xml", "failed_tests": cases_failed}
+                round_number = reviews + tests + manual
+                task = {"task_id": task_id, "worker_id": "worker", "lease": True, "commit_sha": None,
+                        "pool_id": "worker", "slot_id": "worker-01", "workflow_mode": "staged-feature",
+                        "workflow_run_id": "run-existing", "status": "failed", "current_stage": stage,
+                        "revision": revision, "implementation_attempt": round_number, "retry_count": round_number + 3,
+                        "failure_kind": failures[stage],
+                        "review_result": {"verdict": "request_changes" if stage == "review" else "pass", "revision": revision},
+                        "test_report": {"playmode": {**test_result, "runs": [test_result]}}}
+
+                def save_job(db, action, status, failure=None, result=None):
+                    job = worker.new_job(task_id, str(uuid4()), action, {})
+                    job.update(status=status, failure_kind=failure, stage_result=result or {})
+                    worker.store.save_job(db, job)
+                    return job["job_id"]
+
+                with worker.store.connect(write=True) as db:
+                    worker.store.save_task(db, task)
+                    for origin in ["review"] * reviews + ["test"] * tests + ["accept"] * manual:
+                        if origin == "accept":
+                            save_job(db, "test", "succeeded")
+                        else:
+                            save_job(db, origin, "failed", failures[origin])
+                        save_job(db, "rework", "failed", "timeout")
+                        save_job(db, "recover", "succeeded")
+                        save_job(db, "rework", "succeeded")
+                    result = task["review_result"] if stage == "review" else {**test_result, "mode": "playmode"}
+                    job_id = save_job(db, stage, "failed", failures[stage], result)
+                    task["job_id"] = job_id
+                    worker.store.save_task(db, task)
+                    payload = {"workflow_run_id": task["workflow_run_id"],
+                               "implementation_attempt": round_number + 1, "feedback": "Fix the current verdict"}
+                    if expected:
+                        with self.assertRaisesRegex(RequestConflict, re.escape(expected)):
+                            worker.check_action(db, task, "rework", payload, after_job=job_id)
+                    else:
+                        worker.check_action(db, task, "rework", payload, after_job=job_id)
+                    compile_failure = {**task, "current_stage": "compile", "failure_kind": "compile_failed"}
+                    self.assertIsNone(worker.next_stage(compile_failure))
+                    self.assertEqual(worker.next_stage({**compile_failure, "retry_count": round_number + 2}), "fix")
+
+
 class ApiBaseline(unittest.TestCase):
     def test_legacy_job_id_cannot_replace_a_development_task(self):
         with test_directory() as root:
@@ -495,7 +564,7 @@ class WorkflowTests(WorkflowFixture):
             with worker.store.connect(write=True) as db:
                 current = worker.store.task(db, task)
                 worker.store.save_task(db, {**current, "retry_count": 1})
-            self.assertNotIn("rework_job_id", client.get(task_path).json())
+            self.assertEqual(client.get(task_path).json()["rework_job_id"], failed["job_id"])
             with worker.store.connect(write=True) as db:
                 worker.store.save_task(db, current)
 
@@ -585,7 +654,10 @@ class WorkflowTests(WorkflowFixture):
             self.assertEqual(current["verification"], {"revision": current["revision"], "test_job_id": run_job["job_id"],
                                                        "implementation_attempt": 1})
             self.assertEqual(current["retry_count"], 1)
-            self.assertEqual(action("rework", **{**rework, "implementation_attempt": 2}).status_code, 409)
+            next_rework = action("rework", **{**rework, "implementation_attempt": 2})
+            self.assertEqual(next_rework.status_code, 202, next_rework.text)
+            self.assertEqual(self.wait(client, next_rework.json()["job_id"])["status"], "succeeded")
+            self.assertEqual(self.task(client, task)["implementation_attempt"], 2)
 
     def test_staged_correction_records_the_actual_fix_and_recompile_predecessors(self):
         with self.staged_client() as client:
