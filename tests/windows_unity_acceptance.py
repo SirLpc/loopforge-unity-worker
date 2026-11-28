@@ -164,6 +164,21 @@ def check(condition, message):
         raise AssertionError(message)
 
 
+def check_fixture_origin(checkout, remote):
+    from test_workspace import git
+
+    for options in ([], ["--push"]):
+        urls = git(checkout, "remote", "get-url", *options, "--all", "origin").splitlines()
+        check(urls == [remote.as_posix()], "Acceptance origin must use only its generated local bare repository")
+
+
+def fixture_transport(checkout, remote, *args):
+    from test_workspace import git
+
+    check_fixture_origin(checkout, remote)
+    return git(checkout, "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", *args)
+
+
 def direct_merge_acceptance(root, unity):
     from fastapi.testclient import TestClient
     from test_workspace import git
@@ -178,11 +193,12 @@ def direct_merge_acceptance(root, unity):
     git(project, "config", "user.email", "fixture@example.invalid")
     git(project, "add", "--all")
     git(project, "commit", "-m", "Track the imported disposable Unity project")
-    git(project, "remote", "add", "origin", remote.as_posix())
-    git(project, "push", "-u", "origin", "main")
-    git(root, "clone", str(remote), str(author))
-    urls = [git(project, "remote", "get-url", *opts, "origin") for opts in ([], ["--push"])]
-    identity = hashlib.sha256("\0".join(urls).encode()).hexdigest()
+    git(root, "init", "--initial-branch=main", str(author))
+    for checkout in (project, author):
+        git(checkout, "remote", "add", "origin", remote.as_posix())
+    check_fixture_origin(author, remote)
+    fixture_transport(project, remote, "push", "-u", "origin", "main")
+    identity = hashlib.sha256("\0".join([remote.as_posix()] * 2).encode()).hexdigest()
     settings = Settings(**vars(unity), logs=root / "logs", token=secrets.token_hex(32), git_exe=shutil.which("git"),
                         workflow_approval_key=secrets.token_hex(32), expected_remote_identity=identity, max_fixes=0,
                         test_assemblies={mode.lower(): (f"Acceptance.{mode}",) for mode in MODES})
@@ -241,11 +257,11 @@ def merge_case(client, settings, remote, author, value):
     approved = task()
     claims = claims_for(approved)
     source = claims["commit_sha"]
-    git(author, "pull", "--ff-only", "origin", "main")
+    fixture_transport(author, remote, "pull", "--ff-only", "origin", "main")
     (author / SCRIPT).write_text(sample(value - 1, value), encoding="utf-8")
     git(author, "add", "--", SCRIPT)
     git(author, "commit", "-m", "Independently advance the target on the same C# line")
-    git(author, "push", "origin", "main")
+    fixture_transport(author, remote, "push", "origin", "main")
     base = git(remote, "rev-parse", "main")
     for label, contents in (("test", approved["verification"]), ("approval", {"accept": True, "commit_sha": source})):
         artifact = directory / f"fixture-{label}.json"

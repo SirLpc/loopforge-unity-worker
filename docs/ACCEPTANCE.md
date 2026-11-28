@@ -17,7 +17,7 @@
 
 ## Windows Worker 签名直接合入验收
 
-在已安装 `requirements-dev.txt`、Windows Git 和 Unity Test Framework 依赖的独立检出中运行以下命令。每次运行会新建一个 `.tmp-test-unity-*` 目录，保留 bare 远端、工程、Worker 数据库、编译日志和 XML。生成的临时签名密钥仅用于本次进程内的 Worker HTTP 服务。
+在已安装 `requirements-dev.txt`、Windows Git 和 Unity Test Framework 依赖的独立检出中运行以下命令。每次运行会新建一个 `.tmp-test-unity-*` 目录，保留 bare 远端、工程、Worker 数据库、编译日志和 XML。生成的临时签名密钥仅用于本次进程内的 Worker HTTP 服务。脚本在首次推送前核对两个检出的所有有效拉取和推送地址，并在夹具每次传输前复查。Git 配置将地址改写到其他位置或添加额外目的地时，验收会停止。
 
 ~~~~powershell
 .\.venv\Scripts\python.exe tests/windows_unity_acceptance.py 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe' --direct-merge
