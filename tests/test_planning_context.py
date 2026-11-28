@@ -266,7 +266,7 @@ class FeatureContextTests(unittest.TestCase):
 
     def test_default_review_can_send_back_work_after_review_and_test_reworks(self):
         self.check_auto_rework("review", "review_changes", {"verdict": "request_changes", "summary": "Cover visible drag."},
-                               "独立评审要求修改：Cover visible drag.", completed_reworks=2)
+                               "独立评审要求修改：Cover visible drag.", completed_reworks=3)
 
     def test_auto_rework_requests_fix_for_named_tests_on_the_current_revision(self):
         self.check_auto_rework("test", "tests_failed", {"mode": "playmode", "failed_tests": [

@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, HTTPRedirectHandler, Request, build_opener
 
 from integrations.loopforge.worker_client import save_json
+from worker_config import FEATURE_TOTAL_REWORK_LIMIT
 TAG = "unity-worker-formal"
 WINDOWS_PLANNING_TAG = "unity-worker-windows-planning"
 STARTERS = (
@@ -371,7 +372,7 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
         node.update(artifactOutputs=[artifact(report, report + ".md")], metricStage=metric_stage,
                     maxAttempts=2, maxReworks=0)
         if node_id in {"review", "test"}:
-            node.update(onFailure="fail", maxReworks=3 if node_id == "review" else 2)
+            node.update(onFailure="fail", maxReworks=FEATURE_TOTAL_REWORK_LIMIT)
         if evidence:
             node["artifactOutputs"].append(artifact(evidence, evidence + ".json", "application/json"))
         nodes.append(node)
@@ -379,7 +380,7 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
                     "打开待审交付物中的测试报告，使用报告开头的任务分支和提交 SHA 验收。"
                     "核对需求、独立评审、Unity 测试和未覆盖项。"
                     "批准后发起 MR；需要修改时填写完整意见并打回开发实现。", "implement")
-    gate["maxReworks"] = 0
+    gate["maxReworks"] = FEATURE_TOTAL_REWORK_LIMIT
     nodes.insert(5, gate)
     return definition(target, f"{target.project_id}-{key}", title, lane, nodes, (worker_credential, context_credential))
 
