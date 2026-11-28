@@ -1,5 +1,7 @@
 import subprocess
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from process_runner import StageError
@@ -69,8 +71,8 @@ class DirectMergeTests(unittest.TestCase):
                              [candidate.commit_sha, base, source])
             self.assertEqual(candidate.tree_sha, git(checkout, "rev-parse", "HEAD^{tree}"))
             self.assertEqual(git(checkout, "branch", "--show-current"), "")
-            self.assertEqual((checkout / "hello.txt").read_bytes(), b"approved source\n")
-            self.assertEqual((checkout / "main-only.txt").read_bytes(), b"new main content\n")
+            self.assertEqual((checkout / "hello.txt").read_text(), "approved source\n")
+            self.assertEqual((checkout / "main-only.txt").read_text(), "new main content\n")
             self.assertTrue(merge.contains(ctx, source, candidate.commit_sha))
             self.assertFalse(merge.contains(ctx, source, base))
             merge.assert_clean_candidate(ctx, candidate)
@@ -290,8 +292,8 @@ class DirectMergeTests(unittest.TestCase):
             self.assertEqual(git(checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
                              [candidate.commit_sha, base, source])
             self.assertEqual((checkout / SCRIPT).read_bytes(), b"class Item { int both = 3; }\n")
-            self.assertEqual((checkout / "source.txt").read_bytes(), b"source addition\n")
-            self.assertEqual((checkout / "main.txt").read_bytes(), b"main addition\n")
+            self.assertEqual((checkout / "source.txt").read_text(), "source addition\n")
+            self.assertEqual((checkout / "main.txt").read_text(), "main addition\n")
             self.assert_remote_refs(remote, base, source)
 
     def test_rejects_complex_and_out_of_scope_changes(self):
@@ -369,3 +371,350 @@ class DirectMergeTests(unittest.TestCase):
                     self.assertTrue((checkout / ".git/MERGE_HEAD").is_file())
                     if kind != "markers":
                         self.assertEqual((checkout / "hello.txt").read_bytes(), b"outside the resolution scope")
+
+    def approved(self, root, *, independent=True):
+        workspace, ctx, remote, checkout, author, task = self.repository(root)
+        write(checkout, "source.txt", b"approved source")
+        source = self.publish(checkout, TASK_BRANCH)
+        if independent:
+            write(author, "main.txt", b"external contribution")
+            self.publish(author, "main")
+        revision = git(checkout, "rev-parse", "HEAD^{tree}")
+        claims = {"delivery_mode": "direct-merge", "commit_sha": source, "revision": revision,
+                  "test_job_id": "test-job", "approval_digest": "a" * 64}
+        task.update(approved_revision=revision, approval={"claims": claims},
+                    verification={"test_job_id": "test-job", "revision": revision,
+                                  "checkout": {"branch": TASK_BRANCH, "commit_sha": source}})
+        ctx.task, ctx.workspace, ctx.save = task, SimpleNamespace(git=workspace), task.update
+        return ctx, remote, checkout, author, source
+
+    def land(self, ctx, verify=None):
+        from direct_merge import land_approved
+
+        def unexpected(*_):
+            self.fail("Unexpected conflict or additional verification")
+        return land_approved(ctx, solve=unexpected, verify=verify or unexpected)
+
+    def test_retries_once_when_target_advances_before_push(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent), test_directory() as root:
+                ctx, remote, checkout, author, source = self.approved(root)
+                verified, external = [], []
+                def verify(ctx, candidate):
+                    self.assertEqual(git(checkout, "rev-parse", "HEAD"), candidate.commit_sha)
+                    verified.append(candidate.commit_sha)
+                    if not external or persistent:
+                        write(author, "race.txt", str(len(verified)).encode())
+                        external.append(self.publish(author, "main"))
+                    return {"checked": candidate.commit_sha}
+                if persistent:
+                    with self.assertRaises(StageError):
+                        self.land(ctx, verify)
+                    self.assert_remote_refs(remote, external[-1], source)
+                    with self.assertRaises(StageError):
+                        self.land(ctx, verify)
+                else:
+                    receipt = self.land(ctx, verify)
+                    self.assert_remote_refs(remote, receipt["merge_sha"], source)
+                    self.assertEqual(receipt["base_sha"], external[-1])
+                    self.assertEqual(receipt["target_sha"], verified[-1])
+                    self.assertEqual(receipt["verification"], {"checked": verified[-1]})
+                    self.assertEqual(git(checkout, "branch", "--show-current"), TASK_BRANCH)
+                self.assertEqual(len(verified), 2)
+                self.assertNotEqual(*verified)
+
+    def test_reconciles_lost_push_ack_after_a_further_main_commit(self):
+        with test_directory() as root:
+            ctx, remote, checkout, author, source = self.approved(root)
+            run = ctx.run
+            def lose_ack(argv, *args, **kwargs):
+                result = run(argv, *args, **kwargs)
+                if "push" in argv:
+                    self.assertEqual(result.exit_code, 0)
+                    raise InterruptedError("worker stopped after receive-pack")
+                return result
+            ctx.run = lose_ack
+            with self.assertRaises(InterruptedError):
+                self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            persisted_candidate = ctx.task["merge_journal"]["merge_sha"]
+            self.assert_remote_refs(remote, persisted_candidate, source)
+            ctx.run = run
+            git(author, "pull", "--ff-only", "origin", "main")
+            write(author, "later.txt", b"later main commit")
+            later = self.publish(author, "main")
+            git(author, "switch", "-C", TASK_BRANCH, "origin/main")
+            write(author, "next-task.txt", b"source changed after merge")
+            moved_source = self.publish(author, TASK_BRANCH)
+            receipt = self.land(ctx)
+            self.assertEqual(receipt["merge_sha"], persisted_candidate)
+            self.assertEqual(receipt["target_sha"], later)
+            self.assertEqual(receipt["source_sha"], source)
+            self.assertEqual(receipt["status"], "merged")
+            self.assertEqual(receipt["verification"], {"checked": persisted_candidate})
+            self.assert_remote_refs(remote, later, moved_source)
+            self.assertEqual(git(checkout, "branch", "--show-current"), TASK_BRANCH)
+
+    def test_blocks_source_drift_and_rejects_non_fast_forward(self):
+        from direct_merge import DirectMergeGit
+        with test_directory() as root:
+            ctx, remote, _, author, source = self.approved(root)
+            merge = DirectMergeGit(ctx.workspace.git)
+            base = merge.read_target(ctx, ctx.task)
+            candidate = merge.begin(ctx, ctx.task, source, base)
+            with self.assertRaises(StageError):
+                merge.push(ctx, ctx.task, replace(candidate, commit_sha=source))
+            self.assert_remote_refs(remote, base, source)
+            git(author, "fetch", "origin", TASK_BRANCH)
+            git(author, "switch", "-c", TASK_BRANCH, "FETCH_HEAD")
+            write(author, "later.txt", b"unapproved source change")
+            moved = self.publish(author, TASK_BRANCH)
+            with self.assertRaises(StageError):
+                merge.push(ctx, ctx.task, candidate)
+            self.assert_remote_refs(remote, base, moved)
+
+    def test_exact_target_lease_rejects_last_moment_advance_and_pushes_one_ref(self):
+        from direct_merge import DirectMergeGit
+        with test_directory() as root:
+            ctx, remote, checkout, author, interim = self.approved(root, independent=False)
+            write(checkout, "last.txt", b"second approved change")
+            source = self.publish(checkout, TASK_BRANCH)
+            ctx.task["approval"]["claims"]["commit_sha"] = source
+            ctx.task["approved_revision"] = git(checkout, "rev-parse", "HEAD^{tree}")
+            ctx.task["approval"]["claims"]["revision"] = ctx.task["approved_revision"]
+            merge = DirectMergeGit(ctx.workspace.git)
+            base = merge.read_target(ctx, ctx.task)
+            candidate = merge.begin(ctx, ctx.task, source, base)
+            run = ctx.run
+            advanced = []
+            def advance_before_transport(argv, *args, **kwargs):
+                if "push" in argv:
+                    # The interim commit is an ancestor of the candidate. A plain fast-forward
+                    # push would succeed here despite having verified a different base.
+                    git(author, "fetch", "origin", TASK_BRANCH)
+                    git(author, "merge", "--ff-only", interim)
+                    git(author, "push", "origin", "main")
+                    advanced.append(interim)
+                return run(argv, *args, **kwargs)
+            ctx.run = advance_before_transport
+            with self.assertRaises(StageError):
+                merge.push(ctx, ctx.task, candidate)
+            self.assert_remote_refs(remote, advanced[0], source)
+            ctx.run = run
+            merge.restore(ctx, ctx.task, source)
+            candidate = merge.begin(ctx, ctx.task, source, merge.read_target(ctx, ctx.task))
+            git(checkout, "tag", "-a", "private-tag", "-m", "not for delivery")
+            git(checkout, "config", "push.followTags", "true")
+            git(checkout, "config", "remote.origin.mirror", "true")
+            merge.push(ctx, ctx.task, candidate)
+            self.assertEqual(set(git(remote, "for-each-ref", "--format=%(refname)").splitlines()),
+                             {"refs/heads/main", "refs/heads/" + TASK_BRANCH})
+            self.assert_remote_refs(remote, candidate.commit_sha, source)
+
+    def test_already_landed_reuses_history(self):
+        with test_directory() as root:
+            ctx, remote, checkout, author, source = self.approved(root, independent=False)
+            git(author, "fetch", "origin", TASK_BRANCH)
+            git(author, "merge", "--ff-only", "FETCH_HEAD")
+            write(author, "after.txt", b"external addition after source inclusion")
+            target = self.publish(author, "main")
+            receipt = self.land(ctx)
+            self.assertEqual(receipt["merge_sha"], source)
+            self.assertEqual(receipt["target_sha"], target)
+            self.assertEqual(receipt["status"], "merged")
+            self.assert_remote_refs(remote, target, source)
+            self.assertEqual(git(checkout, "branch", "--show-current"), TASK_BRANCH)
+
+    def test_same_tree_reuses_approved_test_evidence(self):
+        with test_directory() as root:
+            ctx, remote, checkout, _, source = self.approved(root, independent=False)
+            receipt = self.land(ctx)
+            self.assertEqual(receipt["verification"]["test_job_id"], "test-job")
+            self.assertEqual(receipt["verification"]["revision"], ctx.task["approved_revision"])
+            self.assertEqual(receipt["mode"], "direct-merge")
+            self.assertEqual(receipt["task_branch"], TASK_BRANCH)
+            self.assertEqual(receipt["target_branch"], "main")
+            self.assertEqual(receipt["conflict_paths"], [])
+            self.assertEqual(git(checkout, "rev-parse", receipt["merge_sha"] + "^{tree}"),
+                             ctx.task["approved_revision"])
+            self.assert_remote_refs(remote, receipt["merge_sha"], source)
+
+    def test_failed_push_reuses_verified_candidate_after_restart(self):
+        with test_directory() as root:
+            ctx, remote, _, _, source = self.approved(root)
+            base = git(remote, "rev-parse", "main")
+            hook = remote / "hooks/pre-receive"
+            hook.write_bytes(b"#!/bin/sh\nexit 1\n")
+            hook.chmod(0o755)
+            with self.assertRaises(StageError):
+                self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            journal = ctx.task["merge_journal"]
+            self.assert_remote_refs(remote, base, source)
+            self.assertEqual(journal["status"], "in_flight")
+            hook.unlink()
+            receipt = self.land(ctx)
+            self.assertEqual(receipt["merge_sha"], journal["merge_sha"])
+            self.assert_remote_refs(remote, journal["merge_sha"], source)
+
+    def test_deleted_rewritten_or_unreachable_target_preserves_candidate(self):
+        for fault in ("deleted", "rewritten", "unreachable"):
+            with self.subTest(fault=fault), test_directory() as root:
+                ctx, remote, checkout, _, source = self.approved(root)
+                def verify(ctx, candidate):
+                    if fault == "deleted":
+                        git(remote, "update-ref", "-d", "refs/heads/main")
+                    elif fault == "rewritten":
+                        git(remote, "update-ref", "refs/heads/main", ctx.task["base_commit"])
+                    else:
+                        remote.rename(root / "offline")
+                    return {"checked": candidate.commit_sha}
+                with self.assertRaises(StageError):
+                    self.land(ctx, verify)
+                journal = ctx.task["merge_journal"]
+                self.assertEqual(git(checkout, "rev-parse", "HEAD"), journal["merge_sha"])
+                actual = root / "offline" if fault == "unreachable" else remote
+                self.assertEqual(git(actual, "rev-parse", TASK_BRANCH), source)
+                targets = git(actual, "for-each-ref", "--format=%(objectname)", "refs/heads/main")
+                self.assertEqual(targets, {"deleted": "", "rewritten": ctx.task["base_commit"],
+                                           "unreachable": journal["base_sha"]}[fault])
+
+    def test_pre_push_restart_restores_only_clean_worker_checkout(self):
+        with test_directory() as root:
+            ctx, remote, checkout, _, source = self.approved(root)
+            base = git(remote, "rev-parse", "main")
+            def interrupt_verify(*_):
+                raise InterruptedError("worker stopped before verification")
+            with self.assertRaises(InterruptedError):
+                self.land(ctx, interrupt_verify)
+            self.assertEqual(ctx.task["merge_journal"]["status"], "building")
+            head = git(checkout, "rev-parse", "HEAD")
+            marker = checkout / ".git/MERGE_HEAD"
+            marker.write_text(source + "\n")
+            with self.assertRaises(StageError):
+                self.land(ctx)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(git(checkout, "rev-parse", "HEAD"), head)
+            self.assert_remote_refs(remote, base, source)
+            marker.unlink()
+            write(checkout, "local.txt", b"keep pending work")
+            with self.assertRaises(StageError):
+                self.land(ctx)
+            self.assertEqual((checkout / "local.txt").read_bytes(), b"keep pending work")
+            (checkout / "local.txt").unlink()
+            pin = "refs/unity-worker/direct-merge/" + TASK_BRANCH.split("/")[1]
+            unknown = ctx.task["base_commit"]
+            git(checkout, "switch", "--detach", unknown)
+            git(checkout, "update-ref", pin, unknown, head)
+            with self.assertRaises(StageError):
+                self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            self.assertEqual(git(checkout, "rev-parse", "HEAD"), unknown)
+            self.assert_remote_refs(remote, base, source)
+            git(checkout, "switch", "--detach", head)
+            git(checkout, "update-ref", pin, head, unknown)
+            receipt = self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            self.assert_remote_refs(remote, receipt["merge_sha"], source)
+
+    def test_target_rewind_between_advertisement_and_fetch_blocks_delivery(self):
+        with test_directory() as root:
+            ctx, remote, checkout, _, source = self.approved(root)
+            run = ctx.run
+            # Expose both objects locally, as on a resident slot that fetched last week.
+            git(checkout, "fetch", "origin", "main")
+            original = ctx.task["base_commit"]
+            def rewind_before_fetch(argv, *args, **kwargs):
+                if "fetch" in argv:
+                    ctx.run = run
+                    git(remote, "update-ref", "refs/heads/main", original)
+                return run(argv, *args, **kwargs)
+            ctx.run = rewind_before_fetch
+            with self.assertRaises(StageError):
+                self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            self.assert_remote_refs(remote, original, source)
+            self.assertEqual(git(checkout, "branch", "--show-current"), TASK_BRANCH)
+
+    def test_restart_during_rebuild_keeps_the_single_retry_budget(self):
+        with test_directory() as root:
+            ctx, remote, checkout, author, source = self.approved(root)
+            def verify(ctx, candidate):
+                write(author, "race.txt", b"first target advance")
+                self.publish(author, "main")
+                return {"checked": candidate.commit_sha}
+            def interrupt_rebuild(**changes):
+                row = changes["merge_journal"]
+                if row["status"] == "building" and row["rebuilds"] == 1:
+                    raise InterruptedError("stop while restarting on the new base")
+                ctx.task.update(changes)
+            ctx.save = interrupt_rebuild
+            with self.assertRaises(InterruptedError):
+                self.land(ctx, verify)
+            write(author, "race.txt", b"second target advance while stopped")
+            second = self.publish(author, "main")
+            ctx.save = ctx.task.update
+            with self.assertRaises(StageError):
+                self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            self.assert_remote_refs(remote, second, source)
+            self.assertEqual(git(checkout, "branch", "--show-current"), TASK_BRANCH)
+
+    @unittest.skipUnless(subprocess.run(["git", "lfs", "version"], capture_output=True).returncode == 0, "Git LFS")
+    def test_target_lfs_pre_push_uses_the_candidate_and_destination_ref(self):
+        from direct_merge import DirectMergeGit
+        with test_directory() as root:
+            ctx, remote, checkout, _, _ = self.approved(root)
+            git(checkout, "lfs", "install", "--local", "--skip-repo")
+            git(checkout, "lfs", "track", "payload.dat")
+            write(checkout, "payload.dat", b"compiled dependency\0" * 40)
+            source = self.publish(checkout, TASK_BRANCH)
+            task = ctx.task
+            revision = git(checkout, "rev-parse", "HEAD^{tree}")
+            task.update(approved_revision=revision)
+            task["approval"]["claims"].update(revision=revision, commit_sha=source)
+            merge = DirectMergeGit(ctx.workspace.git)
+            base = merge.read_target(ctx, task)
+            candidate = merge.begin(ctx, task, source, base)
+            run = ctx.run
+            supplied = []
+            def transport(argv, *args, **kwargs):
+                if "pre-push" in argv:
+                    supplied.append(kwargs["data"].decode().split())
+                    raise StageError("git_failed", "target-scoped LFS write denied by fixture")
+                return run(argv, *args, **kwargs)
+            ctx.run = transport
+            with self.assertRaises(StageError):
+                merge.push(ctx, task, candidate)
+            self.assert_remote_refs(remote, base, source)
+            self.assertEqual(supplied, [["refs/heads/main", candidate.commit_sha, "refs/heads/main", base]])
+            ctx.run = run
+            merge.push(ctx, task, candidate)
+            self.assert_remote_refs(remote, candidate.commit_sha, source)
+
+    def test_conflict_equal_to_source_still_verifies_and_resumes_the_same_solution(self):
+        from direct_merge import land_approved
+        with test_directory() as root:
+            workspace, ctx, remote, checkout, author, task = self.repository(root, path=SCRIPT)
+            write(checkout, SCRIPT, SOURCE)
+            source = self.publish(checkout, TASK_BRANCH)
+            write(author, SCRIPT, TARGET)
+            base = self.publish(author, "main")
+            revision = git(checkout, "rev-parse", "HEAD^{tree}")
+            task.update(approved_revision=revision, approval={"claims": {"delivery_mode": "direct-merge",
+                        "commit_sha": source, "revision": revision, "test_job_id": "test-job"}},
+                        verification={"test_job_id": "test-job", "revision": revision,
+                                      "checkout": {"branch": TASK_BRANCH, "commit_sha": source}})
+            ctx.task, ctx.workspace, ctx.save = task, SimpleNamespace(git=workspace), task.update
+            def solve(_, candidate):
+                self.assertEqual(candidate.conflict_paths, (SCRIPT,))
+                write(checkout, SCRIPT, SOURCE)
+            candidates = []
+            def verify(_, candidate):
+                candidates.append(candidate.commit_sha)
+                self.assertEqual(git(checkout, "rev-parse", "HEAD^{tree}"), revision)
+                if len(candidates) == 1:
+                    raise InterruptedError("worker stopped during candidate verification")
+                return {"candidate_check": candidate.commit_sha}
+            with self.assertRaises(InterruptedError):
+                land_approved(ctx, solve=solve, verify=verify)
+            self.assert_remote_refs(remote, base, source)
+            receipt = self.land(ctx, verify)
+            self.assertEqual(candidates, [receipt["merge_sha"], receipt["merge_sha"]])
+            self.assertEqual(receipt["conflict_paths"], [SCRIPT])
+            self.assertEqual(receipt["verification"], {"candidate_check": receipt["merge_sha"]})
+            self.assert_remote_refs(remote, receipt["merge_sha"], source)

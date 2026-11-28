@@ -65,7 +65,10 @@ class DirectMergeGit:
             raise StageError("git_failed", "Push target returned an unexpected mainline reference")
         # The target may advance between the advertisement and the fetch.
         workspace.git(ctx, "fetch", "--no-tags", "--no-recurse-submodules", "--refmap=", "--", url, ref)
-        return workspace.text(ctx, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+        fetched = workspace.text(ctx, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+        if fetched != commit and not self.contains(ctx, commit, fetched):
+            raise StageError("merge_target_rewritten", "The advertised target was rewritten during fetch")
+        return fetched
 
     def contains(self, ctx, ancestor: str, descendant: str) -> bool:
         self._require_sha(ancestor)
@@ -81,8 +84,7 @@ class DirectMergeGit:
         workspace.checkout_is(ctx, task, source_sha)
         self._assert_no_merge_markers()
         self._assert_checkout_contents(ctx, source_sha)
-        if workspace.remote_task_tip(ctx, task) != source_sha:
-            raise StageError("push_conflict", "Remote task branch no longer points to the approved commit")
+        self.assert_remote_source(ctx, task, source_sha)
         if self.contains(ctx, source_sha, base_sha):
             raise StageError("workspace_changed", "The approved commit is already in the target history")
         if task.get("approved_revision") and workspace.text(ctx, "rev-parse", "HEAD^{tree}") != task["approved_revision"]:
@@ -172,6 +174,44 @@ class DirectMergeGit:
         self._assert_detached(ctx, candidate.commit_sha)
         self._assert_candidate_identity(ctx, candidate)
         self._assert_checkout_contents(ctx, candidate.commit_sha)
+
+    def push(self, ctx, task: dict, candidate: MergeCandidate) -> None:
+        workspace = self.workspace
+        claims = (task.get("approval") or {}).get("claims") or {}
+        if (claims.get("delivery_mode") != "direct-merge" or claims.get("commit_sha") != candidate.source_sha
+                or claims.get("revision") != task.get("approved_revision")):
+            raise StageError("workspace_changed", "The candidate differs from the direct merge approval")
+        self.assert_clean_candidate(ctx, candidate)
+        if (self.pin(ctx, task) != candidate.commit_sha
+                or workspace.text(ctx, "rev-parse", "--verify", "refs/heads/" + task["task_branch"]) != candidate.source_sha
+                or not self.contains(ctx, candidate.base_sha, candidate.commit_sha)
+                or not self.contains(ctx, candidate.source_sha, candidate.commit_sha)):
+            raise StageError("workspace_changed", "The pinned candidate does not preserve the target and approved task")
+        url = self._push_url(ctx, task)
+        ref = "refs/heads/" + workspace.cfg.base_branch
+        if workspace.validate_lfs_filters(ctx, candidate.commit_sha):
+            data = f"{ref} {candidate.commit_sha} {ref} {candidate.base_sha}\n".encode("utf-8")
+            workspace.git(ctx, "lfs", "pre-push", workspace.cfg.git_remote, url, data=data)
+        target = self.read_target(ctx, task)
+        if target != candidate.base_sha:
+            raise StageError("merge_target_moved", "The target changed after verification", result={"target_sha": target})
+        self.assert_remote_source(ctx, task, candidate.source_sha)
+        try:
+            # A literal endpoint avoids configured mirror refspecs; the exact lease also
+            # rejects an intervening update that could itself fast-forward to the candidate.
+            workspace.git(ctx, "push", "--porcelain", f"--force-with-lease={ref}:{candidate.base_sha}",
+                          "--no-follow-tags", "--recurse-submodules=no", "--", url, f"{candidate.commit_sha}:{ref}")
+        except StageError as error:
+            if error.kind not in {"git_failed", "timeout"}:
+                raise
+            raise StageError("push_failed", str(error), error.exit_code, error.result) from error
+
+    def assert_remote_source(self, ctx, task, source):
+        if self.workspace.remote_task_tip(ctx, task) != source:
+            raise StageError("push_conflict", "Remote task branch no longer points to the approved commit")
+
+    def pin(self, ctx, task):
+        return self.workspace.text(ctx, "rev-parse", "--verify", "--quiet", self._pin_ref(task), allowed=(0, 1))
 
     def restore(self, ctx, task: dict, source_sha: str) -> None:
         workspace = self.workspace
@@ -529,3 +569,159 @@ class DirectMergeGit:
     def _assert_lfs_entries(output):
         if any(not entry["checkout"] for entry in json.loads(output)["files"]):
             raise StageError("workspace_changed", "The checkout contains unhydrated Git LFS dependencies")
+
+
+def _save_journal(ctx, journal, **changes):
+    updated = {**journal, **changes}
+    ctx.save(merge_journal=updated)
+    return updated
+
+
+def _approved_evidence(task, claims):
+    evidence = task.get("verification") or {}
+    if (evidence.get("revision") != claims["revision"] or evidence.get("test_job_id") != claims["test_job_id"]
+            or evidence.get("checkout") != {"branch": task["task_branch"], "commit_sha": claims["commit_sha"]}):
+        raise StageError("workspace_changed", "The approved verification evidence changed")
+    return {"mode": "reused", **evidence}
+
+
+def _restore_operation(ctx, git, journal):
+    pin = git.pin(ctx, ctx.task)
+    known = journal.get("merge_sha")
+    if pin and known and pin != known:
+        raise StageError("workspace_changed", "The merge pin differs from the verified candidate")
+    if pin and not known and pin != journal["base_sha"]:
+        # begin() can finish the candidate before its verification evidence is saved.
+        parents = git.workspace.text(ctx, "rev-list", "--parents", "-n", "1", pin).split()
+        if parents != [pin, journal["base_sha"], journal["source_sha"]]:
+            raise StageError("workspace_changed", "The merge pin differs from the recorded operation")
+    git.restore(ctx, ctx.task, journal["source_sha"])
+
+
+def _candidate_from(journal):
+    return MergeCandidate(journal["source_sha"], journal["base_sha"], tuple(journal["conflict_paths"]),
+                          journal["merge_sha"], journal["tree_sha"])
+
+
+def _verify_for_push(ctx, git, journal, evidence, solve, verify):
+    task = ctx.task
+    if journal.get("merge_sha"):
+        candidate = _candidate_from(journal)
+        if git.pin(ctx, task) != candidate.commit_sha:
+            raise StageError("workspace_changed", "The merge pin differs from the candidate awaiting verification")
+    else:
+        _restore_operation(ctx, git, journal)
+        candidate = git.begin(ctx, task, journal["source_sha"], journal["base_sha"])
+        if candidate.conflict_paths:
+            journal = _save_journal(ctx, journal, conflict_paths=list(candidate.conflict_paths))
+            solve(ctx, candidate)
+            candidate = git.resolve(ctx, candidate)
+        journal = _save_journal(ctx, journal, merge_sha=candidate.commit_sha,
+                                tree_sha=candidate.tree_sha, conflict_paths=list(candidate.conflict_paths))
+
+    git.assert_clean_candidate(ctx, candidate)
+    if not candidate.conflict_paths and candidate.tree_sha == journal["approval"]["revision"]:
+        checked = evidence
+    else:
+        checked = verify(ctx, candidate)
+        git.assert_clean_candidate(ctx, candidate)
+    if not isinstance(checked, dict) or not checked:
+        raise StageError("verification_failed", "Candidate verification returned no evidence")
+    return candidate, _save_journal(ctx, journal, status="in_flight", verification=checked)
+
+
+def _confirmed(ctx, git, journal, target, landed, verification, paths):
+    task = ctx.task
+    receipt = {
+        "mode": "direct-merge", "status": "merged", "task_branch": task["task_branch"],
+        "source_sha": journal["source_sha"], "target_branch": journal["target_branch"],
+        "base_sha": journal["base_sha"], "merge_sha": landed, "target_sha": target,
+        "conflict_paths": list(paths), "verification": verification,
+    }
+    # Keep the candidate fields until restore completes, including when a third
+    # party independently lands the approved source via a different commit.
+    _save_journal(ctx, journal, status="confirmed", receipt=receipt, target_sha=target)
+    _restore_operation(ctx, git, journal)
+    return receipt
+
+
+def land_approved(ctx, *, solve, verify) -> dict:
+    """Land the task authorized by the Worker, or reconcile a prior transport attempt."""
+    task, workspace = ctx.task, ctx.workspace.git
+    git = DirectMergeGit(workspace)
+    claims = (task.get("approval") or {}).get("claims") or {}
+    source = claims.get("commit_sha")
+    git._require_sha(source)
+    git._require_sha(claims.get("revision"))
+    if claims.get("delivery_mode") != "direct-merge" or claims["revision"] != task.get("approved_revision"):
+        raise StageError("workspace_changed", "The task has no matching direct merge approval")
+    evidence = _approved_evidence(task, claims)
+    binding = {"approval": claims, "source_sha": source, "target_branch": workspace.cfg.base_branch,
+               "task_branch": task["task_branch"], "remote_identity": task["remote_identity"]}
+    journal = task.get("merge_journal")
+    if journal is not None and (any(journal.get(k) != v for k, v in binding.items())
+                                or journal.get("status") not in {"building", "in_flight", "confirmed"}):
+        raise StageError("workspace_changed", "The merge journal belongs to a different approval or target")
+
+    target = git.read_target(ctx, task)
+    if journal is None:
+        workspace.checkout_is(ctx, task, source)
+        if git.pin(ctx, task):
+            raise StageError("workspace_changed", "The task already has a merge pin without its operation record")
+        if not git.contains(ctx, task["base_commit"], target):
+            raise StageError("merge_target_rewritten", "The target no longer contains the task's original base")
+        git.assert_remote_source(ctx, task, source)
+        journal = _save_journal(ctx, binding, base_sha=target, status="building", rebuilds=0)
+
+    while True:
+        base, status = journal["base_sha"], journal["status"]
+        if status == "confirmed":
+            receipt = journal["receipt"]
+            if not git.contains(ctx, receipt["merge_sha"], target):
+                raise StageError("merge_target_rewritten", "The target lost the confirmed merge")
+            return _confirmed(ctx, git, journal, target, receipt["merge_sha"], receipt["verification"],
+                              receipt["conflict_paths"])
+
+        if status == "in_flight":
+            candidate = _candidate_from(journal)
+            git._assert_candidate_identity(ctx, candidate)
+            if git.contains(ctx, candidate.commit_sha, target):
+                return _confirmed(ctx, git, journal, target, candidate.commit_sha,
+                                  journal["verification"], candidate.conflict_paths)
+            if journal.get("push_acknowledged"):
+                raise StageError("push_ambiguous", "The target no longer contains the acknowledged merge")
+
+        if not git.contains(ctx, base, target):
+            raise StageError("merge_target_rewritten", "The target history changed after merge preparation")
+        git.assert_remote_source(ctx, task, source)
+        if git.contains(ctx, source, target):
+            return _confirmed(ctx, git, journal, target, source, evidence, ())
+
+        pending = journal.get("rebuild_target")
+        if (pending and target != pending) or (target != base and journal["rebuilds"]):
+            raise StageError("merge_target_moved", "The target advanced again after the single rebuild")
+        if target != base and not pending:
+            # Reserve this exact retry base before releasing the previous pin.
+            journal = _save_journal(ctx, journal, rebuild_target=target)
+        if target != base:
+            _restore_operation(ctx, git, journal)
+            journal = _save_journal(ctx, binding, base_sha=target, status="building", rebuilds=1)
+            status = "building"
+
+        if status == "building":
+            candidate, journal = _verify_for_push(ctx, git, journal, evidence, solve, verify)
+
+        try:
+            git.push(ctx, task, candidate)
+        except StageError as error:
+            if error.kind == "merge_target_moved":
+                target = error.result["target_sha"]
+            elif error.kind == "push_failed":
+                target = git.read_target(ctx, task)
+                if target == journal["base_sha"]:
+                    raise
+            else:
+                raise
+        else:
+            journal = _save_journal(ctx, journal, push_acknowledged=True)
+            target = git.read_target(ctx, task)
