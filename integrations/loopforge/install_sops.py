@@ -456,7 +456,7 @@ def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, e
         encoded = json.dumps([common, pool], sort_keys=True, separators=(",", ":")).encode()
         candidate = {"delivery_mode": "direct-merge", "worker_url": target.worker_url,
                      "worker_id": os.environ.get("UNITY_WORKER_ID", settings.get("worker_id", "worker-01")),
-                     "pool": pool_id, "base_branch": pool.get("base_branch", common.get("base_branch", "main")),
+                     "pool": pool_id, **direct_merge_target(settings, pool),
                      "config_sha256": hashlib.sha256(encoded).hexdigest(), "workflow": value}
     if publish and (direct_merge or preview.exists()):
         try:
@@ -535,6 +535,16 @@ def read_pool(settings, pool_id):
     return pool
 
 
+def direct_merge_target(settings, pool):
+    identity = pool.get("remote_identity")
+    if not isinstance(identity, str) or not re.fullmatch(r"[a-f0-9]{64}", identity):
+        raise ValueError("Direct merge requires the named pool's SHA-256 remote_identity")
+    branch = pool.get("base_branch", settings.get("base_branch", "main"))
+    if not isinstance(branch, str) or not branch:
+        raise ValueError("Direct merge requires a configured target base_branch")
+    return {"base_branch": branch, "remote_identity": identity}
+
+
 def preflight_worker(api, settings, pool_id, *, staged_feature=False, direct_merge=False):
     if direct_merge:
         if not pool_id:
@@ -559,8 +569,12 @@ def preflight_worker(api, settings, pool_id, *, staged_feature=False, direct_mer
     ready = next((item for item in registered if item["id"] == pool_id), None)
     if ready is None:
         raise RuntimeError(f"Worker has not registered pool {pool_id}")
-    if direct_merge and (pool.get("direct_merge") is not True or ready.get("direct_merge") is not True):
-        raise RuntimeError(f"Enable direct_merge on the configured and registered Worker pool {pool_id}")
+    if direct_merge:
+        if pool.get("direct_merge") is not True or ready.get("direct_merge") is not True:
+            raise RuntimeError(f"Enable direct_merge on the configured and registered Worker pool {pool_id}")
+        for key, expected in direct_merge_target(settings, pool).items():
+            if ready.get(key) != expected:
+                raise RuntimeError(f"Registered Worker pool {pool_id} {key} differs from the configured target")
     slots = {slot["id"]: slot["status"] for slot in ready["slots"]}
     expected = {slot["id"]: slot.get("enabled", True) for slot in pool["slots"]}
     if slots.keys() != expected.keys():

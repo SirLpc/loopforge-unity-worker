@@ -77,7 +77,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Staged feature preview failed' }
 
 先升级 Worker 和中继，然后在所选命名池的 `[pools.game]` 配置中设置 `direct_merge = true`（将 `game` 换成真实池名）。安装器会核对该池的本地配置和 Worker 返回的开关，以及 Worker 声明的 `staged-feature-checkpoints` 和 `staged-feature-direct-merge` 能力。在上面的 PowerShell 预览命令之前执行 `$stagedArgs += '--direct-merge'`，核对预览文件中「人工验收 → 合入主线 → 交付汇总」的连线，再用同一组参数和本次预览的 `--expected-revision` 发布。旧运行仍按其冻结的 MR 图完成交付。
 
-预览和发布使用同一个 `--output-dir`。打开输出中的 `preview` 文件，核对 `worker_id`、`worker_url`、`pool`、`base_branch`，再检查 `workflow` 中的完整画布、脚本和验收文案。安装器在写入 Studio 前逐项比较重新生成的候选和该文件，并再次读取 Worker 及所选池状态。若图、交付模式或配置摘要变化，重新预览并核对后发布。中继按冻结图的完整验收文案识别授权，验收人能看到被批准的提交将直接合入主线，以及简单冲突的复验条件。
+预览和发布使用同一个 `--output-dir`。打开输出中的 `preview` 文件，核对 `worker_id`、`worker_url`、`pool`、`base_branch` 和仓库的 SHA-256 指纹 `remote_identity`，再检查 `workflow` 中的完整画布、脚本和验收文案。安装器在写入 Studio 前逐项比较重新生成的候选和该文件，并再次读取 Worker 及所选池状态。Worker 返回的生效目标分支和远端指纹必须与所选池配置一致。若图、交付模式或配置摘要变化，重新预览并核对后发布。中继按冻结图的完整验收文案识别授权，验收人能看到被批准的提交将直接合入主线，以及简单冲突的复验条件。
 
 验收人批准测试报告列出的任务分支和完整提交 SHA。Worker 将该提交合入工程池配置的目标分支。候选树有变化时，Worker 在候选上重新编译并运行原方案的测试范围。简单 C# 内容冲突还需通过独立评审。合入报告列出验收 SHA、目标基线、落地 SHA、远端确认的目标 SHA、冲突文件和验证结果。汇总节点保留原测试报告，核对成功的合入作业和远端回执，确认归还槽位后完成。
 

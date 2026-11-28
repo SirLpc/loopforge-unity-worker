@@ -228,6 +228,8 @@ class InstallSopsTests(unittest.TestCase):
         pool = self.responses["/api/v1/pools"]["pools"][0]
         worker["capabilities"] = ["staged-feature-checkpoints"]
         settings = self.settings["pools"]["game"]
+        settings["remote_identity"] = "a" * 64
+        pool.update(base_branch="main", remote_identity="a" * 64)
         for local, remote, cap, expected in [(True, True, False, "capability"), (True, False, True, "game"),
                                               (False, True, True, "game"), (True, True, True, None)]:
             settings["direct_merge"], pool["direct_merge"] = local, remote
@@ -269,10 +271,10 @@ class InstallSopsTests(unittest.TestCase):
             events.append((method, path))
             return self.probe(method, path)
 
-        self.settings["pools"]["game"].update(direct_merge=True, base_branch="main")
+        self.settings["pools"]["game"].update(direct_merge=True, base_branch="main", remote_identity="a" * 64)
         self.settings["pools"]["other"] = deepcopy(self.settings["pools"]["game"])
         remote = self.responses["/api/v1/pools"]["pools"][0]
-        remote["direct_merge"] = True
+        remote.update(direct_merge=True, base_branch="main", remote_identity="a" * 64)
         self.responses["/api/v1/pools"]["pools"].append({**remote, "id": "other"})
         host = self.responses["/api/v1/workers"]["workers"][0]
         host["capabilities"] = ["staged-feature-checkpoints", "staged-feature-direct-merge"]
@@ -292,6 +294,8 @@ class InstallSopsTests(unittest.TestCase):
             preview = Path(result["preview"])
             original = preview.read_bytes()
             altered = json.loads(original)
+            with self.subTest(descriptor="target"):
+                self.assertEqual((altered.get("base_branch"), altered.get("remote_identity")), ("main", "a" * 64))
             altered["workflow"]["nodes"][5]["maxAttempts"] = True
             preview.write_text(json.dumps(altered), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "preview"):
@@ -303,11 +307,19 @@ class InstallSopsTests(unittest.TestCase):
                     install(True, **options)
             for changed, fields, problem in [(host, {"capabilities": ["staged-feature-checkpoints"]}, "capability"),
                                               (remote, {"direct_merge": False}, "game"),
+                                              (remote, {"base_branch": "release/next"}, "base_branch"),
+                                              (remote, {"remote_identity": "b" * 64}, "remote_identity"),
+                                              (remote, {"remote_identity": None}, "remote_identity"),
                                               (remote["slots"][0], {"status": "unavailable"}, "primary"),
                                               (self.responses["/api/v1/pools"], {"pools": []}, "game"),
                                               (self.settings["pools"]["game"], {"base_branch": "release"}, "preview")]:
                 with self.subTest(fields=fields), patch.dict(changed, fields), self.assertRaisesRegex((RuntimeError, ValueError), problem):
                     install(True)
+            for fingerprint in (None, "", "https://example.test/git", "ab" * 31):
+                with (self.subTest(fingerprint=fingerprint),
+                      patch.dict(self.settings["pools"]["game"], remote_identity=fingerprint),
+                      patch.dict(remote, remote_identity=fingerprint), self.assertRaisesRegex(ValueError, "remote_identity")):
+                    install()
             with patch.object(install_sops, "render", return_value="updated script"), self.assertRaisesRegex(RuntimeError, "preview"):
                 install(True)
             modified = original.replace(b"feature-merge", b"feature-other")
@@ -362,7 +374,8 @@ class InstallSopsTests(unittest.TestCase):
         self.responses["/api/v1/pools"]["pools"][0]["slots"][0]["status"] = "leased"
         if outcome == "published-direct":
             self.responses["/api/v1/workers"]["workers"][0]["capabilities"].append("staged-feature-direct-merge")
-            self.responses["/api/v1/pools"]["pools"][0]["direct_merge"] = True
+            self.responses["/api/v1/pools"]["pools"][0].update(direct_merge=True, base_branch="main",
+                                                               remote_identity="a" * 64)
 
         def api(method, path, value=None, *, missing=False):
             nonlocal live
@@ -412,7 +425,7 @@ class InstallSopsTests(unittest.TestCase):
                     "--worker-url", "https://worker.example.test"]
             if outcome == "published-direct":
                 config.write_text(config.read_text().replace("[[pools.game.slots]]",
-                                  "[pools.game]\ndirect_merge = true\n[[pools.game.slots]]", 1))
+                                  '[pools.game]\ndirect_merge = true\nremote_identity = "' + "a" * 64 + '"\n[[pools.game.slots]]', 1))
                 args.extend(("--direct-merge", "--expected-revision", "20"))
             if outcome != "preview":
                 args.append("--publish")

@@ -78,6 +78,18 @@ class PoolConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load(config=config)
 
+    def test_pool_status_exposes_effective_target_branch_and_repository_fingerprint(self):
+        from development import DevelopmentWorker
+        with test_directory() as root:
+            config, _, _ = self.pool_fixture(root)
+            config["base_branch"] = "release/next"
+            config["pools"]["game"]["direct_merge"] = True
+            worker = DevelopmentWorker(self.config_loader()(config=config))
+            self.addCleanup(worker.close)
+            pool, = worker.pools()
+            self.assertEqual(pool.get("base_branch"), "release/next")
+            self.assertEqual(pool.get("remote_identity"), config["pools"]["game"]["remote_identity"])
+
     def test_rejects_overlapping_checkouts_and_codex_home_inside_a_checkout(self):
         load = self.config_loader()
         with test_directory() as root:
