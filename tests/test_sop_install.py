@@ -206,6 +206,49 @@ class InstallSopsTests(unittest.TestCase):
                 if node_id == "clarify":
                     self.assertEqual(int(arguments[arguments.index("--queue-wait-seconds") + 1]), 5400)
 
+    def test_direct_merge_graph_has_one_approval_and_preserves_existing_bindings(self):
+        target = install_sops.Target("garden", "custom-sandbox", "https://worker.example.test")
+        workflow = install_sops.staged_feature_workflow(target, "worker-key", "context-key", "game", direct_merge=True)
+        self.assertEqual((workflow["id"], workflow["sandboxProfileId"], workflow["projectCredentialIds"]),
+                         ("garden-feature", "custom-sandbox", ["worker-key", "context-key"]))
+        nodes = workflow["nodes"]
+        self.assertEqual([n["id"] for n in nodes],
+                         ["clarify", "design", "implement", "review", "test", "accept", "merge", "deliver"])
+        self.assertEqual([(n["id"], n["rejectTo"]) for n in nodes if n["type"] == "approval"], [("accept", "implement")])
+        self.assertIn("直接合入", nodes[5]["taskPrompt"])
+        self.assertEqual([n["maxReworks"] for n in nodes[3:6]], [10, 10, 10])
+        self.assertEqual([(e["source"], e["target"]) for e in workflow["edges"][-2:]],
+                         [("accept", "merge"), ("merge", "deliver")])
+        self.assertEqual([a["path"] for a in nodes[6]["artifactOutputs"]], ["merge-report.md", "unity-delivery.json"])
+        args = ast.literal_eval(shlex.split(nodes[6]["script"])[-1].splitlines()[0].removeprefix("SOP_ARGS = "))
+        self.assertEqual(args[0], "feature-merge")
+
+    def test_direct_merge_preflight_requires_worker_capability_and_selected_pool(self):
+        worker = self.responses["/api/v1/workers"]["workers"][0]
+        pool = self.responses["/api/v1/pools"]["pools"][0]
+        worker["capabilities"] = ["staged-feature-checkpoints"]
+        settings = self.settings["pools"]["game"]
+        for local, remote, cap, expected in [(True, True, False, "capability"), (True, False, True, "game"),
+                                              (False, True, True, "game"), (True, True, True, None)]:
+            settings["direct_merge"], pool["direct_merge"] = local, remote
+            if cap and "staged-feature-direct-merge" not in worker["capabilities"]:
+                worker["capabilities"].append("staged-feature-direct-merge")
+            with self.subTest(local=local, remote=remote, cap=cap):
+                if expected:
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        install_sops.preflight_worker(self.probe, self.settings, "game", staged_feature=True, direct_merge=True)
+                else:
+                    self.assertEqual(install_sops.preflight_worker(self.probe, self.settings, "game",
+                                     staged_feature=True, direct_merge=True)["pool"]["id"], "game")
+
+    def test_direct_merge_publish_requires_preview_revision(self):
+        target = install_sops.Target("garden", "old", "https://worker.example.test")
+        with self.assertRaisesRegex(ValueError, "expected-revision"):
+            install_sops.install_staged_feature(target, self.fail, "game", Path("."), publish=True, direct_merge=True)
+
+    def test_direct_merge_publishes_the_previewed_workflow_with_live_node_settings(self):
+        self._check_staged_install("published-direct")
+
     def test_staged_publish_preserves_project_bindings_on_conflict(self):
         for outcome in ("preview", "stale-preview", "put-conflict", "changed-before-publish", "changed-on-publish",
                         "no-capability", "wrong-credentials", "published", "published-draft"):
@@ -229,6 +272,10 @@ class InstallSopsTests(unittest.TestCase):
         if outcome == "published-draft":
             original.update(status="draft", revision=1, version=1)
             original.pop("publishedRevision")
+        if outcome == "published-direct":
+            original.update(revision=20, publishedRevision=20, version=11)
+            original["nodes"] = [{"id": "review", "type": "script", "maxReworks": 10, "maxAttempts": 4,
+                                  "position": {"x": 43, "y": 99}, "notifications": [{"type": "completed"}]}]
         live = original
         writes = []
         workflow_writes = []
@@ -241,6 +288,9 @@ class InstallSopsTests(unittest.TestCase):
         self.responses["/api/v1/workers"]["workers"][0]["capabilities"] = (
             ["staged-feature"] if outcome == "no-capability" else ["staged-feature", "staged-feature-checkpoints"])
         self.responses["/api/v1/pools"]["pools"][0]["slots"][0]["status"] = "leased"
+        if outcome == "published-direct":
+            self.responses["/api/v1/workers"]["workers"][0]["capabilities"].append("staged-feature-direct-merge")
+            self.responses["/api/v1/pools"]["pools"][0]["direct_merge"] = True
 
         def api(method, path, value=None, *, missing=False):
             nonlocal live
@@ -251,6 +301,11 @@ class InstallSopsTests(unittest.TestCase):
             writes.append((method, path))
             if (method, path) == ("PUT", "/api/workflows"):
                 workflow_writes.append(value["id"])
+                if outcome == "published-direct":
+                    self.assertEqual([n["id"] for n in value["nodes"]][-3:], ["accept", "merge", "deliver"])
+                    review = next(n for n in value["nodes"] if n["id"] == "review")
+                    for key, old in original["nodes"][0].items():
+                        self.assertEqual(review[key], old)
                 self.assertEqual({k: v for k, v in value.items() if k not in {"nodes", "edges"}}, {
                     k: v for k, v in original.items() if k not in {"nodes", "edges"}
                 })
@@ -280,6 +335,10 @@ class InstallSopsTests(unittest.TestCase):
             args = ["--staged-feature", "--config", str(config), "--output-dir", str(root),
                     "--project-id", "garden", "--api-url", "https://studio.example.test",
                     "--worker-url", "https://worker.example.test"]
+            if outcome == "published-direct":
+                config.write_text(config.read_text().replace("[[pools.game.slots]]",
+                                  "[pools.game]\ndirect_merge = true\n[[pools.game.slots]]", 1))
+                args.extend(("--direct-merge", "--expected-revision", "20"))
             if outcome != "preview":
                 args.append("--publish")
             if outcome == "stale-preview":
@@ -305,6 +364,6 @@ class InstallSopsTests(unittest.TestCase):
         else:
             self.assertEqual(workflow_writes, ["garden-feature"])
             expected = [("PUT", "/api/workflows")]
-            if outcome in {"published", "published-draft", "changed-on-publish"}:
+            if outcome in {"published", "published-draft", "published-direct", "changed-on-publish"}:
                 expected.append(("POST", feature_path + "/publish"))
             self.assertEqual(writes, expected)

@@ -22,15 +22,30 @@ OUTPUTS = {
     "clarify": ("unity-scope", "requirement"), "design": ("unity-planning", "design"),
     "implement": ("unity-implementation", "implementation"), "review": ("unity-review", "review"),
     "test": ("unity-verification", "test-report"), "mr": ("unity-delivery", "mr-body"),
-    "deliver": (None, "delivery"),
+    "merge": ("unity-delivery", "merge-report"), "deliver": (None, "delivery"),
 }
 SCOPE = ("workflow_project_id", "workflow_id", "workflow_run_id")
 ASSIGNMENT = ("task_id", "pool_id", "slot_id", "base_commit")
+MERGE_RETRYABLE = {"git_failed", "timeout", "workspace_in_use", "license_failed", "package_failed", "startup_failed",
+                   "test_execution_failed", "push_failed", "recovered", "report_io_failed"}
 
 
 def require(condition, message):
     if not condition:
         raise api.ClientError(message)
+
+
+def may_retry_merge(task, job):
+    journal = task.get("merge_journal") or {}
+    if journal.get("status") == "confirmed":
+        return True
+    # The Worker enforces the same admission rules. Keep blocked verification on its original job and reports.
+    prior_check = journal.get("verification_failure")
+    if prior_check and prior_check["kind"] not in MERGE_RETRYABLE | {"recovery_required", "cancelled"}:
+        return False
+    failure = job.get("failure_kind")
+    return (failure in MERGE_RETRYABLE or job["status"] == "recovery_required"
+            or failure == "worker_error" and journal.get("status") == "in_flight")
 
 
 def review_feedback(review):
@@ -54,7 +69,7 @@ def mounted_evidence(ref):
 
 def write_report(node, sections):
     title = {"clarify": "需求定型", "design": "方案设计", "implement": "开发实现", "review": "独立评审",
-             "test": "测试验证", "mr": "发起 MR", "deliver": "交付汇总"}[node]
+             "test": "测试验证", "mr": "发起 MR", "merge": "合入主线", "deliver": "交付汇总"}[node]
     lines = ["# " + title, ""]
     for label, value in sections.items():
         lines.extend(["## " + label, ""])
@@ -78,6 +93,9 @@ class FeatureStage:
         self.args = args
         self.ctx = context
         self.node = context["node_id"]
+        self.direct = context.get("delivery_mode") == "direct-merge"
+        require(context.get("delivery_mode") in (None, "direct-merge") and
+                self.node != ("mr" if self.direct else "merge"), "Signed context has a different delivery mode")
         self.attempt = context["node_attempt"]
         self.ref = context.get("upstream")
         self.source = mounted_evidence(self.ref) if self.ref else {}
@@ -94,6 +112,8 @@ class FeatureStage:
                        "workflow_project_id": context["workflow_project_id"], "workflow_run_id": context["workflow_run_id"],
                        "requirement": context["requirement"],
                        "request_id": api.operation_id(context["workflow_run_id"], "feature-create", 0)}
+            if self.direct:
+                payload["delivery_mode"] = "direct-merge"
             created = client.request("/api/v1/planning-tasks", payload)
             self.create_job = created["job_id"]
             task_id = created["task_id"]
@@ -110,6 +130,8 @@ class FeatureStage:
         t = self.task
         require(t.get("task_id") == self.task_id and t.get("workflow_mode") == "staged-feature"
                 and t.get("planning_profile") == "feature" and t.get("pool_id") == self.args.pool
+                and t.get("delivery_mode") == self.ctx.get("delivery_mode")
+                and (not self.direct or t.get("publish_checkpoints") is True)
                 and all(t.get(k) == self.ctx[k] for k in ("workflow_run_id", "workflow_project_id")),
                 "Worker assignment does not match this staged feature")
         if self.source:
@@ -132,7 +154,9 @@ class FeatureStage:
         """Use the Worker's admission record to join a phase or retry a failed attempt."""
         operation = action + ":" + version
         path = self.state_file(operation)
-        actions = {"commit", "pr"} if action == "workflow-deliver" else {action}
+        actions = {action}
+        if action == "workflow-deliver":
+            actions = {"merge"} if self.direct else {"commit", "pr"}
         generation, request_id, receipt = self.operation_receipt(operation)
         job = receipt["job"]
         if job:
@@ -155,9 +179,11 @@ class FeatureStage:
             # A failed check that requires edits cannot rerun on the same implementation.
             needs_rework = (action, job.get("failure_kind")) in {
                 ("review", "review_changes"), ("test", "tests_failed")}
-            if (job["status"] == "failed" and current == job["job_id"] and not needs_rework
-                    or job["status"] == "recovery_required" and recovered and current == recovered
-                    and self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"):
+            if job["action"] == "merge":
+                needs_rework = not may_retry_merge(self.task, job)
+            if not needs_rework and (job["status"] == "failed" and current == job["job_id"]
+                                     or job["status"] == "recovery_required" and recovered and current == recovered
+                                     and self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"):
                 job = None
                 predecessor = current
         if job is None:
@@ -185,11 +211,13 @@ class FeatureStage:
             return job
 
         failure = {k: job.get(k) for k in ("job_id", "action", "status", "failure_kind", "error_message", "stage_result")}
-        evidence = {"Worker 作业": failure, "Worker 产物": api.handoff(self.task, job)["artifact_reference"]}
+        references = api.handoff(self.task, job)["artifact_reference"]
+        evidence = {"Worker 作业": failure, "Worker 产物": references}
         if self.task.get("delivery"):
             evidence["已记录的交付"] = self.task["delivery"]
         write_report(self.node, evidence)
-        raise api.ClientError(f"Worker {action} job {job_id}: {job.get('failure_kind') or job['status']}")
+        raise api.ClientError(f"Worker {action} job {job_id}: {job.get('failure_kind') or job['status']}. "
+                              f"{job.get('error_message') or ''} {' '.join(references)}".strip())
 
     def current(self, stage):
         require(self.task["job_id"] == self.last_job["job_id"] and self.task["current_stage"] == stage,
@@ -350,7 +378,7 @@ class FeatureStage:
                 "Worker verification or tests differ from the current platform evidence")
         return {**fields, "verification": verification, "test_report": self.source["test_report"]}
 
-    def mr(self):
+    def approved_delivery(self):
         fields = self.checked_tests()
         approval = self.ctx["approval"]
         claims = approval["claims"]
@@ -361,7 +389,8 @@ class FeatureStage:
         checkout = fields["verification"].get("checkout")
         if checkout is not None:
             expected["commit_sha"] = checkout["commit_sha"]
-        require(all(claims.get(k) == v for k, v in expected.items()), "Delivery approval differs from the tested assignment")
+        require(claims.get("delivery_mode") == self.ctx.get("delivery_mode") and (not self.direct or checkout)
+                and all(claims.get(k) == v for k, v in expected.items()), "Delivery approval differs from the tested assignment")
         previous = self.task.get("approval")
         if previous:
             require(previous.get("claims") == claims, "Worker is delivering a different approval")
@@ -371,7 +400,12 @@ class FeatureStage:
         self.checked_tests()
         require(self.task["status"] == "completed" and self.task["approval"]["claims"] == claims,
                 "Worker did not finish this approved delivery")
+        return fields, claims
+
+    def mr(self):
+        fields, claims = self.approved_delivery()
         delivery = self.task["delivery"]
+        checkout = fields["verification"].get("checkout")
         require(delivery["pushed"] and delivery["commit_sha"] and delivery["mr_status"] in {"created", "pending"},
                 "Worker lacks a durable delivery receipt")
         if checkout is not None:
@@ -379,25 +413,86 @@ class FeatureStage:
                     "Delivered commit differs from the tested checkout")
         return {**fields, "delivery": delivery, "approval_artifact_id": claims["approval_artifact_id"]}, {"分支和 MR": delivery}
 
+    def confirmed_merge(self, job, claims):
+        task = self.task
+        receipt = task.get("delivery") or {}
+        journal = task.get("merge_journal") or {}
+        checkout = task["verification"]["checkout"]
+        require(job["task_id"] == self.task_id and job["action"] == "merge" and job["status"] == "succeeded"
+                and job.get("stage_result") == receipt and journal.get("status") == "confirmed"
+                and journal.get("receipt") == receipt and journal.get("approval") == claims == task["approval"]["claims"]
+                and all(receipt.get(k) == journal.get(k) for k in ("source_sha", "task_branch", "target_branch",
+                                                                    "base_sha", "target_sha"))
+                and task.get("pushed") is True and receipt.get("status") == "merged" and receipt.get("mode") == "direct-merge"
+                and receipt.get("task_branch") == checkout["branch"] == task["task_branch"]
+                and receipt.get("source_sha") == checkout["commit_sha"] == claims["commit_sha"] == task["commit_sha"]
+                and receipt.get("target_branch") == task["base_branch"]
+                and all(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", receipt.get(key) or "")
+                        for key in ("base_sha", "target_sha", "merge_sha")),
+                "Worker lacks a confirmed receipt for this approved merge")
+        paths = receipt.get("conflict_paths")
+        checks = receipt.get("verification") or {}
+        require(isinstance(paths, list) and all(isinstance(path, str) and path.lower().endswith(".cs") for path in paths),
+                "Invalid Worker merge conflict evidence")
+        # An already-landed approved source can supersede an earlier candidate in the journal.
+        if receipt["merge_sha"] != receipt["source_sha"]:
+            require(checks == journal.get("verification") and paths == journal.get("conflict_paths")
+                    and receipt["merge_sha"] == journal.get("merge_sha"), "Landed candidate evidence changed")
+        if checks.get("mode") == "reused":
+            approved_tree = (receipt["merge_sha"] == receipt["source_sha"] or
+                             receipt["merge_sha"] == journal.get("merge_sha") and journal.get("tree_sha") == claims["revision"])
+            require(not paths and approved_tree and checks == {"mode": "reused", **task["verification"]},
+                    "Original test evidence differs from the landed tree")
+        else:
+            compile_report = checks.get("compile") or {}
+            require(checks.get("mode") == "retested" and checks.get("merge_sha") == receipt["merge_sha"] == journal.get("merge_sha")
+                    and checks.get("revision") == journal.get("tree_sha") and
+                    re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", checks.get("revision") or "")
+                    and compile_report.get("mode") == "compile" and compile_report.get("exit_code") == 0
+                    and (not paths or (checks.get("review") or {}).get("verdict") == "pass"),
+                    "Worker lacks passing compile or independent review for the landed candidate")
+            runs = checks.get("runs") or []
+            scopes = [(mode, scope) for mode, items in task["test_selection"].items() for scope in items]
+            require(scopes and len(runs) == len(scopes), "Worker did not retest every approved scope")
+            for run in runs:
+                key = (run.get("mode"), run.get("scope"))
+                require(key in scopes and run.get("exit_code") == 0 and run.get("passed", 0) > 0
+                        and run.get("failed") == 0 and run.get("inconclusive") == 0, "Invalid candidate test evidence")
+                scopes.remove(key)
+        return receipt
+
+    def merge(self):
+        fields, claims = self.approved_delivery()
+        delivery = self.confirmed_merge(self.last_job, claims)
+        return {**fields, "delivery": delivery, "approval_artifact_id": claims["approval_artifact_id"]}, {"主线合入回执": delivery}
+
     def deliver(self):
         self.checked_tests()
         delivery = self.task["delivery"]
         recovered = (self.task["status"] == "failed" and self.task.get("failure_kind") == "recovered"
                      and self.task["lease"])
+        if self.direct:
+            require(self.source["node_id"] == "merge", "Expected a merge artifact before release")
+            job_id = str(UUID(self.source["job_id"]))
+            merge_job = self.client.request("/api/v1/jobs/" + job_id)
+            require(merge_job["job_id"] == job_id, "Worker returned a different merge job")
+            self.confirmed_merge(merge_job, self.ctx["approved_claims"])
         require((self.task["status"] == "completed" or recovered) and self.task["current_stage"] == "delivered"
-                and delivery == self.source["delivery"] and delivery["pushed"]
+                and delivery == self.source["delivery"] and (self.direct or delivery["pushed"])
                 and self.task["approval"]["claims"]["approval_artifact_id"] == self.source["approval_artifact_id"],
                 "Worker delivery changed before release")
         self.job("release", predecessor=self.source["job_id"])
         self.current("delivered")
         self.checked_tests()
+        if self.direct:
+            self.confirmed_merge(merge_job, self.ctx["approved_claims"])
         require(self.task["status"] == "completed" and self.task["lease"] is False
                 and self.task["delivery"] == delivery
                 and self.task["approval"]["claims"]["approval_artifact_id"] == self.source["approval_artifact_id"]
                 and self.last_job["stage_result"].get("released") is True,
                 "Worker did not confirm release")
         return {}, {"验证记录": self.source["verification"], "测试结果与范围": self.source["test_report"],
-                    "分支和 MR": delivery, "槽位归还": {"slot_id": self.task["slot_id"], "released": True,
+                    ("主线合入回执" if self.direct else "分支和 MR"): delivery, "槽位归还": {"slot_id": self.task["slot_id"], "released": True,
                                                      "released_at": self.task.get("released_at")}}
 
     def run(self):

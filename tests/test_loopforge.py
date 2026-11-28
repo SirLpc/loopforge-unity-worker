@@ -224,6 +224,143 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(artifact["job_id"], job_id)
 
 class FeatureScriptTests(unittest.TestCase):
+    def test_direct_merge_receipt_is_required_before_release(self):
+        import hashlib
+        import json
+        from contextlib import chdir, redirect_stderr
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from support import test_directory
+        from integrations.loopforge import worker_client
+
+        task_id, test_id, merge_id, release_id = (str(uuid4()) for _ in range(4))
+        scope = {"workflow_project_id": "garden", "workflow_run_id": "run-123", "workflow_id": "garden-feature"}
+        binding = {"task_id": task_id, "pool_id": "pool", "slot_id": "one", "base_commit": "a" * 40,
+                   "implementation_attempt": 0, "plan_digest": "b" * 64, "revision": "c" * 40}
+        checkout = {"branch": "ai/task-" + task_id.replace("-", ""), "commit_sha": "d" * 40}
+        original = {"revision": binding["revision"], "checkout": checkout, "test_job_id": test_id, "implementation_attempt": 0}
+        selected = {"assembly": "Game.Tests", "fixtures": ["Game.Trees"]}
+        report = {"editmode": {"status": "passed", "revision": binding["revision"]}}
+        source = {**scope, **binding, "node_id": "test", "node_attempt": 1, "job_id": test_id,
+                  "verification": original, "test_report": report, "parent_artifact_id": "review-1"}
+        task = {**scope, **binding, "job_id": test_id, "workflow_mode": "staged-feature", "planning_profile": "feature",
+                "delivery_mode": "direct-merge", "publish_checkpoints": True, "lease": True, "current_stage": "tested",
+                "base_branch": "main", "task_branch": checkout["branch"], "approved_plan_digest": binding["plan_digest"],
+                "verification": original, "test_selection": {"editmode": [selected]}, "test_report": report,
+                "artifacts": [{"name": "candidate.json", "kind": "report"}]}
+        ctx = {**scope, "node_id": "merge", "node_attempt": 1, "rework": 0, "delivery_mode": "direct-merge"}
+        claims = {"project_id": "garden", "workflow_run_id": "run-123", "workflow_id": "garden-feature", **binding,
+                  "test_job_id": test_id, "accept_attempt": 1, "approval_artifact_id": "accept-1",
+                  "approval_digest": "e" * 64, "test_artifact_id": "test-1", "delivery_mode": "direct-merge",
+                  "commit_sha": checkout["commit_sha"]}
+        receipt = {"mode": "direct-merge", "status": "merged", "source_sha": checkout["commit_sha"],
+                   "base_sha": "1" * 40, "merge_sha": "2" * 40, "target_sha": "3" * 40, "target_branch": "main",
+                   "task_branch": checkout["branch"], "conflict_paths": ["Assets/Tree.cs"],
+                   "verification": {"mode": "retested", "merge_sha": "2" * 40, "revision": "4" * 40,
+                                    "compile": {"mode": "compile", "exit_code": 0},
+                                    "runs": [{"mode": "editmode", "scope": selected, "exit_code": 0,
+                                              "passed": 3, "failed": 0, "inconclusive": 0}],
+                                    "review": {"verdict": "pass", "summary": "Both changes preserved"}}}
+        merge = {"task_id": task_id, "job_id": merge_id, "action": "merge", "status": "failed",
+                 "failure_kind": "compile_failed", "error_message": "Assets/Tree.cs failed in Unity",
+                 "stage_result": {"step": "compile"}}
+        release = {"task_id": task_id, "job_id": release_id, "action": "release", "status": "succeeded",
+                   "stage_result": {"released": True}}
+        ids, posts = {}, []
+
+        def request(path, payload=None):
+            if payload is None:
+                if "/operations/" in path:
+                    return {"job": ids.get(path.rsplit("/", 1)[-1]), "recovered_by": None}
+                if "/jobs/" in path:
+                    return {merge_id: merge, release_id: release}[path.rsplit("/", 1)[-1]]
+                self.assertEqual(path, f"/api/v1/tasks/{task_id}")
+                return task.copy()
+            action, after = path.rsplit("/", 1)[-1].split("?after_job=")
+            self.assertEqual(after, task["job_id"])
+            posts.append(action)
+            if action == "workflow-deliver":
+                self.assertEqual(payload["approval"]["claims"], claims)
+                job = merge
+                task.update(status="failed", current_stage="merge", approval={"claims": dict(claims)})
+            else:
+                self.assertEqual(action, "release")
+                job = release
+                task.update(lease=False)
+            ids[payload["request_id"]] = job
+            task.update(job_id=job["job_id"])
+            return job
+
+        with (test_directory() as root, chdir(root), patch.object(worker_client, "planning_context", return_value=ctx),
+              patch.object(worker_client, "Client", return_value=SimpleNamespace(request=request))):
+            inputs = Path(".agentflow/inputs")
+            inputs.mkdir(parents=True)
+            def mount(name, identifier, record):
+                raw = json.dumps(record).encode()
+                (inputs / (name + ".json")).write_bytes(raw)
+                return {"name": name, "id": identifier, "sha256": hashlib.sha256(raw).hexdigest()}
+            ctx["upstream"] = mount("unity-verification", "test-1", source)
+            claims["test_digest"] = ctx["upstream"]["sha256"]
+            ctx["approval"] = {"claims": claims}
+            merge_args = ["feature-merge", "--pool", "pool"]
+            for attempt in (1, 2):
+                ctx["node_attempt"] = attempt
+                error = StringIO()
+                with redirect_stderr(error):
+                    self.assertEqual(worker_client.main(merge_args), 1)
+                for detail in (merge_id, "compile_failed", "Assets/Tree.cs", "candidate.json"):
+                    self.assertIn(detail, error.getvalue())
+                    self.assertIn(detail, Path("merge-report.md").read_text(encoding="utf-8"))
+            self.assertEqual(posts, ["workflow-deliver"])
+            self.assertFalse(Path("unity-delivery.json").exists())
+            merge.update(status="succeeded", stage_result=receipt)
+            task.update(status="completed", current_stage="delivered", delivery=receipt, pushed=True,
+                        commit_sha=receipt["source_sha"], merge_journal={"status": "confirmed", "receipt": receipt,
+                        "tree_sha": "4" * 40, "merge_sha": receipt["merge_sha"], "approval": dict(claims),
+                        "source_sha": receipt["source_sha"], "base_sha": receipt["base_sha"],
+                        "target_sha": receipt["target_sha"], "task_branch": checkout["branch"], "target_branch": "main",
+                        "verification": receipt["verification"], "conflict_paths": ["Assets/Tree.cs"]})
+            for where, change in [(merge, {"action": "pr"}), (merge, {"stage_result": {}}),
+                                  (receipt, {"target_branch": "foreign"}), (receipt, {"source_sha": "9" * 40}),
+                                  (receipt, {"base_sha": "a" * 40}), (receipt, {"target_sha": "e" * 40}),
+                                  (receipt, {"verification": {"mode": "reused", **original}}),
+                                  (receipt["verification"], {"merge_sha": "8" * 40}),
+                                  (receipt["verification"], {"revision": "6" * 40}),
+                                  (receipt["verification"], {"review": {"verdict": "request_changes"}}),
+                                  (task["merge_journal"], {"verification": {}}), (task["merge_journal"], {"conflict_paths": []}),
+                                  (receipt["verification"], {"runs": []}), (receipt["verification"], {"compile": {}})]:
+                with self.subTest(change=change), patch.dict(where, change):
+                    self.assertEqual(worker_client.main(merge_args), 1)
+            with patch.dict(receipt, conflict_paths=[], verification={"mode": "reused", **original}):
+                self.assertEqual(worker_client.main(merge_args), 1)  # Candidate tree differs from the approved tree.
+                with patch.dict(task["merge_journal"], tree_sha=binding["revision"], conflict_paths=[],
+                                verification=receipt["verification"]):
+                    self.assertEqual(worker_client.main(merge_args), 0)
+                with patch.dict(receipt, merge_sha=receipt["source_sha"]):
+                    self.assertEqual(worker_client.main(merge_args), 0)  # Source already in remote history.
+            with (patch.dict(receipt, conflict_paths=["Assets/Tree.CS"]),
+                  patch.dict(task["merge_journal"], conflict_paths=["Assets/Tree.CS"])):
+                self.assertEqual(worker_client.main(merge_args), 0)
+            self.assertEqual(worker_client.main(merge_args), 0)
+            record = json.loads(Path("unity-delivery.json").read_bytes())
+            self.assertEqual(record["delivery"], receipt)
+            self.assertEqual(record["test_report"], report)
+            ctx.update(node_id="deliver", upstream=mount("unity-delivery", "merge-1", record),
+                       approved_claims=dict(claims))
+            ctx.pop("approval")
+            deliver_args = ["feature-delivery", "--pool", "pool"]
+            for where, change in [(merge, {"status": "failed"}), (merge, {"stage_result": {}}),
+                                  (ctx["approved_claims"], {"test_digest": "3" * 64}),
+                                  (task, {"delivery": {**receipt, "target_sha": "8" * 40}})]:
+                with self.subTest(change=change), patch.dict(where, change):
+                    self.assertEqual(worker_client.main(deliver_args), 1)
+                    self.assertEqual(posts, ["workflow-deliver"])
+            for _ in range(2):
+                self.assertEqual(worker_client.main(deliver_args), 0)
+            self.assertEqual(posts, ["workflow-deliver", "release"])
+            self.assertIn(receipt["target_sha"], Path("delivery.md").read_text(encoding="utf-8"))
+
     def test_staged_review_reuses_rejected_job_without_resubmission(self):
         import json
         from contextlib import chdir
@@ -437,6 +574,11 @@ class FeatureScriptTests(unittest.TestCase):
 
 
     def test_feature_stages_freeze_then_compile_review_test_and_resume_reserved_rework(self):
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                self.check_feature_stages(direct)
+
+    def check_feature_stages(self, direct):
         import hashlib
         import json
         from contextlib import chdir
@@ -455,6 +597,8 @@ class FeatureScriptTests(unittest.TestCase):
                 "implementation_attempt": 0, "artifacts": [], "revision": None, "approved_plan_digest": None}
         ctx = {"workflow_run_id": "run-90", "workflow_project_id": "garden", "workflow_id": "garden-feature",
                "node_id": "clarify", "node_attempt": 1, "rework": 0, "feedback": "", "requirement": "Grow"}
+        if direct:
+            ctx["delivery_mode"] = "direct-merge"
         jobs, ids, operations, recovered = {}, {}, [], {}
         pre_admission_drop = [True]
         def request(path, payload=None):
@@ -490,6 +634,10 @@ class FeatureScriptTests(unittest.TestCase):
                                   "workflow_run_id": "run-90", "planning_profile": "feature", "pool_id": "pool",
                                   "requirement": "Grow"})
                 self.assertIs(payload["publish_checkpoints"], True)
+                if direct:
+                    self.assertEqual(payload["delivery_mode"], "direct-merge")
+                else:
+                    self.assertNotIn("delivery_mode", payload)
                 task.update(payload)
             elif action == "clarify":
                 task.update(clarification=scope, slot_id="s1", lease=True, base_commit="a" * 40, current_stage="clarified")

@@ -173,6 +173,53 @@ class FeatureContextTests(unittest.TestCase):
         with self.assertRaisesRegex(ContextError, "successful test job"):
             self.context()
 
+    def test_direct_merge_signing_is_bound_to_the_frozen_graph(self):
+        import hashlib
+        from workflow_approval import verify_approval
+
+        wf = self.run["workflowSnapshot"]
+        self.assertNotIn("delivery_mode", self.context()["approval"]["claims"])
+        self.run["nodes"]["merge"] = self.run["nodes"].pop("mr")
+        wf["nodes"][-2]["id"] = "merge"
+        wf["edges"][-2]["target"] = "merge"
+        with self.assertRaises(ContextError):
+            self.context()
+        wf["edges"][-1]["source"] = "merge"
+        with self.assertRaises(ContextError):
+            self.context()  # Old evidence has no tested commit.
+        checkout = {"branch": "ai/task-" + self.task_id.replace("-", ""), "commit_sha": "a" * 40}
+        for node, key in (("implement", "compile_report"), ("review", "review_result"), ("test", "verification")):
+            meta = next(a for a in self.run["artifacts"] if a["nodeId"] == node)
+            record = json.loads(self.bodies[meta["id"]])
+            record.setdefault(key, {})["checkout"] = checkout
+            self.bodies[meta["id"]] = json.dumps(record).encode()
+            meta["sha256"] = hashlib.sha256(self.bodies[meta["id"]]).hexdigest()
+        ctx = self.context()
+        self.assertEqual(ctx["operation"], "feature-merge")
+        claims = verify_approval(ctx["approval"], self.key, 1001)
+        self.assertEqual((claims["delivery_mode"], claims["commit_sha"], claims["test_digest"]),
+                         ("direct-merge", checkout["commit_sha"], meta["sha256"]))
+        self.assertEqual((claims["accept_attempt"], claims["test_job_id"]), (3, self.test_job_id))
+        with patch.dict(wf["nodes"][-2], type="approval"), self.assertRaises(ContextError):
+            self.context()
+        decision = self.run["artifacts"][-1]
+        manual = b"# Manual pass\n"
+        with (patch.dict(self.bodies, {decision["id"]: manual}),
+              patch.dict(decision, sha256=hashlib.sha256(manual).hexdigest()), self.assertRaises(ContextError)):
+            self.context()
+        with patch.dict(self.run["nodes"]["merge"], status="pending"), patch.dict(self.run["nodes"]["clarify"], status="running"):
+            self.assertEqual(self.context()["delivery_mode"], "direct-merge")
+        merged = {**record, "node_id": "merge", "job_id": "worker-merge", "parent_artifact_id": meta["id"],
+                  "approval_artifact_id": decision["id"]}
+        merge_body = json.dumps(merged).encode()
+        self.bodies["merged"] = merge_body
+        self.run["artifacts"].append({"id": "merged", "nodeId": "merge", "runId": self.run_id, "attempt": 3,
+                                      "name": "unity-delivery", "sha256": hashlib.sha256(merge_body).hexdigest()})
+        with patch.dict(self.run["nodes"]["merge"], status="succeeded"), patch.dict(self.run["nodes"]["deliver"], status="running"):
+            summary = self.context()
+            self.assertEqual((summary["upstream"]["id"], summary["approved_claims"]), ("merged", claims))
+            self.assertNotIn("approval", summary)
+
     def test_feature_rejects_manual_pass_and_cross_assignment_or_old_round(self):
         import hashlib
         for node, values in (("accept", None), ("review", {"task_id": "ee"}), ("test", {"node_attempt": 2}),

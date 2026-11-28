@@ -73,6 +73,14 @@ if ($LASTEXITCODE -ne 0) { throw 'Staged feature preview failed' }
 
 新版 SOP 的每轮开发或返工编译通过后，Worker 将该版本追加并推送到同一条任务分支。人工验收时，在「待审交付物」中打开测试报告，按报告开头的分支和完整 SHA 检出。发起 MR 使用中继签发的授权核对同一提交，交付汇总记录归还结果。已创建的任务沿用创建时的发布方式。
 
+#### 人工验收后直接合入主线
+
+先升级 Worker 和中继，然后在所选命名池的 `[pools.game]` 配置中设置 `direct_merge = true`（将 `game` 换成真实池名）。安装器会核对该池的本地配置和 Worker 返回的开关，以及 Worker 声明的 `staged-feature-checkpoints` 和 `staged-feature-direct-merge` 能力。在上面的 PowerShell 预览命令之前执行 `$stagedArgs += '--direct-merge'`，核对预览文件中「人工验收 → 合入主线 → 交付汇总」的连线，再用同一组参数和本次预览的 `--expected-revision` 发布。旧运行仍按其冻结的 MR 图完成交付。
+
+验收人批准测试报告列出的任务分支和完整提交 SHA。Worker 将该提交合入工程池配置的目标分支。候选树有变化时，Worker 在候选上重新编译并运行原方案的测试范围。简单 C# 内容冲突还需通过独立评审。合入报告列出验收 SHA、目标基线、落地 SHA、远端确认的目标 SHA、冲突文件和验证结果。汇总节点保留原测试报告，核对成功的合入作业和远端回执，确认归还槽位后完成。
+
+合入节点阻塞时，从节点输出查找 Worker 作业 ID、失败原因和产物路径。排除许可证或网络等故障后，重试该节点以恢复原操作。复验编译、测试或评审要求修改时，原作业和槽位保留现场，联系操作员归档，或从最新主线发起新一轮实现和验收。
+
 | 节点 | Markdown | JSON |
 | --- | --- | --- |
 | 需求定型 | requirement.md | unity-scope.json |
@@ -81,6 +89,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Staged feature preview failed' }
 | 独立评审 | review.md | unity-review.json |
 | 测试验证 | test-report.md | unity-verification.json |
 | 发起 MR | mr-body.md | unity-delivery.json |
+| 合入主线（直合模式） | merge-report.md | unity-delivery.json |
 | 交付汇总 | delivery.md | |
 
 #### 回退功能 SOP

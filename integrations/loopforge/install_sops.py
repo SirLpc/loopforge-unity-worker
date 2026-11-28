@@ -352,7 +352,7 @@ def windows_workflow(target, row, worker_credentials, context_credential, pool_i
     return workflow
 
 
-def staged_feature_workflow(target, worker_credential, context_credential, pool_id):
+def staged_feature_workflow(target, worker_credential, context_credential, pool_id, *, direct_merge=False):
     if not pool_id:
         raise ValueError("Staged feature delivery requires a named pool")
     key, title, _, lane = STARTERS[0]
@@ -362,7 +362,8 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
         ("implement", "开发实现", "feature-implement", "implementation", "unity-implementation", "development"),
         ("review", "独立评审", "feature-review", "review", "unity-review", "development"),
         ("test", "测试验证", "feature-test", "test-report", "unity-verification", "testing"),
-        ("mr", "发起 MR", "feature-mr", "mr-body", "unity-delivery", "none"),
+        (("merge", "合入主线", "feature-merge", "merge-report", "unity-delivery", "none") if direct_merge else
+         ("mr", "发起 MR", "feature-mr", "mr-body", "unity-delivery", "none")),
         ("deliver", "交付汇总", "feature-delivery", "delivery", None, "none"),
     )
     nodes = []
@@ -376,10 +377,12 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
         if evidence:
             node["artifactOutputs"].append(artifact(evidence, evidence + ".json", "application/json"))
         nodes.append(node)
+    grant = ("批准后将此提交直接合入工程池主线。简单 C# 冲突通过复验及独立评审后自动合入。"
+             if direct_merge else "批准后发起 MR；")
     gate = approval("accept", "人工验收",
                     "打开待审交付物中的测试报告，使用报告开头的任务分支和提交 SHA 验收。"
                     "核对需求、独立评审、Unity 测试和未覆盖项。"
-                    "批准后发起 MR；需要修改时填写完整意见并打回开发实现。", "implement")
+                    + grant + "需要修改时填写完整意见并打回开发实现。", "implement")
     gate["maxReworks"] = FEATURE_TOTAL_REWORK_LIMIT
     nodes.insert(5, gate)
     return definition(target, f"{target.project_id}-{key}", title, lane, nodes, (worker_credential, context_credential))
@@ -411,7 +414,9 @@ def workflow_content(workflow, *, publishing=False):
     return content
 
 
-def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, expected_revision=None):
+def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, expected_revision=None, direct_merge=False):
+    if direct_merge and publish and (type(expected_revision) is not int or expected_revision < 1):
+        raise ValueError("Publishing direct merge requires a positive --expected-revision from preview")
     identifier = target.project_id + "-feature"
     project_path = "/api/projects/" + target.project_id
     project = api("GET", project_path)
@@ -429,7 +434,16 @@ def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, e
         raise RuntimeError(f"Feature workflow revision changed: expected {expected_revision}, found {revision}")
     worker, context = staged_credential_ids(api, project_path, live)
     live_target = Target(target.project_id, live["sandboxProfileId"], target.worker_url)
-    graph = staged_feature_workflow(live_target, worker, context, pool_id)
+    graph = staged_feature_workflow(live_target, worker, context, pool_id, direct_merge=direct_merge)
+    if direct_merge:
+        existing = {n["id"]: n for n in live["nodes"]}
+        for node in graph["nodes"]:
+            old = existing.get(node["id"], existing.get("mr", {}) if node["id"] == "merge" else {})
+            if old.get("type") == node["type"]:
+                for key in ("maxAttempts", "maxReworks", "metricStage", "position", "notifications", "retryStrategy",
+                            "carryOver", "executionScope", "credentialEnv", "runOnWorkspaceRebuild", "executorId"):
+                    if key in old:
+                        node[key] = old[key]
     value = {**live, "nodes": graph["nodes"], "edges": graph["edges"]}
     # Keep the exact input revision for recovery, even on repeated deployments.
     backup = output_dir / f"{identifier}-before.json"
@@ -495,13 +509,19 @@ def read_pool(settings, pool_id):
     return pool
 
 
-def preflight_worker(api, settings, pool_id, *, staged_feature=False):
+def preflight_worker(api, settings, pool_id, *, staged_feature=False, direct_merge=False):
+    if direct_merge:
+        if not pool_id:
+            raise ValueError("Direct merge requires a named pool")
+        staged_feature = True
     pool = read_pool(settings, pool_id)
     worker_id = os.environ.get("UNITY_WORKER_ID", settings.get("worker_id", "worker-01"))
     workers = api("GET", "/api/v1/workers")["workers"]
     if len(workers) != 1 or workers[0]["worker_id"] != worker_id:
         raise RuntimeError(f"Worker endpoint does not match configured worker {worker_id}")
     worker = workers[0]
+    if direct_merge and "staged-feature-direct-merge" not in worker.get("capabilities", []):
+        raise RuntimeError("Worker does not advertise the staged-feature-direct-merge capability")
     if staged_feature and "staged-feature-checkpoints" not in worker.get("capabilities", []):
         raise RuntimeError("Worker does not advertise the staged-feature-checkpoints capability")
     if pool is None:
@@ -513,6 +533,8 @@ def preflight_worker(api, settings, pool_id, *, staged_feature=False):
     ready = next((item for item in registered if item["id"] == pool_id), None)
     if ready is None:
         raise RuntimeError(f"Worker has not registered pool {pool_id}")
+    if direct_merge and (pool.get("direct_merge") is not True or ready.get("direct_merge") is not True):
+        raise RuntimeError(f"Enable direct_merge on the configured and registered Worker pool {pool_id}")
     slots = {slot["id"]: slot["status"] for slot in ready["slots"]}
     expected = {slot["id"]: slot.get("enabled", True) for slot in pool["slots"]}
     if slots.keys() != expected.keys():
@@ -566,9 +588,15 @@ def main(argv=None):
                         help="Preview or publish only the existing project feature SOP")
     layout.add_argument("--windows-planning", action="store_true",
                         help="Use the Windows Worker for code investigation and planning before approval")
+    parser.add_argument("--direct-merge", action="store_true",
+                        help="Use the selected pool's approved direct-merge delivery with --staged-feature")
     parser.add_argument("--expected-revision", type=int,
                         help="With --staged-feature, stop if the existing feature revision differs")
     args = parser.parse_args(argv)
+    if args.direct_merge and not args.staged_feature:
+        parser.error("--direct-merge requires --staged-feature")
+    if args.direct_merge and args.publish and args.expected_revision is None:
+        parser.error("Publishing direct merge requires --expected-revision from preview")
     if args.expected_revision is not None and (not args.staged_feature or args.preflight
                                                 or args.expected_revision < 1):
         parser.error("--expected-revision requires staged preview or publish and a positive revision")
@@ -589,7 +617,7 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.preflight:
         result = preflight_worker(call_factory(worker_token, probe_url), settings, pool_id,
-                                  staged_feature=args.staged_feature)
+                                  staged_feature=args.staged_feature, direct_merge=args.direct_merge)
         save_json(args.output_dir / "worker-preflight.json", result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
@@ -599,11 +627,11 @@ def main(argv=None):
     target = Target(args.project_id, args.sandbox_profile, worker_url)
     if args.staged_feature:
         worker_health = preflight_worker(call_factory(worker_token, probe_url), settings, pool_id,
-                                        staged_feature=True)
+                                        staged_feature=True, direct_merge=args.direct_merge)
         save_json(args.output_dir / "worker-preflight.json", worker_health)
         api = call_factory(require_env("UNITY_FORMAL_STUDIO_TOKEN"), endpoint(args.api_url))
         result = install_staged_feature(target, api, pool_id, args.output_dir, publish=args.publish,
-                                        expected_revision=args.expected_revision)
+                                        expected_revision=args.expected_revision, direct_merge=args.direct_merge)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
 

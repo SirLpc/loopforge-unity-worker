@@ -98,7 +98,7 @@ def run_context(run, run_id, operation, project_id):
 FEATURE_NODES = {
     "clarify": "unity-scope", "design": "unity-planning", "implement": "unity-implementation",
     "review": "unity-review", "test": "unity-verification", "accept": "decision",
-    "mr": "unity-delivery", "deliver": None,
+    "mr": "unity-delivery", "merge": "unity-delivery", "deliver": None,
 }
 ASSIGNMENT = ("task_id", "pool_id", "slot_id", "base_commit")
 HUMAN_APPROVAL = b"# Approval\n\nApproved by a human gate.\n"
@@ -212,12 +212,14 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
     wf = run.get("workflowSnapshot", {})
     kinds = [(n.get("id"), n.get("type")) for n in wf.get("nodes", [])]
     edges = [(e.get("source"), e.get("target"), e.get("when")) for e in wf.get("edges", [])]
-    order = list(FEATURE_NODES)
+    delivery_node = "merge" if ("merge", "script") in kinds else "mr"
+    order = ("clarify", "design", "implement", "review", "test", "accept", delivery_node, "deliver")
     if (run.get("id") != run_id or run.get("workflowId") != workflow_id or wf.get("id") != workflow_id
             or wf.get("projectId") != project_id or run.get("executionContext", {}).get("projectId") != project_id
             or run.get("status") != "running" or run.get("pauseRequested") or run.get("cancelRequested")
-            or sorted(kinds) != sorted((n, "approval" if n == "accept" else "script") for n in order)
-            or sorted(edges) != sorted((a, b, "success") for a, b in zip(order, order[1:]))):
+            or len(kinds) != len(order) or set(kinds) != {(n, "approval" if n == "accept" else "script") for n in order}
+            or len(edges) != len(order) - 1 or set(edges) != {(a, b, "success") for a, b in zip(order, order[1:])}
+            or set(run["nodes"]) != set(order)):
         raise ContextError("Run is outside the installed staged feature flow")
     nodes = run["nodes"]
     active = [n for n, state in nodes.items() if state.get("status") == "running"]
@@ -234,6 +236,9 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
     scope = {"workflow_project_id": project_id, "workflow_id": workflow_id, "workflow_run_id": run_id}
     context = {**scope, "node_id": node, "node_attempt": attempt, "rework": rework, "feedback": feedback,
                "operation": "feature-" + ("delivery" if node == "deliver" else node)}
+    direct = delivery_node == "merge"
+    if direct:
+        context["delivery_mode"] = "direct-merge"
     if node == "implement" and rework:
         try:
             context["feedback"] = full_rejection_feedback(run, feedback, artifact_reader, telemetry_reader)
@@ -247,7 +252,7 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
         return context
 
     binding = dict(scope)
-    previous = approval_meta = checkout = None
+    previous = checkout = None
     for upstream in order[:order.index(node)]:
         prior = nodes[upstream]
         if prior.get("status") != "succeeded" or type(prior.get("attempt")) is not int or prior["attempt"] < 1:
@@ -256,7 +261,16 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
         if upstream == "accept":
             if raw != HUMAN_APPROVAL and not raw.startswith(HUMAN_APPROVAL + b"\n"):
                 raise ContextError("Current decision is not an approval by a human gate")
-            approval_meta = meta
+            claims = {k: v for k, v in binding.items() if k != "workflow_project_id"}
+            claims.update(project_id=project_id, accept_attempt=prior["attempt"], test_job_id=test_job_id,
+                          approval_artifact_id=meta["id"], approval_digest=meta["sha256"],
+                          test_artifact_id=previous["id"], test_digest=previous["sha256"])
+            if checkout is not None:
+                claims["commit_sha"] = checkout["commit_sha"]
+            if direct:
+                if checkout is None:
+                    raise ContextError("Direct merge requires the approved checkpoint")
+                claims["delivery_mode"] = "direct-merge"
             continue
         try:
             record = json.loads(raw)
@@ -293,18 +307,14 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
             if record.get("verification") != checked:
                 raise ContextError("Missing current successful test job")
             test_job_id = checked["test_job_id"]
-        if upstream == "mr" and record.get("approval_artifact_id") != approval_meta["id"]:
+        if upstream == delivery_node and record.get("approval_artifact_id") != claims["approval_artifact_id"]:
             raise ContextError("Delivery receipt references a different approval")
         previous = meta
     context["upstream"] = previous
-    if node == "mr":
-        claims = {k: v for k, v in binding.items() if k != "workflow_project_id"}
-        claims.update(project_id=project_id, accept_attempt=nodes["accept"]["attempt"], test_job_id=test_job_id,
-                      approval_artifact_id=approval_meta["id"], approval_digest=approval_meta["sha256"],
-                      test_artifact_id=previous["id"], test_digest=previous["sha256"])
-        if checkout is not None:
-            claims["commit_sha"] = checkout["commit_sha"]
+    if node == delivery_node:
         context["approval"] = sign_approval(claims, approval_key, now)
+    elif node == "deliver" and direct:
+        context["approved_claims"] = claims
     return context
 
 
@@ -499,7 +509,7 @@ def publish_workspace_contexts(workspace_root, context_secret, platform_call, pr
             run = platform_call("/api/runs/" + run_id)
             if (run.get("executionContext", {}).get("workspaceRunId") or run_id) != workspace_owner:
                 continue
-            if "clarify" in run.get("nodes", {}) and "mr" in run["nodes"]:
+            if "clarify" in run.get("nodes", {}):
                 if not approval_key:
                     continue
                 def artifact_reader(identifier):
