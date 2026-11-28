@@ -159,7 +159,7 @@ def permission_args(settings, cwd, *, review, planning=False):
         'default_permissions="unity_worker"', f"permissions.unity_worker.filesystem={filesystem}",
         "permissions.unity_worker.network.enabled=false", 'web_search="disabled"',
         'shell_environment_policy.inherit="core"', 'shell_environment_policy.exclude=["*TOKEN*","*KEY*","*SECRET*","*PASSWORD*","CODEX_HOME"]',
-        f'projects.{toml_string(cwd)}.trust_level="untrusted"',
+        f'projects={{{toml_string(cwd)}={{trust_level="untrusted"}}}}',
     )
     return [part for override in overrides for part in ("-c", override)]
 

@@ -31,6 +31,21 @@ class CodexOutputTests(unittest.TestCase):
                 self.assertIn(f'{toml_string(sibling)}="deny"', arguments)
                 self.assertIn(f'{toml_string(cwd)}="{"read" if read_only else "write"}"', arguments)
 
+    def test_strict_config_receives_project_trust_as_one_top_level_override(self):
+        import tomllib
+        from pathlib import Path
+        from types import SimpleNamespace
+        from codex_executor import permission_args
+
+        cwd = Path.cwd() / "acceptance slot"
+        settings = SimpleNamespace(project=cwd, codex_exe=str(cwd.parent / "codex.exe"),
+                                   codex_home=cwd.parent / "codex-home", codex_sandbox="mxc")
+        overrides = permission_args(settings, cwd, review=False)[1::2]
+        # Codex 0.172 validates the override key before decoding dynamic project names.
+        projects = [value for value in overrides if value.partition("=")[0] == "projects"]
+        self.assertEqual(len(projects), 1)
+        self.assertEqual(tomllib.loads(projects[0]), {"projects": {str(cwd): {"trust_level": "untrusted"}}})
+
     def test_root_project_protects_configured_caches_and_tracked_outputs(self):
         from pathlib import Path
         from types import SimpleNamespace
