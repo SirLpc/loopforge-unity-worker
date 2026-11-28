@@ -575,19 +575,22 @@ def preflight_worker(api, settings, pool_id, *, staged_feature=False, direct_mer
         for key, expected in direct_merge_target(settings, pool).items():
             if ready.get(key) != expected:
                 raise RuntimeError(f"Registered Worker pool {pool_id} {key} differs from the configured target")
-    slots = {slot["id"]: slot["status"] for slot in ready["slots"]}
+    slots = {slot["id"]: slot for slot in ready["slots"]}
     expected = {slot["id"]: slot.get("enabled", True) for slot in pool["slots"]}
     if slots.keys() != expected.keys():
         raise RuntimeError(f"Registered slots do not match the config for pool {pool_id}")
     for slot_id, enabled in expected.items():
-        if enabled and slots[slot_id] not in ("idle", "leased"):
-            raise RuntimeError(f"Worker slot {slot_id} is not ready: {slots[slot_id]}")
-        if not enabled and slots[slot_id] == "idle":
+        slot = slots[slot_id]
+        if direct_merge and slot.get("enabled") is not enabled:
+            raise RuntimeError(f"Worker slot {slot_id} enabled setting differs from the configured pool")
+        if enabled and slot["status"] not in ("idle", "leased"):
+            raise RuntimeError(f"Worker slot {slot_id} is not ready: {slot['status']}")
+        if not enabled and slot["status"] == "idle":
             raise RuntimeError(f"Worker slot {slot_id} is enabled on the server")
     if staged_feature:
         if not any(expected.values()):
             raise RuntimeError(f"Worker pool {pool_id} has no enabled slot")
-    elif "idle" not in slots.values():
+    elif not any(slot["status"] == "idle" for slot in slots.values()):
         raise RuntimeError(f"Worker pool {pool_id} has no idle enabled slot")
     return {"worker": worker, "pool": ready}
 

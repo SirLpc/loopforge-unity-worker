@@ -83,10 +83,12 @@ class PoolConfigTests(unittest.TestCase):
         with test_directory() as root:
             config, _, _ = self.pool_fixture(root)
             config["base_branch"] = "release/next"
+            config["pools"]["game"]["slots"][1]["enabled"] = False
             config["pools"]["game"]["direct_merge"] = True
             worker = DevelopmentWorker(self.config_loader()(config=config))
             self.addCleanup(worker.close)
             pool, = worker.pools()
+            self.assertEqual([s.get("enabled") for s in pool["slots"]], [True, False])
             self.assertEqual(pool.get("base_branch"), "release/next")
             self.assertEqual(pool.get("remote_identity"), config["pools"]["game"]["remote_identity"])
 

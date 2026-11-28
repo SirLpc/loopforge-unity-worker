@@ -37,6 +37,8 @@ def require(condition, message):
 
 def may_retry_merge(task, job):
     journal = task.get("merge_journal") or {}
+    if journal.get("status") == "abandoned":
+        return False
     if journal.get("status") == "confirmed":
         return True
     # The Worker enforces the same admission rules. Keep blocked verification on its original job and reports.

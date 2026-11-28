@@ -20,7 +20,8 @@ class InstallSopsTests(unittest.TestCase):
         self.responses = {
             "/api/v1/workers": {"workers": [{"worker_id": "worker-host", "status": "leased"}]},
             "/api/v1/pools": {"pools": [{"id": "game", "queued_count": 0, "slots": [
-                {"id": "primary", "status": "idle"}, {"id": "reserve", "status": "draining"},
+                {"id": "primary", "status": "idle", "enabled": True},
+                {"id": "reserve", "status": "draining", "enabled": False},
             ]}]},
         }
 
@@ -29,6 +30,8 @@ class InstallSopsTests(unittest.TestCase):
         return self.responses[path]
 
     def test_explicit_pool_probes_that_pool_even_when_default_pool_is_busy(self):
+        for slot in self.responses["/api/v1/pools"]["pools"][0]["slots"]:
+            del slot["enabled"]  # Legacy Workers only expose slot status.
         result = install_sops.preflight_worker(self.probe, self.settings, "game")
         self.assertEqual(result["pool"]["id"], "game")
         self.assertEqual(result["worker"]["worker_id"], "worker-host")
@@ -311,6 +314,8 @@ class InstallSopsTests(unittest.TestCase):
                                               (remote, {"remote_identity": "b" * 64}, "remote_identity"),
                                               (remote, {"remote_identity": None}, "remote_identity"),
                                               (remote["slots"][0], {"status": "unavailable"}, "primary"),
+                                              (remote["slots"][0], {"status": "leased", "enabled": False}, "primary"),
+                                              (remote["slots"][1], {"status": "leased", "enabled": True}, "reserve"),
                                               (self.responses["/api/v1/pools"], {"pools": []}, "game"),
                                               (self.settings["pools"]["game"], {"base_branch": "release"}, "preview")]:
                 with self.subTest(fields=fields), patch.dict(changed, fields), self.assertRaisesRegex((RuntimeError, ValueError), problem):

@@ -181,7 +181,7 @@ class DirectMergeGit:
         self._assert_candidate_identity(ctx, candidate)
         self._assert_checkout_contents(ctx, candidate.commit_sha)
 
-    def push(self, ctx, task: dict, candidate: MergeCandidate) -> None:
+    def push(self, ctx, task: dict, candidate: MergeCandidate, *, before_transport=None) -> None:
         workspace = self.workspace
         claims = (task.get("approval") or {}).get("claims") or {}
         if (claims.get("delivery_mode") != "direct-merge" or claims.get("commit_sha") != candidate.source_sha
@@ -202,6 +202,8 @@ class DirectMergeGit:
         if target != candidate.base_sha:
             raise StageError("merge_target_moved", "The target changed after verification", result={"target_sha": target})
         self.assert_remote_source(ctx, task, candidate.source_sha)
+        if before_transport is not None:
+            before_transport()
         try:
             # A literal endpoint avoids configured mirror refspecs; the exact lease also
             # rejects an intervening update that could itself fast-forward to the candidate.
@@ -636,7 +638,7 @@ def can_abandon_merge(task, *, terminal_status=None):
     status = task["status"] if terminal_status is None else terminal_status
     journal = task.get("merge_journal")
     return (status in {"failed", "cancelled"} and not task.get("delivery") and not task.get("pushed")
-            and (journal is None or (journal.get("status") == "building"
+            and (journal is None or (journal.get("status") in {"building", "verified", "abandoned"}
                                      and not journal.get("push_acknowledged") and not journal.get("receipt"))))
 
 
@@ -661,7 +663,13 @@ def recover_merge_checkout(ctx, *, released=False, abandonment_status=None):
             or journal["remote_identity"] != workspace.remote_identity(ctx)
             or workspace.text(ctx, "rev-parse", "--verify", "refs/heads/" + task["task_branch"]) != source):
         raise StageError("workspace_changed", "The merge operation no longer matches its task and assignment")
-    if released or task.get("current_stage") == "delivered":
+    unsaved_resolution = journal and journal.get("conflict_paths") and not journal.get("merge_sha")
+    # Only the operator reattaches the task branch at these stages, except during a reserved rebuild.
+    expects_candidate = journal and (journal["status"] == "verified" or unsaved_resolution)
+    if not released and journal and (journal["status"] == "abandoned" or (
+            expects_candidate and not journal.get("rebuild_target") and git._current_branch(ctx))):
+        abandonment_status = "failed"
+    if released or abandonment_status or task.get("current_stage") == "delivered":
         if abandonment_status is not None:
             if not can_abandon_merge(task, terminal_status=abandonment_status):
                 raise StageError("workspace_changed", "The merge transport state no longer permits abandonment")
@@ -674,7 +682,9 @@ def recover_merge_checkout(ctx, *, released=False, abandonment_status=None):
         workspace.assert_task_push_target(ctx, task)
         workspace.checkout_is(ctx, task, source)
         git._assert_checkout_contents(ctx, source)
-    elif journal.get("conflict_paths") and not journal.get("merge_sha"):
+        if not released and abandonment_status and journal["status"] != "abandoned":
+            _save_journal(ctx, journal, status="abandoned")
+    elif unsaved_resolution:
         git.adopt_resolution(ctx, task, journal)
     elif journal["status"] == "confirmed" or journal.get("rebuild_target"):
         _restore_operation(ctx, git, journal)
@@ -732,7 +742,7 @@ def _verify_for_push(ctx, git, journal, evidence, solve, verify):
         journal.pop("verification_failure", None)
     if not isinstance(checked, dict) or not checked:
         raise StageError("verification_failed", "Candidate verification returned no evidence")
-    return candidate, _save_journal(ctx, journal, status="in_flight", verification=checked)
+    return candidate, _save_journal(ctx, journal, status="verified", verification=checked)
 
 
 def _confirmed(ctx, git, journal, target, landed, verification, paths):
@@ -765,7 +775,7 @@ def land_approved(ctx, *, solve, verify) -> dict:
                "task_branch": task["task_branch"], "remote_identity": task["remote_identity"]}
     journal = task.get("merge_journal")
     if journal is not None and (any(journal.get(k) != v for k, v in binding.items())
-                                or journal.get("status") not in {"building", "in_flight", "confirmed"}):
+                                or journal.get("status") not in {"building", "verified", "in_flight", "confirmed"}):
         raise StageError("workspace_changed", "The merge journal belongs to a different approval or target")
 
     target = git.read_target(ctx, task)
@@ -777,6 +787,11 @@ def land_approved(ctx, *, solve, verify) -> dict:
             raise StageError("merge_target_rewritten", "The target no longer contains the task's original base")
         git.assert_remote_source(ctx, task, source)
         journal = _save_journal(ctx, binding, base_sha=target, status="building", rebuilds=0)
+
+    def mark_in_flight():
+        nonlocal journal
+        if journal["status"] == "verified":
+            journal = _save_journal(ctx, journal, status="in_flight")
 
     while True:
         base, status = journal["base_sha"], journal["status"]
@@ -790,10 +805,13 @@ def land_approved(ctx, *, solve, verify) -> dict:
             return _confirmed(ctx, git, journal, target, receipt["merge_sha"], receipt["verification"],
                               receipt["conflict_paths"])
 
-        if status == "in_flight":
+        if status in {"verified", "in_flight"}:
             candidate = _candidate_from(journal)
             git._assert_candidate_identity(ctx, candidate)
             if git.contains(ctx, candidate.commit_sha, target):
+                if status == "verified":
+                    # Another writer landed this pin before our transport. Its approval must still be current.
+                    git.assert_remote_source(ctx, task, source)
                 return _confirmed(ctx, git, journal, target, candidate.commit_sha,
                                   journal["verification"], candidate.conflict_paths)
             if journal.get("push_acknowledged"):
@@ -820,7 +838,7 @@ def land_approved(ctx, *, solve, verify) -> dict:
             candidate, journal = _verify_for_push(ctx, git, journal, evidence, solve, verify)
 
         try:
-            git.push(ctx, task, candidate)
+            git.push(ctx, task, candidate, before_transport=mark_in_flight)
         except StageError as error:
             if error.kind == "merge_target_moved":
                 target = error.result["target_sha"]

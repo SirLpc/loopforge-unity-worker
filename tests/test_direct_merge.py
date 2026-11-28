@@ -396,6 +396,7 @@ class DirectMergeTests(unittest.TestCase):
         return land_approved(ctx, solve=unexpected, verify=verify or unexpected)
 
     def test_retries_once_when_target_advances_before_push(self):
+        from direct_merge import can_abandon_merge
         for persistent in (False, True):
             with self.subTest(persistent=persistent), test_directory() as root:
                 ctx, remote, checkout, author, source = self.approved(root)
@@ -411,6 +412,7 @@ class DirectMergeTests(unittest.TestCase):
                     with self.assertRaises(StageError):
                         self.land(ctx, verify)
                     self.assert_remote_refs(remote, external[-1], source)
+                    self.assertTrue(can_abandon_merge(ctx.task, terminal_status="failed"))
                     with self.assertRaises(StageError):
                         self.land(ctx, verify)
                 else:
@@ -423,11 +425,55 @@ class DirectMergeTests(unittest.TestCase):
                 self.assertEqual(len(verified), 2)
                 self.assertNotEqual(*verified)
 
+    def test_interrupted_final_checks_resume_verified_pin_without_reverification(self):
+        from direct_merge import DirectMergeGit
+        with test_directory() as root:
+            ctx, remote, _, _, source = self.approved(root)
+            base = git(remote, "rev-parse", "main")
+            check_source = DirectMergeGit.assert_remote_source
+
+            def interrupt_final_check(merge, ctx, task, source):
+                if (task.get("merge_journal") or {}).get("verification"):
+                    raise InterruptedError("interrupted during final pretransport checks")
+                check_source(merge, ctx, task, source)
+
+            with patch.object(DirectMergeGit, "assert_remote_source", interrupt_final_check):
+                with self.assertRaises(InterruptedError):
+                    self.land(ctx, lambda _, c: {"checked": c.commit_sha})
+            self.assert_remote_refs(remote, base, source)
+            journal = ctx.task["merge_journal"]
+            self.assertEqual(journal["status"], "verified")
+            receipt = self.land(ctx)
+            self.assertEqual(receipt["merge_sha"], journal["merge_sha"])
+            self.assert_remote_refs(remote, receipt["merge_sha"], source)
+
+    def test_independently_landed_verified_pin_still_checks_source_before_delivery(self):
+        with test_directory() as root:
+            ctx, remote, checkout, author, source = self.approved(root)
+            def verify(ctx, candidate):
+                # An independent writer has access to the same candidate. The Worker has not sent a push.
+                git(author, "fetch", str(checkout), candidate.commit_sha)
+                git(author, "push", "origin", candidate.commit_sha + ":refs/heads/main")
+                git(author, "fetch", "origin", TASK_BRANCH)
+                git(author, "switch", "-c", TASK_BRANCH, "FETCH_HEAD")
+                write(author, "new.txt", b"unapproved source")
+                self.publish(author, TASK_BRANCH)
+                return {"checked": candidate.commit_sha}
+
+            with self.assertRaises(StageError) as rejected:
+                self.land(ctx, verify)
+            self.assertEqual(rejected.exception.kind, "push_conflict")
+            self.assertEqual(ctx.task["merge_journal"]["status"], "verified")
+            self.assertNotEqual(git(remote, "rev-parse", TASK_BRANCH), source)
+            self.assertEqual(git(remote, "rev-parse", "main"), ctx.task["merge_journal"]["merge_sha"])
+
     def test_reconciles_lost_push_ack_after_a_further_main_commit(self):
         with test_directory() as root:
             ctx, remote, checkout, author, source = self.approved(root)
             run = ctx.run
             def lose_ack(argv, *args, **kwargs):
+                if "push" in argv:
+                    self.assertEqual(ctx.task["merge_journal"]["status"], "in_flight")
                 result = run(argv, *args, **kwargs)
                 if "push" in argv:
                     self.assertEqual(result.exit_code, 0)

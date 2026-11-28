@@ -718,8 +718,8 @@ class WorkflowDeliveryTests(WorkflowFixture):
             worker = client.app.state.worker
             real_push = DirectMergeGit.push
 
-            def interrupted_push(git_merge, ctx, record, candidate):
-                real_push(git_merge, ctx, record, candidate)
+            def interrupted_push(git_merge, ctx, record, candidate, **kwargs):
+                real_push(git_merge, ctx, record, candidate, **kwargs)
                 raise StageError("recovery_required", "Worker stopped before persisting acknowledgement")
 
             with patch.object(DirectMergeGit, "push", interrupted_push):
@@ -778,6 +778,87 @@ class WorkflowDeliveryTests(WorkflowFixture):
                 delivered = self.merge_job(client, task)
             self.assertEqual(delivered["status"], "succeeded", delivered)
             self.assertEqual(git(self.remote, "rev-parse", "main"), candidate)
+
+    def test_interrupted_solver_can_recover_and_release_after_operator_restores_source(self):
+        with self.direct_client() as client:
+            task = self.direct_task(client, conflict=True)
+            task_id = task["task_id"]
+            base = self.advance_target(conflict=True)
+            source = task["verification"]["checkout"]["commit_sha"]
+            worker = client.app.state.worker
+
+            def interrupt_solver(ctx, prompt, *, review=False):
+                worker.store.recover_interrupted(ctx.job["job_id"])
+                raise StageError("recovery_required", "Solver interrupted before pinning a resolution")
+
+            with patch.object(self.agent, "execute", side_effect=interrupt_solver):
+                job = self.merge_job(client, task)
+            self.assertEqual(job["status"], "recovery_required", job)
+            journal = self.task(client, task_id)["merge_journal"]
+            self.assertTrue(journal["resolution_id"])
+            self.assertNotIn("merge_sha", journal)
+            self.assertTrue((self.project / ".git/MERGE_HEAD").is_file())
+            archived = self.root / "archived-conflict.cs"
+            archived.write_bytes((self.project / "Example.cs").read_bytes())
+            git(self.project, "merge", "--abort")
+            git(self.project, "switch", task["task_branch"])
+            self.assertEqual(git(self.project, "rev-parse", "HEAD"), source)
+            dirty = self.project / "operator.meta"
+            dirty.touch()
+            recovery = client.post(f"/api/v1/tasks/{task_id}/recover", headers={"Authorization": f"Bearer {APPROVER}"},
+                                   json={"request_id": str(uuid4()), "confirmed_stopped": True, "note": "Stopped"})
+            self.assertEqual(self.wait(client, recovery.json()["job_id"])["status"], "failed")
+            self.assertTrue(dirty.exists())
+            dirty.rename(self.root / "archived-operator.meta")
+            self.recover(client, task_id)
+            self.assertEqual(self.deliver(client, task, self.direct_proof(task)).status_code, 409)
+            self.assertEqual(self.stage(client, task_id, "release")["status"], "succeeded")
+            current = self.task(client, task_id)
+            self.assertEqual(current["status"], "failed")
+            self.assertFalse(current["lease"])
+            self.assertFalse(current.get("delivery"))
+            self.assertFalse(current["pushed"])
+            self.assertEqual(current["merge_journal"]["conflict_paths"], ["Example.cs"])
+            self.assertEqual(current["merge_journal"]["resolution_id"], journal["resolution_id"])
+            self.assertIn(b"<<<<<<<", archived.read_bytes())
+            self.assertEqual(git(self.remote, "rev-parse", "main"), base)
+
+    def test_source_drift_during_verification_allows_release_after_operator_restores_source(self):
+        with self.direct_client() as client:
+            task = self.direct_task(client)
+            task_id = task["task_id"]
+            base = self.advance_target()
+            worker = client.app.state.worker
+            unity = worker.workspaces[task["slot_id"]].unity
+            run = unity.run
+
+            def move_source(ctx, mode, **kwargs):
+                if mode == "compile":
+                    other = self.root / "other"
+                    git(other, "switch", task["task_branch"])
+                    (other / "unapproved.txt").write_text("new source")
+                    git(other, "add", "unapproved.txt")
+                    git(other, "commit", "-m", "new source during verification")
+                    git(other, "push", "origin", task["task_branch"])
+                return run(ctx, mode, **kwargs)
+
+            with patch.object(unity, "run", side_effect=move_source):
+                failed = self.merge_job(client, task)
+            self.assertEqual(failed["failure_kind"], "push_conflict", failed)
+            self.assertEqual(self.deliver(client, task, self.direct_proof(task)).status_code, 409)
+            candidate = git(self.project, "rev-parse", "HEAD")
+            git(self.project, "switch", task["task_branch"])
+            self.assertEqual(self.stage(client, task_id, "release")["status"], "succeeded")
+            current = self.task(client, task_id)
+            self.assertEqual(current["merge_journal"]["merge_sha"], candidate)
+            self.assertTrue(current["merge_journal"]["verification"])
+            self.assertEqual(current["status"], "failed")
+            self.assertFalse(current["lease"])
+            self.assertFalse(current.get("delivery"))
+            self.assertFalse(current["pushed"])
+            self.assertEqual(git(self.remote, "rev-parse", "main"), base)
+            self.assertNotEqual(git(self.remote, "rev-parse", task["task_branch"]),
+                                task["verification"]["checkout"]["commit_sha"])
 
     def test_operator_restored_unlanded_conflict_can_release_failed_task(self):
         with self.direct_client() as client:

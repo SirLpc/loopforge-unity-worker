@@ -633,6 +633,8 @@ class DevelopmentWorker:
         failure = task.get("failure_kind")
         if direct:
             journal = task.get("merge_journal") or {}
+            if journal.get("status") == "abandoned":
+                raise RequestConflict("The operator recovered the source checkout and abandoned this merge")
             if stage == "merge" and journal.get("status") == "confirmed":
                 # land_approved rechecks remote history and resumes only local restoration and receipt storage.
                 return "merge"

@@ -157,7 +157,7 @@ class PoolScheduler:
                 status = "draining"
             else:
                 status = "idle"
-            slots.append({"id": slot.id, "status": status,
+            slots.append({"id": slot.id, "status": status, "enabled": slot.enabled,
                           "task_id": task["task_id"] if task else None,
                           "current_stage": task["current_stage"] if task else None})
         return {"id": pool.id, "direct_merge": pool.direct_merge, "base_branch": pool.policy.base_branch,
