@@ -7,6 +7,7 @@ import stat
 from dataclasses import dataclass, field, replace
 from hashlib import file_digest, sha256
 from pathlib import PurePosixPath
+from uuid import uuid4
 
 from git_workspace import SHA, GitWorkspace
 from process_runner import StageError
@@ -38,6 +39,11 @@ class MergeCandidate:
     outside_fingerprints: tuple[tuple[str, bytes], ...] = field(default=(), repr=False, compare=False)
     task_branch: str | None = field(default=None, repr=False, compare=False)
     remote_identity: str | None = field(default=None, repr=False, compare=False)
+    resolution_id: str | None = field(default=None, repr=False, compare=False)
+
+    def _resolution_reflog(self):
+        record = [self.resolution_id, self.base_sha, self.source_sha, self.commit_sha, self.tree_sha, self.conflict_paths]
+        return "unity-worker resolved " + sha256(json.dumps(record).encode("ascii")).hexdigest()
 
 
 class DirectMergeGit:
@@ -531,13 +537,36 @@ class DirectMergeGit:
         candidate = replace(candidate, commit_sha=sha, tree_sha=tree, index_entries=(), outside_fingerprints=(),
                             task_branch=None, remote_identity=None)
         self._assert_candidate_identity(ctx, candidate)
-        workspace.git(ctx, "update-ref", self._pin_ref(task), sha, candidate.base_sha)
+        record = ("--create-reflog", "-m", candidate._resolution_reflog()) if candidate.resolution_id else ()
+        workspace.git(ctx, "update-ref", *record, self._pin_ref(task), sha, candidate.base_sha)
         workspace.git(ctx, "update-ref", "--no-deref", "HEAD", sha, candidate.base_sha)
         workspace.git(ctx, "merge", "--quit")
         if lfs:
             workspace.hydrate_lfs(ctx, workspace.cfg.git_remote, lfs_url=url)
         self.assert_clean_candidate(ctx, candidate)
         return candidate
+
+    def adopt_resolution(self, ctx, task, journal):
+        """Recover the exact solved pin when its Git transition preceded the task save."""
+        pin = self.pin(ctx, task)
+        paths = journal["conflict_paths"]
+        evidence = {"conflict_paths": paths, "base_sha": journal["base_sha"], "pinned_sha": pin or None}
+        if not journal.get("resolution_id") or not pin or pin == journal["base_sha"]:
+            raise StageError("merge_resolution_scope", "A solver was admitted but its completed pin is unavailable",
+                             result=evidence)
+        try:
+            tree = self.workspace.text(ctx, "rev-parse", "--verify", pin + "^{tree}")
+            candidate = MergeCandidate(journal["source_sha"], journal["base_sha"], tuple(paths), pin, tree,
+                                       resolution_id=journal["resolution_id"])
+            self.assert_clean_candidate(ctx, candidate)
+            entry = self.workspace.text(ctx, "reflog", "-1", "--format=%H%x09%gs", self._pin_ref(task))
+            if entry != f"{pin}\t{candidate._resolution_reflog()}" or self.pin(ctx, task) != pin:
+                raise StageError("merge_resolution_scope", "The pin does not record this solver's completed candidate")
+            self._assert_detached(ctx, pin)
+            return candidate
+        except StageError as error:
+            error.result.update(evidence)
+            raise
 
     def _assert_candidate_identity(self, ctx, candidate):
         workspace = self.workspace
@@ -613,9 +642,10 @@ def _verify_for_push(ctx, git, journal, evidence, solve, verify):
         _restore_operation(ctx, git, journal)
         candidate = git.begin(ctx, task, journal["source_sha"], journal["base_sha"])
         if candidate.conflict_paths:
-            journal = _save_journal(ctx, journal, conflict_paths=list(candidate.conflict_paths))
+            journal = _save_journal(ctx, journal, conflict_paths=list(candidate.conflict_paths),
+                                    resolution_id=uuid4().hex)
             solve(ctx, candidate)
-            candidate = git.resolve(ctx, candidate)
+            candidate = git.resolve(ctx, replace(candidate, resolution_id=journal["resolution_id"]))
         journal = _save_journal(ctx, journal, merge_sha=candidate.commit_sha,
                                 tree_sha=candidate.tree_sha, conflict_paths=list(candidate.conflict_paths))
 
@@ -675,6 +705,9 @@ def land_approved(ctx, *, solve, verify) -> dict:
 
     while True:
         base, status = journal["base_sha"], journal["status"]
+        if journal.get("conflict_paths") and not journal.get("merge_sha"):
+            candidate = git.adopt_resolution(ctx, task, journal)
+            journal = _save_journal(ctx, journal, merge_sha=candidate.commit_sha, tree_sha=candidate.tree_sha)
         if status == "confirmed":
             receipt = journal["receipt"]
             if not git.contains(ctx, receipt["merge_sha"], target):

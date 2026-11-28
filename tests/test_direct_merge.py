@@ -686,20 +686,24 @@ class DirectMergeTests(unittest.TestCase):
             merge.push(ctx, task, candidate)
             self.assert_remote_refs(remote, candidate.commit_sha, source)
 
+    def approved_conflict(self, root):
+        workspace, ctx, remote, checkout, author, task = self.repository(root, path=SCRIPT)
+        write(checkout, SCRIPT, SOURCE)
+        source = self.publish(checkout, TASK_BRANCH)
+        write(author, SCRIPT, TARGET)
+        base = self.publish(author, "main")
+        revision = git(checkout, "rev-parse", "HEAD^{tree}")
+        task.update(approved_revision=revision, approval={"claims": {"delivery_mode": "direct-merge",
+                    "commit_sha": source, "revision": revision, "test_job_id": "test-job"}},
+                    verification={"test_job_id": "test-job", "revision": revision,
+                                  "checkout": {"branch": TASK_BRANCH, "commit_sha": source}})
+        ctx.task, ctx.workspace, ctx.save = task, SimpleNamespace(git=workspace), task.update
+        return ctx, remote, checkout, source, base, revision
+
     def test_conflict_equal_to_source_still_verifies_and_resumes_the_same_solution(self):
         from direct_merge import land_approved
         with test_directory() as root:
-            workspace, ctx, remote, checkout, author, task = self.repository(root, path=SCRIPT)
-            write(checkout, SCRIPT, SOURCE)
-            source = self.publish(checkout, TASK_BRANCH)
-            write(author, SCRIPT, TARGET)
-            base = self.publish(author, "main")
-            revision = git(checkout, "rev-parse", "HEAD^{tree}")
-            task.update(approved_revision=revision, approval={"claims": {"delivery_mode": "direct-merge",
-                        "commit_sha": source, "revision": revision, "test_job_id": "test-job"}},
-                        verification={"test_job_id": "test-job", "revision": revision,
-                                      "checkout": {"branch": TASK_BRANCH, "commit_sha": source}})
-            ctx.task, ctx.workspace, ctx.save = task, SimpleNamespace(git=workspace), task.update
+            ctx, remote, checkout, source, base, revision = self.approved_conflict(root)
             def solve(_, candidate):
                 self.assertEqual(candidate.conflict_paths, (SCRIPT,))
                 write(checkout, SCRIPT, SOURCE)
@@ -718,3 +722,53 @@ class DirectMergeTests(unittest.TestCase):
             self.assertEqual(receipt["conflict_paths"], [SCRIPT])
             self.assertEqual(receipt["verification"], {"candidate_check": receipt["merge_sha"]})
             self.assert_remote_refs(remote, receipt["merge_sha"], source)
+
+    def test_recovers_solver_commit_if_candidate_journal_save_was_interrupted(self):
+        from direct_merge import land_approved
+        for fault in ("intact", "replaced", "restored"):
+            with self.subTest(fault=fault), test_directory() as root:
+                ctx, remote, checkout, source, base, _ = self.approved_conflict(root)
+                solved, finished = [], []
+                def solve(_, candidate):
+                    solved.append(candidate.conflict_paths)
+                    write(checkout, SCRIPT, SOURCE)
+                def interrupt_save(**changes):
+                    row = changes["merge_journal"]
+                    if row.get("merge_sha"):
+                        finished.append(row["merge_sha"])
+                        raise InterruptedError("solver finished, candidate journal was not saved")
+                    ctx.task.update(changes)
+                ctx.save = interrupt_save
+                with self.assertRaises(InterruptedError):
+                    land_approved(ctx, solve=solve, verify=None)
+                first, = finished
+                self.assertEqual(git(checkout, "rev-parse", "HEAD"), first)
+                self.assertEqual(ctx.task["merge_journal"]["conflict_paths"], [SCRIPT])
+                self.assertNotIn("merge_sha", ctx.task["merge_journal"])
+                self.assert_remote_refs(remote, base, source)
+                ctx.save = ctx.task.update
+                pin = "refs/unity-worker/direct-merge/" + TASK_BRANCH.split("/")[1]
+                if fault == "intact":
+                    receipt = land_approved(ctx, solve=solve, verify=lambda _, c: {"checked": c.commit_sha})
+                    self.assertEqual(receipt["merge_sha"], first)
+                    self.assertEqual(receipt["verification"], {"checked": first})
+                    self.assert_remote_refs(remote, first, source)
+                else:
+                    if fault == "replaced":
+                        # Preserve the exact parents, tree and a clean detached checkout,
+                        # but replace the private ref with an unrelated commit.
+                        head = git(checkout, "commit-tree", first + "^{tree}", "-p", base, "-p", source,
+                                   "-m", "Independent resolution")
+                        git(checkout, "switch", "--detach", head)
+                        label = git(checkout, "reflog", "-1", "--format=%gs", pin)
+                        git(checkout, "update-ref", "-m", label, pin, head, first)
+                    else:
+                        head = source
+                        git(checkout, "switch", TASK_BRANCH)
+                        git(checkout, "update-ref", "-d", pin, first)
+                    with self.assertRaises(StageError) as failure:
+                        land_approved(ctx, solve=solve, verify=lambda _, c: {"checked": c.commit_sha})
+                    self.assertEqual(failure.exception.result["conflict_paths"], [SCRIPT])
+                    self.assertEqual(git(checkout, "rev-parse", "HEAD"), head)
+                    self.assert_remote_refs(remote, base, source)
+                self.assertEqual(solved, [(SCRIPT,)])
