@@ -15,6 +15,19 @@
 
 编译验收使用 Unity 2022.3 的 BatchMode 导入及退出证据。EditMode 和 PlayMode 使用 Test Framework 的 -runTests、-testPlatform 和 -testResults，分别校验 XML。 [Unity 2022.3 Editor 参数](https://docs.unity3d.com/2022.3/Documentation/Manual/EditorCommandLineArguments.html) [Unity Test Framework 1.1 参数](https://docs.unity3d.com/Packages/com.unity.test-framework@1.1/manual/reference-command-line.html)
 
+## Windows Worker 签名直接合入验收
+
+在已安装 `requirements-dev.txt`、Windows Git 和 Unity Test Framework 依赖的独立检出中运行以下命令。每次运行会新建一个 `.tmp-test-unity-*` 目录，保留 bare 远端、工程、Worker 数据库、编译日志和 XML。生成的临时签名密钥仅用于本次进程内的 Worker HTTP 服务。
+
+~~~~powershell
+.\.venv\Scripts\python.exe tests/windows_unity_acceptance.py 'C:\UnityVersions\2022.3.62f3\Editor\Unity.exe' --direct-merge
+~~~~
+
+脚本通过 Worker API 受理两个任务。每个任务都在发布测试通过的检查点后，令独立检出修改同一行 C# 并推进 `main`。规划、实现、冲突解法和独立评审使用确定性夹具。Git 与 Unity 使用本机可执行文件。每个 Editor 进程的默认超时是 240 秒，慢速机器可加 `--timeout 1200`。
+
+- 第一个合并必须保留双方改动。候选重新编译，并在 EditMode 和 PlayMode 各运行一个引用实际业务代码的定向断言。脚本读取候选 XML，检查合并提交的双亲、签名绑定的任务 SHA、bare 远端目标 SHA 和槽位归还结果。
+- 第二个解法故意丢掉任务的改动，候选 EditMode 必须报告断言失败。脚本检查 bare 远端 `main` 仍指向合并前的基线，任务分支和失败现场的租约均保留。每个任务结束时输出 JSON，可据其中的任务和作业 ID 核对日志。
+
 ## LoopForge 与真实工具
 
 - [ ] 用专用账号启动 Worker，从 Windows、WSL2、LoopForge Docker 脚本分别获取 /health。非法 Token 返回 401。已有 MVP smoke 幂等并有真实 Unity 日志。
@@ -40,6 +53,7 @@
 ## 本机证据
 
 - Unity 2022.3.62f3 与 Unity Test Framework 1.1.33 已在独立工程实测。通过正常编译、EditMode 1 个测试、PlayMode 1 个测试。故意失败的断言被分类为 tests_failed，故意的 C# 语法错误被分类为 compile_failed。
+- 2026-11-28，直接合入验收在 Unity 2022.3.62f3 上跑完两次签名交付。正确解法的候选 `318812753374cc24801111c855e9f32284c176a7` 通过编译、EditMode 和 PlayMode 各一个定向用例；Worker 确认远端指向该提交并归还槽位。第二个候选的 EditMode 得到 1，预期值为 2，Worker 保留现场租约，远端 `main` 保持在本次交付的基线 `1a6419d066d6e0201cf8b616190df9d2cb8933f1`。
 - Codex CLI 0.172.0 的 MXC 权限探针已实测，包含工程内写入、Git 元数据写入阻断、工程外读取阻断和独立审查目录只读。该探针不调用模型。elevated 后备模式需在目标账号的预配环境重新验证。
 - Windows 临时 Worker 已通过同一 LoopForge Docker 镜像及 Compose 网络的 `/health` 调用。
 - 隔离功能 SOP 通过 LoopForge Runner、签名中继和原生 Windows Worker 跑完八个节点。设计引用已在同一租约的基础提交核实。第一次人工验收打回后，Worker 收到完整意见。第二轮的真实 Unity EditMode 和 PlayMode XML 各通过一个定向用例。一次批准后，隔离的 bare Git 远端任务分支指向交付记录中的提交，其 Git 树与本轮通过测试的树一致，基础分支 SHA 保持原值，Worker 归还槽位。
