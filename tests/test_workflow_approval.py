@@ -498,3 +498,278 @@ class WorkflowDeliveryTests(WorkflowFixture):
             self.assertEqual((recovered["action"], recovered["status"]), ("commit", "succeeded"), recovered)
             self.assertEqual(recovered["stage_result"]["commit_sha"], commit)
             self.assertTrue(self.task(client, task["task_id"])["pushed"])
+
+    def direct_client(self):
+        from dataclasses import replace
+        from fastapi.testclient import TestClient
+        from test_planning import PlanningAgent
+        from worker import create_app
+        from worker_config import Settings, legacy_service
+
+        with patch.dict(os.environ, {"UNITY_WORKER_WORKFLOW_APPROVAL_KEY": self.key}):
+            settings = replace(Settings.load(), test_assemblies={"editmode": ("Tests",), "playmode": ("PlayTests",)},
+                               test_modes=("editmode", "playmode"))
+        cfg = legacy_service(settings)
+        pool = cfg.pools[cfg.default_pool]
+        cfg.pools[pool.id] = replace(pool, direct_merge=True)
+        cfg = replace(cfg, implicit=False)
+        self.agent = PlanningAgent(self.project)
+        original_plan = self.agent.plan
+
+        def scoped_plan(ctx, briefing):
+            plan = original_plan(ctx, briefing)
+            plan["test_selection"]["playmode"] = [{"assembly": "PlayTests", "fixtures": ["Game.UnitTests"]}]
+            return plan
+
+        self.agent.plan = scoped_plan
+        return TestClient(create_app(cfg, runner=self.runner, agent=self.agent),
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+
+    def direct_task(self, client, *, conflict=False, mode=True):
+        if conflict:
+            source = self.project / "Example.cs"
+            source.write_text("class Base {}\n")
+            git(self.project, "add", "Example.cs")
+            git(self.project, "commit", "-m", "original class")
+            git(self.project, "push", "origin", "main")
+        execute = self.agent.execute
+
+        def edit(ctx, prompt, *, review=False):
+            result = execute(ctx, prompt, review=review)
+            if not review:
+                (self.project / "hello.txt").write_text(ctx.task["task_id"] + "\n")
+                if conflict:
+                    source.write_text("class Feature {}\n")
+            return result
+
+        options = {"delivery_mode": "direct-merge"} if mode else {}
+        task_id = self.accepted_staged_plan(client, publish_checkpoints=True, **options)
+        with patch.object(self.agent, "execute", side_effect=edit):
+            result = self.stage(client, task_id, "run")
+            self.assertEqual(result["status"], "succeeded", result)
+        return self.task(client, task_id)
+
+    def advance_target(self, *, conflict=False):
+        other = self.root / "other"
+        git(self.root, "clone", str(self.remote), str(other))
+        path = "Example.cs" if conflict else "concurrent.txt"
+        (other / path).write_text("class Main {}\n")
+        git(other, "add", path)
+        git(other, "commit", "-m", "concurrent target edit")
+        git(other, "push", "origin", "main")
+        return git(other, "rev-parse", "HEAD")
+
+    def direct_proof(self, task):
+        return envelope({**claims_for(task), "delivery_mode": "direct-merge"}, self.key, int(time.time()))
+
+    def merge_job(self, client, task, request_id=None):
+        response = self.deliver(client, task, self.direct_proof(task), request_id)
+        self.assertEqual(response.status_code, 202, response.text)
+        return self.wait(client, response.json()["job_id"])
+
+    def test_direct_delivery_requires_signed_mode_and_pool_opt_in(self):
+        from dataclasses import replace
+
+        with self.direct_client() as client:
+            self.assertIn("staged-feature-direct-merge", client.get("/api/v1/workers").json()["workers"][0]["capabilities"])
+            task = self.direct_task(client)
+            task_id = task["task_id"]
+            claims, now = claims_for(task), int(time.time())
+            proof = self.direct_proof(task)
+            self.assertEqual(self.deliver(client, task, envelope(claims, self.key, now)).status_code, 409)
+            self.assertEqual(self.deliver(client, task, {**proof, "signature": "0" * 64}).status_code, 403)
+            missing_sha = {key: value for key, value in proof["claims"].items() if key != "commit_sha"}
+            self.assertEqual(self.deliver(client, task, envelope(missing_sha, self.key, now)).status_code, 403)
+            for action in ("commit", "merge", "pr"):
+                body = {"revision": task["revision"]} if action == "commit" else {}
+                response = client.post(f"/api/v1/tasks/{task_id}/{action}", json={"request_id": str(uuid4()), **body})
+                self.assertIn(response.status_code, (409, 422))
+            pools = client.app.state.worker.cfg.pools
+            pool = pools[task["pool_id"]]
+            self.assertIs(client.get("/api/v1/pools").json()["pools"][0]["direct_merge"], True)
+            with patch.dict(pools, {pool.id: replace(pool, direct_merge=False)}):
+                self.assertEqual(self.deliver(client, task, proof).status_code, 409)
+            self.assertEqual(git(self.remote, "rev-parse", "main"), task["base_commit"])
+            request_id = str(uuid4())
+            job = self.merge_job(client, task, request_id)
+            self.assertEqual((job["action"], job["status"]), ("merge", "succeeded"), job)
+            self.assertEqual(self.merge_job(client, task, request_id)["job_id"], job["job_id"])
+            self.assertEqual(self.deliver(client, task, envelope(claims, self.key, now), request_id).status_code, 409)
+            self.stage(client, task_id, "release")
+            legacy = self.direct_task(client, mode=False)
+            self.assertEqual(self.deliver(client, legacy, self.direct_proof(legacy)).status_code, 409)
+
+    def check_candidate_failure(self, fault, expected):
+        with self.direct_client() as client:
+            task = self.direct_task(client)
+            base = self.advance_target()
+            if fault in ("broken_compile", "broken_tests"):
+                (self.root / fault).touch()
+            workspace = client.app.state.worker.workspaces[task["slot_id"]]
+            run = workspace.unity.run
+            calls = []
+
+            def unity(ctx, mode, **kwargs):
+                self.assertEqual(git(self.project, "branch", "--show-current"), "")
+                calls.append(mode)
+                result = run(ctx, mode, **kwargs)
+                if fault == "drift":
+                    (self.project / "unexpected.meta").write_text("unapproved\n")
+                return result
+
+            with patch.object(workspace.unity, "run", side_effect=unity):
+                job = self.merge_job(client, task)
+            self.assertEqual(job["failure_kind"], expected, job)
+            journal = self.task(client, task["task_id"])["merge_journal"]
+            failure = journal.get("verification_failure") or {}
+            self.assertEqual(failure.get("kind"), expected, journal)
+            self.assertEqual(failure["result"]["step"], "editmode" if fault == "broken_tests" else "compile")
+            self.assertEqual(calls, ["compile", "editmode"] if fault == "broken_tests" else ["compile"])
+            self.assertEqual(git(self.remote, "rev-parse", "main"), base)
+            for key in ("verification", "test_report", "compile_report", "review_result"):
+                self.assertEqual(self.task(client, task["task_id"])[key], task[key])
+            for action in ("release", "run", "fix"):
+                response = client.post(f"/api/v1/tasks/{task['task_id']}/{action}", json={"request_id": str(uuid4())})
+                self.assertEqual(response.status_code, 409)
+            self.assertEqual(self.deliver(client, task, self.direct_proof(task)).status_code, 409)
+
+    def test_direct_delivery_blocks_unity_workspace_drift(self):
+        self.check_candidate_failure("drift", "dirty_workspace")
+
+    def test_direct_delivery_preserves_compile_failure(self):
+        self.check_candidate_failure("broken_compile", "compile_failed")
+
+    def test_direct_delivery_preserves_test_failure(self):
+        self.check_candidate_failure("broken_tests", "tests_failed")
+
+    def test_direct_delivery_retries_journal_and_releases_original_checkout(self):
+        with self.direct_client() as client:
+            task = self.direct_task(client, conflict=True)
+            task_id = task["task_id"]
+            base = self.advance_target(conflict=True)
+            worker = client.app.state.worker
+            calls, reviews, solves = [], [], []
+            workspace = worker.workspaces[task["slot_id"]]
+            unity = workspace.unity.run
+
+            def verify(ctx, mode, **kwargs):
+                calls.append((mode, kwargs.get("scope"), git(self.project, "rev-parse", "HEAD")))
+                self.assertEqual(git(self.project, "branch", "--show-current"), "")
+                return unity(ctx, mode, **kwargs)
+
+            def agent(ctx, prompt, *, review=False):
+                if review:
+                    reviews.append(prompt)
+                    return {"verdict": "pass", "issues": [], "summary": "both changes kept", "session_id": "independent"}
+                solves.append(prompt)
+                (self.project / "Example.cs").write_text("class Main {}\nclass Feature {}\n")
+                return {"success": True, "session_id": "solver"}
+
+            save = worker.save
+
+            def stop_at_candidate(job, **updates):
+                if updates.get("merge_journal", {}).get("merge_sha"):
+                    raise StageError("recovery_required", "Interrupted before the candidate SHA reached SQLite")
+                return save(job, **updates)
+
+            with patch.object(self.agent, "execute", side_effect=agent), patch.object(workspace.unity, "run", side_effect=verify):
+                with patch.object(worker, "save", side_effect=stop_at_candidate):
+                    interrupted = self.merge_job(client, task)
+                self.assertEqual(interrupted["status"], "recovery_required", interrupted)
+                candidate = git(self.project, "rev-parse", "HEAD")
+                self.assertNotEqual(candidate, base)
+                self.assertNotIn("merge_sha", self.task(client, task_id)["merge_journal"])
+                (self.project / "unexpected.meta").touch()
+                recovered = client.post(f"/api/v1/tasks/{task_id}/recover", headers={"Authorization": f"Bearer {APPROVER}"},
+                                        json={"request_id": str(uuid4()), "confirmed_stopped": True, "note": "stopped"})
+                self.assertEqual(self.wait(client, recovered.json()["job_id"])["status"], "failed")
+                (self.project / "unexpected.meta").unlink()
+                self.recover(client, task_id)
+                self.assertEqual(git(self.project, "rev-parse", "HEAD"), candidate)
+                merged = self.merge_job(client, task)
+            self.assertEqual(merged["status"], "succeeded", merged)
+            self.assertEqual((len(solves), len(reviews)), (1, 1))
+            for evidence in ("class Main", "class Feature", "Example.cs"):
+                self.assertIn(evidence, reviews[0])
+            self.assertEqual(calls, [("compile", None, candidate),
+                                     ("editmode", {"assembly": "Tests", "fixtures": ["Game.UnitTests"]}, candidate),
+                                     ("playmode", {"assembly": "PlayTests", "fixtures": ["Game.UnitTests"]}, candidate)])
+            current = self.task(client, task_id)
+            self.assertEqual(git(self.remote, "rev-parse", "main"), current["delivery"]["merge_sha"])
+            self.assertEqual(git(self.project, "branch", "--show-current"), task["task_branch"])
+            self.assertEqual(git(self.project, "rev-parse", "HEAD"), task["verification"]["checkout"]["commit_sha"])
+            for key in ("test_report", "compile_report", "review_result", "verification"):
+                self.assertEqual(current[key], task[key])
+            with patch.object(worker, "finish", side_effect=lambda job, *_: worker.store.recover_interrupted(job["job_id"])):
+                self.assertEqual(self.stage(client, task_id, "release")["status"], "recovery_required")
+            self.recover(client, task_id)
+            self.assertEqual(self.stage(client, task_id, "release")["status"], "succeeded")
+            self.assertFalse(self.task(client, task_id)["lease"])
+            self.assertEqual(self.task(client, task_id)["status"], "completed")
+
+    def test_direct_delivery_recovers_remote_push_and_failed_receipt_write(self):
+        from direct_merge import DirectMergeGit
+
+        with self.direct_client() as client:
+            task = self.direct_task(client)
+            worker = client.app.state.worker
+            real_push = DirectMergeGit.push
+
+            def interrupted_push(git_merge, ctx, record, candidate):
+                real_push(git_merge, ctx, record, candidate)
+                raise StageError("recovery_required", "Worker stopped before persisting acknowledgement")
+
+            with patch.object(DirectMergeGit, "push", interrupted_push):
+                original = self.merge_job(client, task)
+            self.assertEqual(original["status"], "recovery_required", original)
+            journal = self.task(client, task["task_id"])["merge_journal"]
+            self.assertEqual(journal["status"], "in_flight")
+            self.assertEqual(git(self.remote, "rev-parse", "main"), journal["merge_sha"])
+            self.recover(client, task["task_id"])
+            save = worker.save
+
+            def lose_receipt(job, **change):
+                if "delivery" in change:
+                    raise OSError("Disk full after checkout restoration")
+                return save(job, **change)
+
+            with patch.object(DirectMergeGit, "push", side_effect=AssertionError("duplicate target push")):
+                with patch.object(worker, "save", side_effect=lose_receipt):
+                    failed = self.merge_job(client, task)
+                self.assertEqual(failed["status"], "failed", failed)
+                self.assertEqual(self.task(client, task["task_id"])["merge_journal"]["status"], "confirmed")
+                response = client.post(f"/api/v1/tasks/{task['task_id']}/release", json={"request_id": str(uuid4())})
+                self.assertEqual(response.status_code, 409)
+                reconciled = self.merge_job(client, task)
+            self.assertEqual(reconciled["status"], "succeeded", reconciled)
+            self.assertEqual(reconciled["stage_result"]["merge_sha"], journal["merge_sha"])
+            git(self.project, "switch", "--detach", journal["merge_sha"])
+            wrong_checkout = self.stage(client, task["task_id"], "release")
+            self.assertEqual(wrong_checkout["failure_kind"], "workspace_changed")
+            self.assertTrue(self.task(client, task["task_id"])["lease"])
+            git(self.project, "switch", task["task_branch"])
+            self.assertEqual(self.stage(client, task["task_id"], "release")["status"], "succeeded")
+
+    def test_direct_delivery_recovers_the_exact_unrecorded_clean_merge(self):
+        with self.direct_client() as client:
+            task = self.direct_task(client)
+            self.advance_target()
+            worker = client.app.state.worker
+            save = worker.save
+
+            def interrupt(job, **changes):
+                if changes.get("merge_journal", {}).get("merge_sha"):
+                    raise StageError("recovery_required", "Clean candidate pin persisted before task update")
+                return save(job, **changes)
+
+            with patch.object(worker, "save", side_effect=interrupt):
+                interrupted = self.merge_job(client, task)
+            self.assertEqual(interrupted["status"], "recovery_required", interrupted)
+            candidate = git(self.project, "rev-parse", "HEAD")
+            self.recover(client, task["task_id"])
+            recovered = self.task(client, task["task_id"])
+            self.assertEqual(recovered["merge_journal"]["merge_sha"], candidate)
+            with patch("direct_merge.DirectMergeGit.begin", side_effect=AssertionError("candidate was rebuilt")):
+                delivered = self.merge_job(client, task)
+            self.assertEqual(delivered["status"], "succeeded", delivered)
+            self.assertEqual(git(self.remote, "rev-parse", "main"), candidate)

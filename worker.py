@@ -69,6 +69,7 @@ class PlanningTaskRequest(OperationRequest):
     workflow_mode: Literal["staged-feature"] | None = None
     workflow_project_id: WorkflowProjectId | None = None
     publish_checkpoints: Literal[True] | None = None
+    delivery_mode: Literal["direct-merge"] | None = None
     requirement: Text
     planning_profile: Literal["feature", "ui", "issue-fix"]
 
@@ -76,6 +77,8 @@ class PlanningTaskRequest(OperationRequest):
     def staged_feature_requires_project(self):
         if self.workflow_mode == "staged-feature" and self.workflow_project_id is None:
             raise ValueError("Staged feature tasks require a LoopForge project ID")
+        if self.delivery_mode and not self.publish_checkpoints:
+            raise ValueError("Direct merge requires tested commit checkpoints")
         if self.publish_checkpoints and (self.workflow_mode != "staged-feature" or self.planning_profile != "feature"):
             raise ValueError("Checkpoint publication requires a staged feature task")
         return self
@@ -272,7 +275,7 @@ def create_app(settings=None, *, runner=None, agent=None, pr_adapter=None):
         payload = payload_for(request)
         if payload["pool_id"] in (None, cfg.default_pool):
             del payload["pool_id"]
-        for field in ("workflow_mode", "workflow_project_id", "publish_checkpoints"):
+        for field in ("workflow_mode", "workflow_project_id", "publish_checkpoints", "delivery_mode"):
             if payload[field] is None:
                 del payload[field]
         try:

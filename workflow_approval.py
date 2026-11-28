@@ -28,6 +28,8 @@ def validate_claims(claims):
     if not isinstance(claims, dict):
         raise ApprovalError("Invalid approval claim fields")
     fields = FIELDS | {"commit_sha": GIT_ID} if "commit_sha" in claims else FIELDS
+    if "delivery_mode" in claims:
+        fields = FIELDS | {"commit_sha": GIT_ID, "delivery_mode": "direct-merge"}
     if claims.keys() != fields.keys() | ATTEMPTS.keys():
         raise ApprovalError("Invalid approval claim fields")
     for name, pattern in fields.items():

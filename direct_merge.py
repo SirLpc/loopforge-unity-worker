@@ -632,6 +632,59 @@ def _candidate_from(journal):
                           journal["merge_sha"], journal["tree_sha"])
 
 
+def recover_merge_checkout(ctx, *, released=False):
+    """Validate the interrupted checkout before clearing the process permit or returning its lease."""
+    task, workspace = ctx.task, ctx.workspace.git
+    git = DirectMergeGit(workspace)
+    claims = task["approval"]["claims"]
+    source = claims["commit_sha"]
+    workspace.validate(ctx)
+    git._assert_no_merge_markers()
+    journal = task.get("merge_journal")
+    pin = git.pin(ctx, task)
+    if not journal:
+        if released or pin:
+            raise StageError("workspace_changed", "The merge operation has no matching journal")
+        # A process can be interrupted during the initial mixed reset.
+        workspace.adopt_checkpoint(ctx, task, source)
+        return
+    if (journal["approval"] != claims or journal["source_sha"] != source
+            or journal["target_branch"] != workspace.cfg.base_branch or journal["task_branch"] != task["task_branch"]
+            or journal["remote_identity"] != workspace.remote_identity(ctx)
+            or workspace.text(ctx, "rev-parse", "--verify", "refs/heads/" + task["task_branch"]) != source):
+        raise StageError("workspace_changed", "The merge operation no longer matches its task and assignment")
+    if released or task.get("current_stage") == "delivered":
+        if (journal["status"] != "confirmed" or not task.get("delivery")
+                or task["delivery"] != journal["receipt"] or pin):
+            raise StageError("workspace_changed", "A confirmed receipt and restored checkout are required")
+        workspace.checkout_is(ctx, task, source)
+        git._assert_checkout_contents(ctx, source)
+    elif journal.get("conflict_paths") and not journal.get("merge_sha"):
+        git.adopt_resolution(ctx, task, journal)
+    elif journal["status"] == "confirmed" or journal.get("rebuild_target"):
+        _restore_operation(ctx, git, journal)
+    elif journal.get("merge_sha"):
+        if pin != journal["merge_sha"]:
+            raise StageError("workspace_changed", "The recorded merge candidate lost its pin")
+        git.assert_clean_candidate(ctx, _candidate_from(journal))
+    elif git._current_branch(ctx):
+        if pin and pin != journal["base_sha"]:
+            raise StageError("workspace_changed", "Unexpected pin before merge checkout")
+        workspace.checkout_is(ctx, task, source)
+        git._assert_checkout_contents(ctx, source)
+    else:
+        git._assert_detached(ctx, pin)
+        if pin == journal["base_sha"]:
+            git._assert_checkout_contents(ctx, pin)
+            return
+        # A clean merge may have been pinned before its candidate record reached SQLite.
+        # Independently reproduce the automatic tree before accepting this exact pin.
+        tree = workspace.text(ctx, "merge-tree", "--write-tree", journal["base_sha"], source)
+        candidate = MergeCandidate(source, journal["base_sha"], (), pin, tree)
+        git.assert_clean_candidate(ctx, candidate)
+        _save_journal(ctx, journal, merge_sha=pin, tree_sha=tree, conflict_paths=[])
+
+
 def _verify_for_push(ctx, git, journal, evidence, solve, verify):
     task = ctx.task
     if journal.get("merge_sha"):
@@ -653,8 +706,15 @@ def _verify_for_push(ctx, git, journal, evidence, solve, verify):
     if not candidate.conflict_paths and candidate.tree_sha == journal["approval"]["revision"]:
         checked = evidence
     else:
-        checked = verify(ctx, candidate)
-        git.assert_clean_candidate(ctx, candidate)
+        try:
+            checked = verify(ctx, candidate)
+            git.assert_clean_candidate(ctx, candidate)
+        except StageError as error:
+            _save_journal(ctx, journal, verification_failure={"kind": error.kind, "message": str(error),
+                                                             "result": error.result})
+            raise
+        journal = dict(journal)
+        journal.pop("verification_failure", None)
     if not isinstance(checked, dict) or not checked:
         raise StageError("verification_failed", "Candidate verification returned no evidence")
     return candidate, _save_journal(ctx, journal, status="in_flight", verification=checked)

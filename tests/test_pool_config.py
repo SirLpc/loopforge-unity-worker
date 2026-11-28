@@ -64,6 +64,20 @@ class PoolConfigTests(unittest.TestCase):
             self.assertEqual(legacy.legacy_slot, "worker-01")
             self.assertEqual(legacy.slots["worker-01"].settings.project, first)
 
+    def test_direct_merge_requires_explicit_boolean_pool_opt_in(self):
+        with test_directory() as root:
+            config, _, _ = self.pool_fixture(root)
+            definition = config["pools"]["game"]
+            load = self.config_loader()
+            self.assertIs(getattr(load(config=config).pools["game"], "direct_merge", None), False)
+            for setting in (False, True):
+                definition["direct_merge"] = setting
+                self.assertIs(load(config=config).pools["game"].direct_merge, setting)
+            for setting in ("true", 1, None):
+                definition["direct_merge"] = setting
+                with self.assertRaises(ValueError):
+                    load(config=config)
+
     def test_rejects_overlapping_checkouts_and_codex_home_inside_a_checkout(self):
         load = self.config_loader()
         with test_directory() as root:

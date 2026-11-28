@@ -247,6 +247,7 @@ class PoolSettings:
     remote_identity: str | None
     slots: tuple[SlotSettings, ...]
     pr: dict[str, str] | None = None
+    direct_merge: bool = False
 
     @property
     def policy(self) -> Settings:
@@ -367,7 +368,10 @@ def load_service_settings(*, config=None) -> ServiceSettings:
         templates = {slot.settings.project.relative_to(slot.settings.checkout) for slot in pool_slots}
         if len(templates) != 1:
             raise ValueError("Slots in a pool must use the same relative Unity project path")
-        pools[pool_id] = PoolSettings(pool_id, remote, tuple(pool_slots), pool_pr(definition.get("pr")))
+        direct_merge = definition.get("direct_merge", False)
+        if type(direct_merge) is not bool:
+            raise ValueError("Pool direct_merge must be a boolean")
+        pools[pool_id] = PoolSettings(pool_id, remote, tuple(pool_slots), pool_pr(definition.get("pr")), direct_merge)
     default_pool, default_slot = config.get("default_pool"), config.get("legacy_slot")
     if not isinstance(default_pool, str) or default_pool not in pools or not any(
             slot.id == default_slot for slot in pools[default_pool].slots):

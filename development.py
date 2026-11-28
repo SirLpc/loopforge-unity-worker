@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from artifacts import RunContext, log_page, redact_text, safe_child
 from codex_executor import IMPLEMENT_RULES, REVIEW_RULES, STAGED_FEATURE_REVIEW_RULES, AgentExecutor, CodexExecutor
+from direct_merge import DirectMergeGit, land_approved, recover_merge_checkout
 from git_workspace import GitWorkspace
 from pool_scheduler import PoolScheduler, RequestConflict
 from process_runner import ProcessRunner, StageError
@@ -44,6 +45,9 @@ TERMINAL = {"completed", "cancelled", "failed"}
 RETRYABLE = {"git_failed", "timeout", "unity_changed", "workspace_in_use", "license_failed", "package_failed",
              "startup_failed", "test_execution_failed", "not_run", "unsupported", "review_blocked", "dirty_workspace",
              "push_conflict"}
+MERGE_RETRYABLE = {"git_failed", "timeout", "workspace_in_use", "license_failed", "package_failed", "startup_failed",
+                   "test_execution_failed", "push_failed", "recovered", "report_io_failed"}
+
 REWORK_RETRYABLE = {"git_failed", "timeout", "workspace_in_use", "dirty_workspace", "workspace_changed",
                     "unsupported", "recovered", "report_io_failed"}
 
@@ -237,7 +241,7 @@ class DevelopmentWorker:
                 if status == "recovery_required" and self.store.recovery_after(db, task["task_id"], job_id):
                     confirmed = True
             elif action != "recover":
-                return confirmed and action in {"commit", "pr"} and status == "succeeded"
+                return confirmed and action in {"commit", "pr", "merge"} and status == "succeeded"
         return False
 
     def job(self, job_id):
@@ -341,7 +345,7 @@ class DevelopmentWorker:
         current = leased[0] if len(leased) == 1 else {}
         return {"worker_id": self.cfg.worker_id, "status": status, "task_id": current.get("task_id"),
                 "current_stage": current.get("current_stage"),
-                **({"capabilities": ["staged-feature", "staged-feature-checkpoints"]}
+                **({"capabilities": ["staged-feature", "staged-feature-checkpoints", "staged-feature-direct-merge"]}
                    if self.cfg.legacy.workflow_approval_key and not legacy else {})}
 
     def require_task(self, db, task_id):
@@ -392,6 +396,8 @@ class DevelopmentWorker:
             pool = self.cfg.pools.get(payload.get("pool_id", self.cfg.default_pool))
             if pool is None:
                 raise ValueError("Unknown Unity workspace pool")
+            if payload.get("delivery_mode") and not pool.direct_merge:
+                raise RequestConflict("Direct merge is disabled for this workspace pool")
             if not payload.get("planning_profile"):
                 validate_test_selection(payload.get("test_selection"), pool.policy.test_assemblies)
             task_id = str(uuid4())
@@ -492,6 +498,12 @@ class DevelopmentWorker:
                 return
         elif active_job:
             raise RequestConflict("The task already has an active job")
+        elif task.get("delivery_mode") == "direct-merge" and task.get("approval"):
+            if (action == "release" and task.get("delivery") and stage == "delivered" and task["lease"]
+                    and (status == "completed" or self.recovered_delivery_release(db, task))
+                    and not self.store.has_task_permit(db, task["task_id"])):
+                return
+            raise RequestConflict("Direct delivery requires a confirmed merge and restored checkout before release")
         elif action == "clarify" and staged_feature:
             if (status in {"pending", "failed"} and stage in {"created", "clarify"}
                     and (task["lease"] or task["slot_id"] is None)):
@@ -588,9 +600,12 @@ class DevelopmentWorker:
             "workflow_run_id": task["workflow_run_id"], "task_id": task["task_id"], "pool_id": task["pool_id"],
             "slot_id": task["slot_id"], "base_commit": task["base_commit"], "plan_digest": task.get("approved_plan_digest"),
             "revision": task["revision"], "implementation_attempt": task["implementation_attempt"],
-            "test_job_id": verification.get("test_job_id"),
+            "test_job_id": verification.get("test_job_id"), "delivery_mode": task.get("delivery_mode"),
             "commit_sha": (verification.get("checkout") or {}).get("commit_sha"),
         }
+        direct = task.get("delivery_mode") == "direct-merge"
+        if direct and not self.cfg.pools[task["pool_id"]].direct_merge:
+            raise RequestConflict("Direct merge is disabled for this workspace pool")
         if ((task.get("publish_checkpoints") and not expected["commit_sha"])
                 or any(claims.get(key) != value for key, value in expected.items())
                 or any(verification.get(key) != claims[key] for key in ("revision", "implementation_attempt"))
@@ -607,12 +622,23 @@ class DevelopmentWorker:
             raise RequestConflict("The assigned workspace is unavailable or busy")
         stage, status = task["current_stage"], task["status"]
         if (stage, status) == ("tested", "awaiting_approval") and not task["commit_sha"]:
-            return "commit"
+            if direct and task["job_id"] != tested["job_id"]:
+                raise RequestConflict("Direct merge requires the current successful test job")
+            return "merge" if direct else "commit"
         approval = task.get("approval") or {}
         if (approval.get("claims") != claims or task["approved_revision"] != claims["revision"]
                 or status != "failed"):
             raise RequestConflict("Delivery is unavailable for this approval")
         failure = task.get("failure_kind")
+        if direct:
+            journal = task.get("merge_journal") or {}
+            prior_check = journal.get("verification_failure") or {}
+            if prior_check and prior_check["kind"] not in MERGE_RETRYABLE | {"recovery_required", "cancelled"}:
+                raise RequestConflict("The recorded candidate verification requires operator inspection")
+            reconcile = failure == "worker_error" and journal.get("status") in {"confirmed", "in_flight"}
+            if stage == "merge" and (failure in MERGE_RETRYABLE or reconcile):
+                return "merge"
+            raise RequestConflict("The merge requires operator inspection or a new approved revision")
         if task["pushed"] and task["commit_sha"] and failure in {"pr_failed", "recovered", "report_io_failed", "worker_error"}:
             return "pr" if approval["create_pr"] else "commit"
         if not task["pushed"] and stage in {"approved", "commit"}:
@@ -628,7 +654,7 @@ class DevelopmentWorker:
             with self.store.connect(write=True) as db:
                 previous = self.store.request(db, request_id)
                 if previous:
-                    if (previous["action"] not in {"commit", "pr"} or previous["task_id"] != task_id
+                    if (previous["action"] not in {"commit", "pr", "merge"} or previous["task_id"] != task_id
                             or previous["signature"] != signature(payload)):
                         raise RequestConflict("Request ID is already bound to a different operation")
                     return publishable(previous)
@@ -640,7 +666,9 @@ class DevelopmentWorker:
                 if not task.get("approval"):
                     task.update(current_stage="approved", approved_revision=claims["revision"],
                                 approval={"claims": claims, "approved_at": now(), "commit_message": "",
-                                          "create_pr": self.adapters.get(task["pool_id"]) is not None})
+                                          "create_pr": action != "merge" and self.adapters.get(task["pool_id"]) is not None})
+                if action == "merge":
+                    task.update(current_stage="merge", status="merging")
                 task.update(job_id=job["job_id"], cancel_requested=False, finished_at=None)
                 self.store.save_task(db, task)
                 self.store.save_job(db, job)
@@ -650,7 +678,7 @@ class DevelopmentWorker:
         with self.guard:
             with self.store.connect(write=True) as db:
                 task = self.store.task(db, task_id)
-                if task and task.get("workflow_mode") == "staged-feature" and action in {"approve", "commit", "pr"}:
+                if task and task.get("workflow_mode") == "staged-feature" and action in {"approve", "commit", "pr", "merge"}:
                     raise RequestConflict("Staged features require LoopForge workflow delivery approval")
                 if previous := self.previous(db, action, task_id, request_id, payload):
                     return publishable(previous)
@@ -759,14 +787,20 @@ class DevelopmentWorker:
                 result = {"status": "pending", **plan_binding(task)}
             elif action == "smoke":
                 result = ctx.workspace.unity.run(ctx, "startup_smoke", safe_child(self.cfg.logs, f"{task['task_id']}.log"))
+            elif action == "merge":
+                result = self.stage_direct_merge(ctx)
             elif action == "release":
                 assert_unity_closed(ctx.settings.project)
-                if task["task_type"] == "development":
+                if task.get("delivery_mode") == "direct-merge" and task.get("approval"):
+                    recover_merge_checkout(ctx, released=True)
+                elif task["task_type"] == "development":
                     ctx.workspace.git.clean(ctx)
                 result = {"released": True}
             elif action == "recover":
                 assert_unity_closed(ctx.settings.project)
-                if task["task_type"] == "development":
+                if task.get("delivery_mode") == "direct-merge" and task.get("approval"):
+                    recover_merge_checkout(ctx)
+                elif task["task_type"] == "development":
                     ctx.workspace.git.validate(ctx)
                 result = {"recovered": True, "operator_note": payload["note"]}
             elif action == "pr":
@@ -778,7 +812,7 @@ class DevelopmentWorker:
         except Exception as exc:
             logging.getLogger(__name__).error("Worker job %s raised %s", job["job_id"], type(exc).__name__)
             error = StageError("worker_error", f"Worker exception ({type(exc).__name__}); inspect local logs")
-        if error and (action == "commit" and error.kind in {"timeout", "cancelled"}
+        if error and (action in {"commit", "merge"} and error.kind in {"timeout", "cancelled"}
                       or action == "smoke" and error.kind == "workspace_in_use"):
             error.kind = "recovery_required"
         if ctx and action not in {"smoke", "release", "accept-plan"}:
@@ -787,7 +821,7 @@ class DevelopmentWorker:
             except Exception as exc:
                 logging.getLogger(__name__).error("Cannot save job report %s (%s)", job["job_id"], type(exc).__name__)
                 if error is None:
-                    staged_delivery = ctx.task.get("workflow_mode") == "staged-feature" and action in {"commit", "pr"}
+                    staged_delivery = ctx.task.get("workflow_mode") == "staged-feature" and action in {"commit", "pr", "merge"}
                     retry_report = staged_delivery or stage_finalizes_with_job(ctx.task, action)
                     kind = "report_io_failed" if isinstance(exc, OSError) and retry_report else "worker_error"
                     error = StageError(kind, "Cannot save the development report")
@@ -857,6 +891,9 @@ class DevelopmentWorker:
                         task["verification"]["checkout"] = task["compile_report"]["checkout"]
                 elif action == "rework":
                     task.pop("rework_pending", None)
+            if action == "merge" and not error:
+                task.update(status="completed", current_stage="delivered", finished_at=timestamp, stage_result=result,
+                            error_message=None, failure_kind=None, exit_code=0)
             if action == "pr" and task.get("workflow_mode") == "staged-feature":
                 task.update(self.clean_output(workflow_pr_outcome(task, error, timestamp)))
                 if error and error.kind == "report_io_failed":
@@ -1126,6 +1163,95 @@ class DevelopmentWorker:
             raise StageError(kind, "Review did not pass", result=review)
         return review
 
+    def stage_direct_merge(self, ctx):
+        task = ctx.task
+        if not task.get("merge_journal"):
+            source = self.verified_checkout(ctx, task["verification"]["checkout"])
+            if source != task["approval"]["claims"]["commit_sha"] or DirectMergeGit(ctx.workspace.git).pin(ctx, task):
+                raise StageError("workspace_changed", "The signed checkpoint or its merge pin changed")
+            ctx.workspace.git.adopt_checkpoint(ctx, task, source)
+        receipt = land_approved(ctx, solve=self.solve_merge, verify=self.verify_merge)
+        ctx.save(delivery=receipt, pushed=True, commit_sha=receipt["source_sha"])
+        return receipt
+
+    def solve_merge(self, ctx, candidate):
+        inputs = {**self.brief(ctx.task), "source_sha": candidate.source_sha, "base_sha": candidate.base_sha,
+                  "conflict_paths": list(candidate.conflict_paths)}
+        prompt = ("Resolve the listed C# content conflicts in the working files. Preserve both the approved "
+                  "feature and concurrent target changes. Edit only these paths. Leave staging, Git operations "
+                  "and Unity execution to the Worker. Report the changes using the implementation schema.")
+        result = ctx.workspace.agent.execute(ctx, prompt + "\n\n" + json.dumps(inputs, ensure_ascii=False))
+        ctx.save(merge_solver={"resolution_id": ctx.task["merge_journal"]["resolution_id"],
+                               "session_id": result.get("session_id")})
+
+    def review_merge(self, ctx, candidate, checks):
+        workspace = ctx.workspace.git
+        ancestor = workspace.text(ctx, "merge-base", candidate.base_sha, candidate.source_sha)
+        inputs = {**self.brief(ctx.task), "conflict_paths": list(candidate.conflict_paths),
+                  "source_sha": candidate.source_sha, "base_sha": candidate.base_sha, "merge_sha": candidate.commit_sha,
+                  "verification": checks}
+        for label, start, end in (("target_changes", ancestor, candidate.base_sha),
+                                  ("approved_changes", ancestor, candidate.source_sha),
+                                  ("resolution_against_target", candidate.base_sha, candidate.commit_sha),
+                                  ("resolution_against_source", candidate.source_sha, candidate.commit_sha)):
+            diff = workspace.git(ctx, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                                 start, end, "--", *candidate.conflict_paths, limit=ctx.settings.max_diff_bytes)[1]
+            inputs[label] = self.clean_output(diff.decode("utf-8", errors="replace"))
+        prompt = REVIEW_RULES + "\nDecide whether the conflict resolution preserves both sides' intended behavior."
+        review = ctx.workspace.agent.execute(ctx, prompt + "\n\n" + json.dumps(inputs, ensure_ascii=False), review=True)
+        session = review.get("session_id")
+        if session and session in {ctx.task.get("agent_session_id"), (ctx.task.get("merge_solver") or {}).get("session_id"),
+                                   (ctx.task.get("review_result") or {}).get("session_id")}:
+            raise StageError("review_blocked", "Merge review reused a previous session", result=review)
+        if review.get("verdict") != "pass":
+            raise StageError("review_changes" if review.get("verdict") == "request_changes" else "review_blocked",
+                             "Independent conflict review did not pass", result=review)
+        return review
+
+    def verify_merge(self, ctx, candidate):
+        git = DirectMergeGit(ctx.workspace.git)
+        selection = ctx.task.get("test_selection")
+        if not selection or selection != ctx.task["planning"].get("test_selection"):
+            raise StageError("verification_failed", "The approved test selection changed")
+        try:
+            validate_test_selection(selection, ctx.settings.test_assemblies)
+        except ValueError as error:
+            raise StageError("verification_failed", str(error)) from error
+        if set(selection) - set(ctx.settings.test_modes):
+            raise StageError("verification_failed", "An approved test mode is disabled")
+
+        checks = {"mode": "retested", "revision": candidate.tree_sha, "merge_sha": candidate.commit_sha, "runs": []}
+
+        def checked(step, execute, **details):
+            git.assert_clean_candidate(ctx, candidate)
+            try:
+                result = execute()
+            except StageError as error:
+                if error.kind not in {"cancelled", "recovery_required", "workspace_in_use"}:
+                    try:
+                        git.assert_clean_candidate(ctx, candidate)
+                    except StageError as drift:
+                        drift.result.update(step=step, candidate_checks=checks, **details, original_failure={
+                            "kind": error.kind, "message": str(error), "result": error.result})
+                        raise drift from error
+                error.result.update(step=step, candidate_checks=checks, **details)
+                raise
+            try:
+                git.assert_clean_candidate(ctx, candidate)
+            except StageError as error:
+                error.result.update(step=step, candidate_checks=checks, step_result=result, **details)
+                raise
+            return result
+
+        checks["compile"] = checked("compile", lambda: ctx.workspace.unity.run(ctx, "compile"))
+        for mode in ctx.settings.test_modes:
+            for scope in selection.get(mode, ()):
+                result = checked(mode, lambda: ctx.workspace.unity.run(ctx, mode, scope=scope), scope=scope)
+                checks["runs"].append({"mode": mode, "scope": scope, **result})
+        if candidate.conflict_paths:
+            checks["review"] = checked("review", lambda: self.review_merge(ctx, candidate, checks))
+        return checks
+
     def stage_commit(self, ctx):
         task = ctx.task
         staged = task.get("workflow_mode") == "staged-feature"
@@ -1211,6 +1337,9 @@ class DevelopmentWorker:
         data = {key: value for key, value in task.items() if key not in {"remote_identity", "artifacts"}}
         if ctx.job["action"] == "pr" and task.get("workflow_mode") == "staged-feature":
             data.update(workflow_pr_outcome(task, error, now()))
+        if ctx.job["action"] == "merge" and not error:
+            data.update(status="completed", current_stage="delivered", finished_at=now(), stage_result=task["delivery"],
+                        failure_kind=None, error_message=None, exit_code=0)
         if error:
             data["operation_error"] = {"kind": error.kind, "message": str(error), "result": error.result}
             if ctx.job["action"] not in {"recover", "pr"}:
