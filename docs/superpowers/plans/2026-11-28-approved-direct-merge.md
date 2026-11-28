@@ -29,7 +29,7 @@
 
 ---
 
-### 任务 1 — Git 候选与冲突判定
+### Task 1 — Git 候选与冲突判定
 
 **文件** 新建 `direct_merge.py`、`tests/test_direct_merge.py`。复用 `git_workspace.py` 的命令、安全树和远端绑定方法。保留已有工作分支推送检查。
 
@@ -40,7 +40,7 @@
 - [ ] 实现上述方法。目标从经验证的推送端点读取并获取对象。进入前确认 Worker 槽位干净且处于已验收任务分支。候选使用 Worker 管理的 detached checkout，基于两个固定 SHA 运行 Git 合并。验证未合并条目的三个阶段与同一路径上的原始 blob、文件模式、文本内容和重命名诊断相符。保存 Git 在非冲突路径上的暂存结果，解完后逐路径暂存，确认最终树只改变允许的冲突路径。复用 Unity 工程版本、Git 安全树及 LFS/子模块完整性检查，候选和恢复后的检出都核实实际依赖与所在提交。作业重启后只清理已确认为 Worker 自己创建的操作状态，未知修改留待人工处理。
 - [ ] 重跑候选测试和 `python -m unittest discover -s tests -p test_workspace.py -v`，确认均通过后提交该组文件。
 
-### 任务 2 — 候选验证、推送与恢复顺序
+### Task 2 — 候选验证、推送与恢复顺序
 
 **文件** 在 `direct_merge.py` 加交付编排和推送方法，在 `tests/test_direct_merge.py` 加 bare Git 并发及故障测试。
 
@@ -51,7 +51,7 @@
 - [ ] 实现 `land_approved`。在移动检出前保存操作所有权和固定源 SHA，在推送前保存候选 SHA、目标 SHA、验证证据和重建次数。为候选建立 Worker 本地引用直到结果可恢复。树等于验收树且无冲突时复用证据。推送执行前核对远端和源分支，校验两个祖先关系及候选树。目标使用精确 ref lease 配合本地快进证明，按目标 ref 校验所需 LFS 对象，接收端的分支保护照常生效。记录远端实际的目标 SHA。先查已落地历史再决定重试，目标只在已知快进后重建一次。安全恢复原任务检出后完成交付。
 - [ ] 重跑任务 1 和任务 2 的测试，确认各故障用例通过后提交。
 
-### 任务 3 — Worker 作业、配置与独立验证
+### Task 3 — Worker 作业、配置与独立验证
 
 **文件** 修改 `worker_config.py`、`worker.py`、`workflow_approval.py`、`development.py`、`pool_scheduler.py`。在 `tests/test_workflow_approval.py`、`tests/test_pool_config.py` 加用例。
 
@@ -62,7 +62,7 @@
 - [ ] 实现可省略的签名字段、任务参数和池开关。保持原 JSON 及旧配置签名，运行时校验新池开关，保留原 MR 任务池绑定。在一次事务中受理经过当前测试作业、槽位和已签署 source SHA 校验的 merge。独立验证复用 `UnityExecutor` 的编译及测试参数校验，并在每次 Unity 执行和只读评审前后验证候选树。Codex 写入沿用现有沙箱和独立会话，解法由任务 1 的范围检查约束。将候选检查结果存到合入记录和作业报告，保留原测试与评审。沿用恢复及归还许可，区分基础设施重试、复验失败、已推送回执补记。进程中断时由现有 `recover` 核对进程退出和候选操作归属，再允许恢复对应作业或归还。未知 Git 操作和额外修改保持阻塞。
 - [ ] 重跑授权、池配置及开发流程测试。运行 `python -m unittest discover -s tests -p test_pool_config.py -v` 和 `python -m unittest discover -s tests -p test_workflow.py -v`。同时通过再提交。
 
-### 任务 4 — 中继、节点和安装器
+### Task 4 — 中继、节点和安装器
 
 **文件** 修改 `integrations/loopforge/planning_context.py`、`integrations/loopforge/feature_client.py`、`integrations/loopforge/install_sops.py` 和现有接入文档。测试 `tests/test_planning_context.py`、`tests/test_sop_install.py`、`tests/test_loopforge.py`。
 
@@ -73,7 +73,7 @@
 - [ ] 中继以冻结图的精确节点类型及连线选择授权方式，继续校验已有产物 ID、摘要、验收尝试和测试版本。脚本只在新图创建直合任务并要求受信任 Worker merge 回执，汇总继续通过原操作 ID 机制安全归还。同一节点的复验阻塞保留作业引用，重试只用于可恢复类别。安装器发布前确认模式能力、目标池开关和 `--expected-revision`，保留当前工作流 ID、沙箱、凭据引用和项目入口。
 - [ ] 重跑三个测试模块，通过后提交。
 
-### 任务 5 — Windows 验收与正式发布
+### Task 5 — Windows 验收与正式发布
 
 **文件** 扩展 `tests/windows_unity_acceptance.py` 和 `docs/ACCEPTANCE.md`，沿用 `scripts/restart-worker.ps1` 及接入 README 的发布/回退步骤。
 
