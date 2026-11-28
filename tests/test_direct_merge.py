@@ -161,6 +161,7 @@ class DirectMergeTests(unittest.TestCase):
             module_remote, module_author = root / "module-remote", root / "module-author"
             git(root, "init", "--bare", "--initial-branch=main", str(module_remote))
             git(root, "clone", str(module_remote), str(module_author))
+            write(module_author, ".gitattributes", b"version.txt text eol=lf\n")
             write(module_author, "version.txt", b"original module\n")
             old_module = self.publish(module_author, "main")
 
@@ -207,6 +208,16 @@ class DirectMergeTests(unittest.TestCase):
                 DirectMergeGit(workspace).restore(ctx, task, source)
             self.assertEqual(git(checked_out, "rev-parse", "HEAD"), external)
             git(checked_out, "switch", "--detach", new_module)
+
+            write(checked_out, "version.txt", b"advanced module\r\n")
+            git(checked_out, "add", "--", "version.txt")
+            self.assertEqual(git(checked_out, "status", "--porcelain"), "")
+            with self.assertRaises(StageError):
+                DirectMergeGit(workspace).restore(ctx, task, source)
+            self.assertEqual((checked_out / "version.txt").read_bytes(), b"advanced module\r\n")
+            self.assertEqual(git(checked_out, "rev-parse", "HEAD"), new_module)
+            write(checked_out, "version.txt", b"advanced module\n")
+            git(checked_out, "add", "--", "version.txt")
 
             DirectMergeGit(workspace).restore(ctx, task, source)
             self.assertEqual(git(checked_out, "rev-parse", "HEAD"), old_module)
