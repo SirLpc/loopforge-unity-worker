@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import json
 
+from integrations.loopforge.install_sops import Target, staged_feature_workflow
 from integrations.loopforge.planning_context import (
     ContextError, run_context, sandbox_identity, signed_context, write_context,
 )
@@ -263,12 +264,16 @@ class FeatureContextTests(unittest.TestCase):
         self.check_auto_rework("review", "review_changes", {"verdict": "request_changes", "summary": "Dispose SerializedObject."},
                                "独立评审要求修改：Dispose SerializedObject.")
 
+    def test_default_review_can_send_back_work_after_review_and_test_reworks(self):
+        self.check_auto_rework("review", "review_changes", {"verdict": "request_changes", "summary": "Cover visible drag."},
+                               "独立评审要求修改：Cover visible drag.", completed_reworks=2)
+
     def test_auto_rework_requests_fix_for_named_tests_on_the_current_revision(self):
         self.check_auto_rework("test", "tests_failed", {"mode": "playmode", "failed_tests": [
             {"name": "Game.DragTests.Drag", "message": "Expected rotation."}]},
             "测试验证未通过：Game.DragTests.Drag")
 
-    def check_auto_rework(self, stage, failure, result, reason):
+    def check_auto_rework(self, stage, failure, result, reason, *, completed_reworks=1):
         import hashlib
         from uuid import uuid4
 
@@ -277,14 +282,17 @@ class FeatureContextTests(unittest.TestCase):
         target = "configured-repair"
         definitions["implement"]["id"] = target
         definitions["accept"]["rejectTo"] = target
-        definitions[stage].update(maxReworks=2, onFailure="fail")
+        installed = staged_feature_workflow(Target(PROJECT, "sandbox", "https://worker.example.test"),
+                                            "worker-key", "context-key", "garden")
+        installed_check = next(node for node in installed["nodes"] if node["id"] == stage)
+        definitions[stage].update(maxReworks=installed_check["maxReworks"], onFailure=installed_check["onFailure"])
         nodes = self.run["nodes"]
-        nodes[target] = {**nodes.pop("implement"), "nodeId": target}
+        nodes[target] = {**nodes.pop("implement"), "nodeId": target, "reworkCount": completed_reworks}
         nodes[stage]["status"] = "failed"
         self.run["status"] = "failed"
         artifact = self.run["artifacts"][2]
         evidence = json.loads(self.bodies[artifact["id"]])
-        evidence["node_id"] = target
+        evidence.update(node_id=target, implementation_attempt=completed_reworks)
         raw = json.dumps(evidence).encode()
         self.bodies[artifact["id"]] = raw
         artifact.update(nodeId=target, sha256=hashlib.sha256(raw).hexdigest())
@@ -327,7 +335,7 @@ class FeatureContextTests(unittest.TestCase):
             (worker_task, {"job_id": str(uuid4())}),
             (worker_task, {"rework_job_id": None}),
             (definitions[stage], {"maxReworks": 0}),
-            (nodes[target], {"reworkCount": 2}),
+            (definitions[stage], {"maxReworks": completed_reworks}),
             (definitions["accept"], {"rejectTo": "design"}),
             (self.run, {"status": "running"}),
         ):

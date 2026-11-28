@@ -67,7 +67,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Staged feature preview failed' }
 .\.venv\Scripts\python.exe -m integrations.loopforge.install_sops @stagedArgs --publish --expected-revision $preview.base_revision
 ~~~~
 
-画布顺序为需求定型 → 方案设计 → 开发实现 → 独立评审 → 测试验证 → 人工验收 → 发起 MR → 交付汇总。自动返工和人工验收共用画布上「人工验收」的打回目标。独立评审和测试验证的「最多返工几轮」默认分别为 1 和 2，按打回目标已累计的返工次数计算。设为 0 可关闭对应节点的自动返工。
+画布顺序为需求定型 → 方案设计 → 开发实现 → 独立评审 → 测试验证 → 人工验收 → 发起 MR → 交付汇总。自动返工和人工验收共用画布上「人工验收」的打回目标。独立评审和测试验证的「最多返工几轮」默认分别为 3 和 2，按开发实现已累计的返工次数计算。评审上限与 Worker 池的默认 `max_fixes = 3` 一致，因此评审和测试各打回一次后，评审仍可在 Worker 允许时打回第三轮。设为 0 可关闭对应节点的自动返工。
 
 使用自动返工时，更新 Worker 和中继，按槽位回收的说明为中继配置 `--worker-url` 和 `--worker-token-file`，并确保中继的 LoopForge Token 有项目运行写权限。独立评审和测试验证节点的「失败后」保留「停下来」。中继核对当前版本后，对评审明确要求修改或报告中有失败用例的情况调用 LoopForge 打回接口。测试返工将用例名、断言信息和堆栈传给开发，修正后重新编译、评审和测试。超时、许可证或测试执行故障沿用节点的重试策略。Worker 池也限制代码返工次数。
 
