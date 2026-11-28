@@ -632,14 +632,15 @@ def _candidate_from(journal):
                           journal["merge_sha"], journal["tree_sha"])
 
 
-def can_abandon_merge(task):
+def can_abandon_merge(task, *, terminal_status=None):
+    status = task["status"] if terminal_status is None else terminal_status
     journal = task.get("merge_journal")
-    return (task["status"] in {"failed", "cancelled"} and not task.get("delivery") and not task.get("pushed")
+    return (status in {"failed", "cancelled"} and not task.get("delivery") and not task.get("pushed")
             and (journal is None or (journal.get("status") == "building"
                                      and not journal.get("push_acknowledged") and not journal.get("receipt"))))
 
 
-def recover_merge_checkout(ctx, *, released=False):
+def recover_merge_checkout(ctx, *, released=False, abandonment_status=None):
     """Validate the interrupted checkout before clearing the process permit or returning its lease."""
     task, workspace = ctx.task, ctx.workspace.git
     git = DirectMergeGit(workspace)
@@ -661,7 +662,9 @@ def recover_merge_checkout(ctx, *, released=False):
             or workspace.text(ctx, "rev-parse", "--verify", "refs/heads/" + task["task_branch"]) != source):
         raise StageError("workspace_changed", "The merge operation no longer matches its task and assignment")
     if released or task.get("current_stage") == "delivered":
-        if released and can_abandon_merge(task):
+        if abandonment_status is not None:
+            if not can_abandon_merge(task, terminal_status=abandonment_status):
+                raise StageError("workspace_changed", "The merge transport state no longer permits abandonment")
             # The operator has archived the failed attempt. Keep the journal and any owned pre-push pin as evidence.
             if pin and (not journal or pin not in {journal["base_sha"], journal.get("merge_sha")}):
                 raise StageError("workspace_changed", "The abandoned merge has an unrecognized candidate pin")

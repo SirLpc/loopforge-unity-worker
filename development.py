@@ -61,7 +61,7 @@ class SlotNotFound(Exception):
 
 
 def publishable(job):
-    return {key: value for key, value in job.items() if key not in {"signature", "request_id"}}
+    return {key: value for key, value in job.items() if key not in {"signature", "request_id", "abandonment_outcome"}}
 
 
 def check_predecessor(task, after_job):
@@ -691,6 +691,15 @@ class DevelopmentWorker:
                 check_predecessor(task, after_job)
                 self.check_action(db, task, action, payload, after_job=after_job)
                 job = self.new_job(task_id, request_id, action, payload)
+                if task.get("delivery_mode") == "direct-merge" and task.get("approval"):
+                    if action == "release" and can_abandon_merge(task):
+                        # Recovery overwrites failure details. Capture them in the same transaction as release admission.
+                        fields = ("status", "failure_kind", "error_message", "finished_at", "stage_result", "exit_code")
+                        job["abandonment_outcome"] = {key: task[key] for key in fields}
+                    elif action == "recover":
+                        predecessor = self.store.job(db, task["job_id"])
+                        if predecessor and predecessor.get("abandonment_outcome"):
+                            job["abandonment_outcome"] = predecessor["abandonment_outcome"]
                 inline_accept = action == "accept-plan" and task.get("workflow_mode") != "staged-feature"
                 if inline_accept or action in {"approve", "cancel"}:
                     active = self.store.active_job(db, task_id)
@@ -793,20 +802,18 @@ class DevelopmentWorker:
                 result = ctx.workspace.unity.run(ctx, "startup_smoke", safe_child(self.cfg.logs, f"{task['task_id']}.log"))
             elif action == "merge":
                 result = self.stage_direct_merge(ctx)
-            elif action == "release":
+            elif action in {"release", "recover"}:
                 assert_unity_closed(ctx.settings.project)
                 if task.get("delivery_mode") == "direct-merge" and task.get("approval"):
-                    recover_merge_checkout(ctx, released=True)
+                    outcome = job.get("abandonment_outcome")
+                    recover_merge_checkout(ctx, released=action == "release" or outcome is not None,
+                                           abandonment_status=outcome["status"] if outcome else None)
                 elif task["task_type"] == "development":
-                    ctx.workspace.git.clean(ctx)
-                result = {"released": True}
-            elif action == "recover":
-                assert_unity_closed(ctx.settings.project)
-                if task.get("delivery_mode") == "direct-merge" and task.get("approval"):
-                    recover_merge_checkout(ctx)
-                elif task["task_type"] == "development":
-                    ctx.workspace.git.validate(ctx)
-                result = {"recovered": True, "operator_note": payload["note"]}
+                    if action == "release":
+                        ctx.workspace.git.clean(ctx)
+                    else:
+                        ctx.workspace.git.validate(ctx)
+                result = {"released": True} if action == "release" else {"recovered": True, "operator_note": payload["note"]}
             elif action == "pr":
                 result = self.publish_pr(ctx)
             else:
@@ -905,7 +912,11 @@ class DevelopmentWorker:
                                 finished_at=timestamp, exit_code=error.exit_code)
             if action == "recover" and not error:
                 self.store.clear_recovered_permits(db, task["task_id"])
-                task.update(status="failed", failure_kind="recovered", recovery=result, finished_at=timestamp)
+                task["recovery"] = result
+                if "abandonment_outcome" in job:
+                    task.update(job["abandonment_outcome"])
+                else:
+                    task.update(status="failed", failure_kind="recovered", finished_at=timestamp)
             self.store.save_task(db, task)
             self.store.save_job(db, job)
 

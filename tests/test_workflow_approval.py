@@ -854,3 +854,75 @@ class WorkflowDeliveryTests(WorkflowFixture):
             self.assertEqual(merged["stage_result"], journal["receipt"])
             self.assertEqual(git(self.project, "branch", "--show-current"), task["task_branch"])
             self.assertEqual(self.stage(client, task_id, "release")["status"], "succeeded")
+
+    def check_interrupted_abandonment(self, *, solved):
+        with self.direct_client() as client:
+            task = self.direct_task(client, conflict=True)
+            task_id = task["task_id"]
+            base = self.advance_target(conflict=True)
+            worker = client.app.state.worker
+
+            def solver(ctx, prompt, *, review=False):
+                if not solved:
+                    raise StageError("agent_failed", "Cannot resolve the conflict", result={"session_id": "solver"})
+                (self.project / "Example.cs").write_text("class Main {}\nclass Feature {}\n")
+                return {"success": True, "session_id": "solver"}
+
+            if solved:
+                (self.root / "broken_compile").touch()
+            with patch.object(self.agent, "execute", side_effect=solver):
+                failed = self.merge_job(client, task)
+            expected = "compile_failed" if solved else "agent_failed"
+            self.assertEqual(failed["failure_kind"], expected, failed)
+            current = self.task(client, task_id)
+            fields = ("status", "current_stage", "finished_at", "failure_kind", "error_message", "stage_result", "exit_code")
+            outcome = {key: current[key] for key in fields}
+            journal = current["merge_journal"]
+            self.assertEqual(journal["conflict_paths"], ["Example.cs"])
+            self.assertEqual(bool(journal.get("merge_sha")), solved)
+            if not solved:
+                (self.root / "archived-conflict.txt").write_bytes((self.project / "Example.cs").read_bytes())
+                git(self.project, "merge", "--abort")
+            git(self.project, "switch", task["task_branch"])
+            pin_ref = "refs/unity-worker/direct-merge/" + task["task_branch"].split("/")[-1]
+            pin = git(self.project, "rev-parse", pin_ref)
+            self.assertEqual(pin, journal.get("merge_sha", base))
+
+            # Crash once immediately after admission, then once after the operator archives the pin.
+            def never_started(job, payload):
+                worker.store.recover_interrupted(job["job_id"])
+                return worker.job(job["job_id"])
+
+            with patch.object(worker, "spawn", side_effect=never_started):
+                interrupted = self.stage(client, task_id, "release")
+            self.assertEqual(interrupted["status"], "recovery_required", interrupted)
+            dirty = self.project / "operator.meta"
+            dirty.touch()
+            blocked = client.post(f"/api/v1/tasks/{task_id}/recover", headers={"Authorization": f"Bearer {APPROVER}"},
+                                  json={"request_id": str(uuid4()), "confirmed_stopped": True, "note": "stopped"})
+            self.assertEqual(self.wait(client, blocked.json()["job_id"])["status"], "failed")
+            self.assertTrue(dirty.exists())
+            dirty.rename(self.root / "archived-operator.meta")
+            self.recover(client, task_id)
+            current = self.task(client, task_id)
+            self.assertTrue(current["lease"])
+            self.assertEqual({key: current[key] for key in fields}, outcome)
+            git(self.project, "update-ref", "refs/archive/test-abandonment", pin)
+            git(self.project, "update-ref", "-d", pin_ref, pin)
+            with patch.object(worker, "finish", side_effect=lambda job, *_: worker.store.recover_interrupted(job["job_id"])):
+                interrupted = self.stage(client, task_id, "release")
+            self.assertEqual(interrupted["status"], "recovery_required", interrupted)
+            self.recover(client, task_id)
+            self.assertEqual(self.stage(client, task_id, "release")["status"], "succeeded")
+            current = self.task(client, task_id)
+            self.assertFalse(current["lease"])
+            self.assertEqual({key: current[key] for key in fields}, outcome)
+            self.assertFalse(current.get("delivery"))
+            self.assertEqual(git(self.project, "rev-parse", "refs/archive/test-abandonment"), pin)
+            self.assertEqual(git(self.remote, "rev-parse", "main"), base)
+
+    def test_interrupted_abandonment_after_unsolved_conflict(self):
+        self.check_interrupted_abandonment(solved=False)
+
+    def test_interrupted_abandonment_after_candidate_compile_failure(self):
+        self.check_interrupted_abandonment(solved=True)
