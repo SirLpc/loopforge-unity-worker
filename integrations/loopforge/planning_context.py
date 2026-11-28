@@ -102,6 +102,10 @@ FEATURE_NODES = {
 }
 ASSIGNMENT = ("task_id", "pool_id", "slot_id", "base_commit")
 HUMAN_APPROVAL = b"# Approval\n\nApproved by a human gate.\n"
+DIRECT_MERGE_CONSENT = ("打开待审交付物中的测试报告，使用报告开头的任务分支和提交 SHA 验收。"
+                        "核对需求、独立评审、Unity 测试和未覆盖项。"
+                        "批准后将此提交直接合入工程池主线。简单 C# 冲突通过复验及独立评审后自动合入。"
+                        "需要修改时填写完整意见并打回开发实现。")
 ARTIFACT_LIMIT = 8 * 1024 * 1024
 REWORK_FAILURES = {"review": "review_changes", "test": "tests_failed"}
 
@@ -238,6 +242,9 @@ def feature_context(run, run_id, project_id, artifact_reader, approval_key, now,
                "operation": "feature-" + ("delivery" if node == "deliver" else node)}
     direct = delivery_node == "merge"
     if direct:
+        gate = next(n for n in wf["nodes"] if n["id"] == "accept")
+        if gate.get("taskPrompt") != DIRECT_MERGE_CONSENT:
+            raise ContextError("Frozen approval gate must request direct merge of the tested commit")
         context["delivery_mode"] = "direct-merge"
     if node == "implement" and rework:
         try:

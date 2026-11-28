@@ -176,6 +176,7 @@ class FeatureContextTests(unittest.TestCase):
     def test_direct_merge_signing_is_bound_to_the_frozen_graph(self):
         import hashlib
         from workflow_approval import verify_approval
+        from integrations.loopforge import install_sops
 
         wf = self.run["workflowSnapshot"]
         self.assertNotIn("delivery_mode", self.context()["approval"]["claims"])
@@ -194,6 +195,14 @@ class FeatureContextTests(unittest.TestCase):
             record.setdefault(key, {})["checkout"] = checkout
             self.bodies[meta["id"]] = json.dumps(record).encode()
             meta["sha256"] = hashlib.sha256(self.bodies[meta["id"]]).hexdigest()
+        gate = next(n for n in wf["nodes"] if n["id"] == "accept")
+        target = install_sops.Target(PROJECT, "sandbox", "https://worker.example.test")
+        new_graph = install_sops.staged_feature_workflow(target, "worker", "context", "garden", direct_merge=True)
+        consent = next(n["taskPrompt"] for n in new_graph["nodes"] if n["id"] == "accept")
+        for prompt in ("", "批准后发起 MR；需要修改时打回。", "批准后仅发起 MR。" + consent):
+            with self.subTest(prompt=prompt), patch.dict(gate, taskPrompt=prompt), self.assertRaises(ContextError):
+                self.context()
+        gate["taskPrompt"] = consent
         ctx = self.context()
         self.assertEqual(ctx["operation"], "feature-merge")
         claims = verify_approval(ctx["approval"], self.key, 1001)

@@ -1,6 +1,7 @@
 
 """Install the project-local Unity SOPs through the supported LoopForge API."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, HTTPRedirectHandler, Request, build_opener
 
+from integrations.loopforge.planning_context import DIRECT_MERGE_CONSENT
 from integrations.loopforge.worker_client import save_json
 from worker_config import FEATURE_TOTAL_REWORK_LIMIT
 TAG = "unity-worker-formal"
@@ -377,12 +379,10 @@ def staged_feature_workflow(target, worker_credential, context_credential, pool_
         if evidence:
             node["artifactOutputs"].append(artifact(evidence, evidence + ".json", "application/json"))
         nodes.append(node)
-    grant = ("批准后将此提交直接合入工程池主线。简单 C# 冲突通过复验及独立评审后自动合入。"
-             if direct_merge else "批准后发起 MR；")
-    gate = approval("accept", "人工验收",
-                    "打开待审交付物中的测试报告，使用报告开头的任务分支和提交 SHA 验收。"
-                    "核对需求、独立评审、Unity 测试和未覆盖项。"
-                    + grant + "需要修改时填写完整意见并打回开发实现。", "implement")
+    prompt = DIRECT_MERGE_CONSENT if direct_merge else (
+        "打开待审交付物中的测试报告，使用报告开头的任务分支和提交 SHA 验收。"
+        "核对需求、独立评审、Unity 测试和未覆盖项。批准后发起 MR；需要修改时填写完整意见并打回开发实现。")
+    gate = approval("accept", "人工验收", prompt, "implement")
     gate["maxReworks"] = FEATURE_TOTAL_REWORK_LIMIT
     nodes.insert(5, gate)
     return definition(target, f"{target.project_id}-{key}", title, lane, nodes, (worker_credential, context_credential))
@@ -414,9 +414,12 @@ def workflow_content(workflow, *, publishing=False):
     return content
 
 
-def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, expected_revision=None, direct_merge=False):
+def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, expected_revision=None,
+                           direct_merge=False, worker_api=None, settings=None):
     if direct_merge and publish and (type(expected_revision) is not int or expected_revision < 1):
         raise ValueError("Publishing direct merge requires a positive --expected-revision from preview")
+    if direct_merge and (worker_api is None or settings is None):
+        raise ValueError("Direct merge requires the Worker API and selected pool config")
     identifier = target.project_id + "-feature"
     project_path = "/api/projects/" + target.project_id
     project = api("GET", project_path)
@@ -445,6 +448,30 @@ def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, e
                     if key in old:
                         node[key] = old[key]
     value = {**live, "nodes": graph["nodes"], "edges": graph["edges"]}
+    preview = output_dir / f"{identifier}-staged-preview.json"
+    candidate = value
+    if direct_merge:
+        pool = read_pool(settings, pool_id)
+        common = {k: v for k, v in settings.items() if k != "pools"}
+        encoded = json.dumps([common, pool], sort_keys=True, separators=(",", ":")).encode()
+        candidate = {"delivery_mode": "direct-merge", "worker_url": target.worker_url,
+                     "worker_id": os.environ.get("UNITY_WORKER_ID", settings.get("worker_id", "worker-01")),
+                     "pool": pool_id, "base_branch": pool.get("base_branch", common.get("base_branch", "main")),
+                     "config_sha256": hashlib.sha256(encoded).hexdigest(), "workflow": value}
+    if publish and (direct_merge or preview.exists()):
+        try:
+            reviewed = json.loads(preview.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"Read a fresh staged preview in the same --output-dir before publishing: {preview}") from error
+        if not isinstance(reviewed, dict):
+            raise RuntimeError(f"Invalid staged preview: {preview}")
+        # A direct preview must also guard against accidentally dropping --direct-merge at publish time.
+        if direct_merge or "workflow" in reviewed:
+            if json.dumps(reviewed, sort_keys=True) != json.dumps(candidate, sort_keys=True):
+                raise RuntimeError("The direct merge preview differs from the current workflow or selected pool config")
+    if worker_api is not None:
+        health = preflight_worker(worker_api, settings, pool_id, staged_feature=True, direct_merge=direct_merge)
+        save_json(output_dir / "worker-preflight.json", health)
     # Keep the exact input revision for recovery, even on repeated deployments.
     backup = output_dir / f"{identifier}-before.json"
     if backup.exists():
@@ -454,8 +481,7 @@ def install_staged_feature(target, api, pool_id, output_dir, *, publish=False, e
         save_json(backup, live)
     report = {"id": identifier, "base_revision": revision, "pool": pool_id, "backup": str(backup)}
     if not publish:
-        preview = output_dir / f"{identifier}-staged-preview.json"
-        save_json(preview, value)
+        save_json(preview, candidate)
         return {**report, "mode": "preview", "preview": str(preview)}
 
     # LoopForge checks the revision in the PUT body and reports a stale write as HTTP 409.
@@ -626,12 +652,11 @@ def main(argv=None):
         parser.error("set --project-id to a LoopForge project ID")
     target = Target(args.project_id, args.sandbox_profile, worker_url)
     if args.staged_feature:
-        worker_health = preflight_worker(call_factory(worker_token, probe_url), settings, pool_id,
-                                        staged_feature=True, direct_merge=args.direct_merge)
-        save_json(args.output_dir / "worker-preflight.json", worker_health)
+        worker_api = call_factory(worker_token, probe_url)
         api = call_factory(require_env("UNITY_FORMAL_STUDIO_TOKEN"), endpoint(args.api_url))
         result = install_staged_feature(target, api, pool_id, args.output_dir, publish=args.publish,
-                                        expected_revision=args.expected_revision, direct_merge=args.direct_merge)
+                                        expected_revision=args.expected_revision, direct_merge=args.direct_merge,
+                                        worker_api=worker_api, settings=settings)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
 

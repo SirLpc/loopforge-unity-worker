@@ -249,6 +249,74 @@ class InstallSopsTests(unittest.TestCase):
     def test_direct_merge_publishes_the_previewed_workflow_with_live_node_settings(self):
         self._check_staged_install("published-direct")
 
+    def test_direct_publish_checks_worker_and_reviewed_preview_at_write_boundary(self):
+        from copy import deepcopy
+        target = install_sops.Target("garden", "sandbox", "https://worker.example.test")
+        live = {"id": "garden-feature", "name": "feature", "projectId": "garden", "revision": 20, "status": "published",
+                "sandboxProfileId": "sandbox", "tags": [install_sops.TAG], "projectCredentialIds": ["worker", "context"],
+                "nodes": [], "edges": []}
+        credentials = [{"id": "worker", "kind": "custom", "variables": ["UNITY_WORKER_URL", "UNITY_WORKER_TOKEN"]},
+                       {"id": "context", "kind": "custom", "variables": ["UNITY_PLANNING_CONTEXT_TOKEN"]}]
+        events = []
+        def studio(method, path, value=None):
+            events.append((method, path))
+            if method == "GET":
+                return {"/api/projects/garden": {"id": "garden"},
+                        "/api/projects/garden/credentials": {"credentials": credentials},
+                        "/api/workflows/garden-feature": live}[path]
+            self.fail("Unexpected Studio mutation " + path)
+        def worker(method, path):
+            events.append((method, path))
+            return self.probe(method, path)
+
+        self.settings["pools"]["game"].update(direct_merge=True, base_branch="main")
+        self.settings["pools"]["other"] = deepcopy(self.settings["pools"]["game"])
+        remote = self.responses["/api/v1/pools"]["pools"][0]
+        remote["direct_merge"] = True
+        self.responses["/api/v1/pools"]["pools"].append({**remote, "id": "other"})
+        host = self.responses["/api/v1/workers"]["workers"][0]
+        host["capabilities"] = ["staged-feature-checkpoints", "staged-feature-direct-merge"]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with self.assertRaisesRegex((RuntimeError, ValueError), "Worker"):
+                install_sops.install_staged_feature(target, studio, "game", root, publish=True,
+                                                    expected_revision=20, direct_merge=True)
+            def install(publish=False, pool="game", **options):
+                kwargs = {"direct_merge": True, "settings": self.settings, "worker_api": worker, **options}
+                return install_sops.install_staged_feature(target, studio, pool, root, publish=publish,
+                                                          expected_revision=20, **kwargs)
+            with self.assertRaisesRegex((RuntimeError, ValueError), "preview"):
+                install(True)
+            self.assertEqual(list(root.iterdir()), [])
+            result = install()
+            preview = Path(result["preview"])
+            original = preview.read_bytes()
+            altered = json.loads(original)
+            altered["workflow"]["nodes"][5]["maxAttempts"] = True
+            preview.write_text(json.dumps(altered), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "preview"):
+                install(True)
+            preview.write_bytes(original)
+            for options, problem in [({"worker_api": None}, "Worker"), ({"settings": None}, "config"),
+                                     ({"pool": "other"}, "preview"), ({"direct_merge": False}, "preview")]:
+                with self.subTest(options=options), self.assertRaisesRegex((RuntimeError, ValueError), problem):
+                    install(True, **options)
+            for changed, fields, problem in [(host, {"capabilities": ["staged-feature-checkpoints"]}, "capability"),
+                                              (remote, {"direct_merge": False}, "game"),
+                                              (remote["slots"][0], {"status": "unavailable"}, "primary"),
+                                              (self.responses["/api/v1/pools"], {"pools": []}, "game"),
+                                              (self.settings["pools"]["game"], {"base_branch": "release"}, "preview")]:
+                with self.subTest(fields=fields), patch.dict(changed, fields), self.assertRaisesRegex((RuntimeError, ValueError), problem):
+                    install(True)
+            with patch.object(install_sops, "render", return_value="updated script"), self.assertRaisesRegex(RuntimeError, "preview"):
+                install(True)
+            modified = original.replace(b"feature-merge", b"feature-other")
+            self.assertNotEqual(original, modified)
+            preview.write_bytes(modified)
+            with self.assertRaisesRegex((RuntimeError, ValueError), "preview"):
+                install(True)
+            self.assertFalse(any(method != "GET" for method, path in events))
+
     def test_staged_publish_preserves_project_bindings_on_conflict(self):
         for outcome in ("preview", "stale-preview", "put-conflict", "changed-before-publish", "changed-on-publish",
                         "no-capability", "wrong-credentials", "published", "published-draft"):
@@ -279,6 +347,10 @@ class InstallSopsTests(unittest.TestCase):
         live = original
         writes = []
         workflow_writes = []
+        api_events = []
+        def probe(method, path):
+            api_events.append((method, path))
+            return self.probe(method, path)
         credentials = [
             {"id": "worker-key", "kind": "custom", "variables": ["UNITY_WORKER_URL", "UNITY_WORKER_TOKEN"]},
             {"id": "context-key", "kind": "custom", "variables": ["UNITY_PLANNING_CONTEXT_TOKEN"]},
@@ -294,6 +366,7 @@ class InstallSopsTests(unittest.TestCase):
 
         def api(method, path, value=None, *, missing=False):
             nonlocal live
+            api_events.append((method, path))
             if method == "GET":
                 return {"/api/projects/garden": project,
                         "/api/projects/garden/credentials": {"canManage": True, "credentials": credentials},
@@ -302,6 +375,8 @@ class InstallSopsTests(unittest.TestCase):
             if (method, path) == ("PUT", "/api/workflows"):
                 workflow_writes.append(value["id"])
                 if outcome == "published-direct":
+                    self.assertEqual(api_events[-3:], [("GET", "/api/v1/workers"), ("GET", "/api/v1/pools"),
+                                                      ("PUT", "/api/workflows")])
                     self.assertEqual([n["id"] for n in value["nodes"]][-3:], ["accept", "merge", "deliver"])
                     review = next(n for n in value["nodes"] if n["id"] == "review")
                     for key, old in original["nodes"][0].items():
@@ -345,7 +420,7 @@ class InstallSopsTests(unittest.TestCase):
                 args.extend(("--expected-revision", "5"))
             env = {"UNITY_FORMAL_STUDIO_TOKEN": "studio-token", "UNITY_WORKER_TOKEN": "worker-token"}
             with patch.dict(os.environ, env, clear=True), \
-                 patch.object(install_sops, "call_factory", side_effect=[self.probe, api]):
+                 patch.object(install_sops, "call_factory", side_effect=[probe, api] * 2):
                 errors = {"stale-preview": "expected 5, found 6", "put-conflict": "HTTP 409",
                           "changed-before-publish": "changed",
                           "changed-on-publish": "published.*match", "no-capability": "staged-feature",
@@ -354,6 +429,8 @@ class InstallSopsTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, errors[outcome]):
                         install_sops.main(args)
                 else:
+                    if outcome == "published-direct":
+                        install_sops.main([arg for arg in args if arg != "--publish"])
                     install_sops.main(args)
                     backup = json.loads((root / "garden-feature-before.json").read_text(encoding="utf-8"))
                     self.assertEqual(backup, original)
